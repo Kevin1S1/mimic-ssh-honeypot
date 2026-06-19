@@ -1,0 +1,51 @@
+# cargo-deny configuration — supply-chain guard for MIMIC.
+#
+# Run with:  cargo deny check
+# Installs:   cargo install cargo-deny
+#
+# Security is Rule #1, and dependencies are part of the attack surface. This
+# config fails CI/local checks on known vulnerabilities, disallowed licenses,
+# and untrusted sources.
+
+[advisories]
+# Fail on any security advisory affecting the dependency tree.
+version = 2
+yanked = "deny"
+# One advisory is explicitly accepted (documented in SECURITY.md): it is
+# unfixable upstream. It does not break MIMIC's core invariant (no escape).
+ignore = [
+    # rsa 0.9.x Marvin timing sidechannel. Worst case: recovery of the SSH *host*
+    # key, enabling impersonation of the honeypot — harmless for a sacrificial
+    # decoy and no escape. No fixed version exists upstream. Becomes relevant
+    # once the `russh`/`rsa` dependency lands in Phase 2.
+    "RUSTSEC-2023-0071",
+]
+
+[licenses]
+version = 2
+# Permissive licenses compatible with MIMIC's MIT OR Apache-2.0 distribution.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# A small, auditable dependency tree is a security feature. Warn on multiple
+# versions of the same crate so the tree stays lean.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io is trusted by default; flag anything pulled from elsewhere.
+unknown-registry = "deny"
+unknown-git = "deny"

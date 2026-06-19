@@ -1,0 +1,25 @@
+# Build artifacts
+/target
+
+# Runtime state — never commit real keys, captures, or logs.
+# These directories are created automatically when the honeypot runs.
+/host_keys/
+/quarantine/
+/logs/
+/data/
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local environment overrides
+.env
+
+# Agent artifacts
+CLAUDE.md
+.agents/
