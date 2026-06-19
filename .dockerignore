@@ -1,0 +1,21 @@
+# Build context is the repo root; the release/dev binary lives under target/.
+target/
+
+# Git metadata and CI config are not needed in the image.
+.git/
+.github/
+.gitignore
+
+# Local runtime state must never leak into the build context / image.
+host_keys/
+quarantine/
+data/
+
+# Docs and editor cruft.
+*.md
+.agents/
+
+# Test files and environment secrets.
+tests/
+.env
+*.env

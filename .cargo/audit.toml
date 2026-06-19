@@ -1,0 +1,13 @@
+# Local `cargo audit` configuration — keeps developer runs consistent with CI.
+#
+# One advisory is explicitly accepted and documented in SECURITY.md (and
+# deny.toml): it is unfixable upstream and does not break MIMIC's core
+# invariant. A *new* advisory in any dependency still fails `cargo audit`.
+
+[advisories]
+ignore = [
+    # rsa Marvin timing sidechannel — host-key recovery only (impersonation of a
+    # decoy), no escape; no fixed version exists upstream. Becomes relevant once
+    # the `russh`/`rsa` dependency lands in Phase 2.
+    "RUSTSEC-2023-0071",
+]

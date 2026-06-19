@@ -1,0 +1,92 @@
+name: CI
+
+# Security is a process, not a state: every push and pull request is linted,
+# tested, and scanned for known-vulnerable dependencies before it can land.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  # Re-run the dependency audit on a schedule so a newly disclosed advisory in
+  # a pinned crate (e.g. tokio, russh) is caught even without new commits.
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned MSRV)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Informational only: the codebase uses an intentionally compact style in
+      # places, so a formatting drift should not block a security fix.
+      - name: Check formatting (non-blocking)
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets --verbose
+
+      - name: Test
+        run: cargo test --workspace --all-targets --verbose
+
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Scans Cargo.lock against the RustSec advisory database. One advisory is
+      # explicitly accepted and documented in SECURITY.md (and deny.toml):
+      #   RUSTSEC-2023-0071  rsa Marvin sidechannel — no fix exists; host-key
+      #                      recovery only, no escape from the honeypot.
+      # Any NEW advisory still fails the build.
+      - name: cargo-audit (fails on new advisories)
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2023-0071
+
+  deny:
+    name: Supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Enforces deny.toml: advisories, allowed licenses, banned crates, and
+      # trusted sources.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
