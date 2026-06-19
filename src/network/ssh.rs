@@ -262,7 +262,7 @@ impl Handler for MimicHandler {
         // Phase 2: send a Debian-style MOTD and close the channel. The full
         // interactive shell arrives in Phase 7.
         let banner = format!(
-            "Linux {host} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC \
+            "Linux {DEFAULT_HOSTNAME} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC \
              Debian 6.1.90-1 (2024-05-03) x86_64\r\n\
              \r\n\
              The programs included with the Debian GNU/Linux system are free software;\r\n\
@@ -270,8 +270,7 @@ impl Handler for MimicHandler {
              individual files in /usr/share/doc/*/copyright.\r\n\
              \r\n\
              Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\r\n\
-             permitted by applicable law.\r\n",
-            host = DEFAULT_HOSTNAME,
+             permitted by applicable law.\r\n"
         );
         session.data(channel, banner.into_bytes())?;
 
