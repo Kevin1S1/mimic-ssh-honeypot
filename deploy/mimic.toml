@@ -1,0 +1,59 @@
+# MIMIC honeypot — example configuration.
+# All values are optional; omitted keys fall back to built-in defaults.
+# Pass this file as the first CLI argument:  mimic /path/to/mimic.toml
+
+# Address to bind the SSH listener to.
+listen_addr = "0.0.0.0"
+
+# Listen port. Inside Docker keep this high (e.g. 2222) and map host port 22
+# to it so the process never has to run as root.
+port = 2222
+
+# SSH identification string. Must begin with "SSH-2.0-".
+server_id = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
+
+# Hostname shown in the shell prompt.
+hostname = "debian"
+
+# Global cap on concurrent sessions.
+max_sessions = 256
+
+# Cap on concurrent connections per source IP.
+per_ip_connections = 10
+
+# Idle timeout (seconds) before a session is dropped.
+idle_timeout_secs = 300
+
+# Absolute cap (seconds) on a single session's lifetime, regardless of activity.
+# Bounds the resources any one connection can hold and prevents a client from
+# keeping a session open indefinitely with periodic keep-alive traffic.
+max_session_secs = 1800
+
+# Directory where files uploaded over SCP are quarantined. Captured payloads
+# are written here named by their SHA-256 hash (content-addressed, deduplicated).
+quarantine_dir = "quarantine"
+
+# Maximum number of bytes stored per uploaded file. Larger uploads are still
+# fully consumed off the wire (to keep the SCP protocol in sync) but truncated
+# in the quarantine store. Default: 16 MiB.
+max_upload_bytes = 16777216
+
+# Directory where SSH host keys are persisted. Keys (Ed25519 + RSA) are
+# generated on first start and reused afterwards so the server fingerprint stays
+# stable across restarts — a fingerprint that changes every boot is a tell.
+host_key_dir = "host_keys"
+
+[auth]
+# Acceptance strategy. One of:
+#   accept_all   — every password succeeds on the first try
+#   reject_all   — capture credentials without ever granting a shell
+#   accept_after — succeed once a session has made `accept_after` attempts
+#   credentials  — only the username/password pairs listed below succeed
+mode = "accept_after"
+accept_after = 2
+
+# Used only when mode = "credentials":
+# credentials = [
+#   { username = "root", password = "toor" },
+#   { username = "admin", password = "admin" },
+# ]

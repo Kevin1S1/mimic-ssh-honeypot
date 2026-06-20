@@ -1,13 +1,19 @@
 #![forbid(unsafe_code)]
 //! MIMIC honeypot binary entry point.
 //!
-//! Initialises structured JSON logging, builds the async runtime, and hands
-//! control to the network listener. Configuration loading from TOML is added
-//! in Phase 3; for now, all settings use safe compiled-in defaults.
+//! Loads configuration, initialises structured JSON logging, builds the async
+//! runtime, and hands control to the network listener. An optional TOML config
+//! path may be passed as the first CLI argument; with none, safe compiled-in
+//! defaults are used.
 
 use anyhow::{Context, Result};
+use mimic::config::Config;
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    let config_path = std::env::args().nth(1).map(PathBuf::from);
+    let config = Config::load(config_path.as_deref()).context("failed to load configuration")?;
+
     mimic::logging::init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -15,5 +21,5 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build tokio runtime")?;
 
-    runtime.block_on(mimic::network::run())
+    runtime.block_on(mimic::network::run(config))
 }

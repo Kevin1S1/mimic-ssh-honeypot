@@ -5,9 +5,11 @@ mod hostkey;
 mod limiter;
 mod ssh;
 
+use crate::config::Config;
 use anyhow::Result;
+use std::sync::Arc;
 
 /// Start the SSH honeypot listener and serve connections until shutdown.
-pub async fn run() -> Result<()> {
-    ssh::serve().await
+pub async fn run(config: Config) -> Result<()> {
+    ssh::serve(Arc::new(config)).await
 }
