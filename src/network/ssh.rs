@@ -6,6 +6,7 @@
 //! Nothing in this file (or anywhere downstream) executes real commands or
 //! touches the real filesystem beyond host-key persistence.
 
+use crate::config::{AuthMode, Config};
 use crate::logging::event;
 use crate::network::limiter::{ConnectionGuard, ConnectionRegistry};
 
@@ -19,68 +20,43 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-/// Default maximum concurrent sessions.
-const DEFAULT_MAX_SESSIONS: usize = 256;
-
-/// Default maximum concurrent connections per source IP.
-const DEFAULT_PER_IP: usize = 10;
-
-/// Default port to listen on.
-const DEFAULT_PORT: u16 = 2222;
-
-/// Default idle timeout in seconds.
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
-
-/// Default absolute session lifetime in seconds.
-const DEFAULT_MAX_SESSION_SECS: u64 = 1800;
-
-/// Default hostname presented in the MOTD.
-const DEFAULT_HOSTNAME: &str = "debian";
-
-/// Default SSH server identification string (Debian 12 OpenSSH 9.2).
-const DEFAULT_SERVER_ID: &str = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3";
-
-/// Default number of password attempts before accepting credentials.
-const DEFAULT_ACCEPT_AFTER: u32 = 2;
-
-/// Default directory for persisting host keys.
-const DEFAULT_HOST_KEY_DIR: &str = "host_keys";
-
 /// Build the russh server config and serve connections forever.
-pub async fn serve() -> Result<()> {
-    let host_keys = super::hostkey::load_or_create(std::path::Path::new(DEFAULT_HOST_KEY_DIR))?;
+pub async fn serve(config: Arc<Config>) -> Result<()> {
+    // Persist host keys so the server fingerprint stays stable across restarts.
+    let host_keys = super::hostkey::load_or_create(&config.host_key_dir)?;
 
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::Password);
     methods.push(MethodKind::PublicKey);
 
     let server_config = Arc::new(ServerConfig {
-        server_id: russh::SshId::Standard(std::borrow::Cow::Owned(DEFAULT_SERVER_ID.to_string())),
+        server_id: russh::SshId::Standard(std::borrow::Cow::Owned(config.server_id.clone())),
         methods,
         // Algorithm ordering trimmed to resemble Debian 12 OpenSSH 9.2's
         // server offer (no sntrup761, umac, or group-exchange).
         preferred: debian_openssh_preferred(),
         auth_rejection_time: Duration::from_secs(2),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        inactivity_timeout: Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)),
+        inactivity_timeout: Some(Duration::from_secs(config.idle_timeout_secs)),
         keys: host_keys,
         ..Default::default()
     });
 
-    let registry = ConnectionRegistry::new(DEFAULT_MAX_SESSIONS, DEFAULT_PER_IP);
+    // Connection caps are enforced at accept time, before any crypto state is
+    // allocated, so a connection flood is shed cheaply.
+    let registry = ConnectionRegistry::new(config.max_sessions, config.per_ip_connections);
     let session_counter = Arc::new(AtomicU64::new(1));
 
-    let listen_addr = format!("0.0.0.0:{DEFAULT_PORT}");
-    let listener = TcpListener::bind(&listen_addr)
+    let listener = TcpListener::bind((config.listen_addr, config.port))
         .await
-        .with_context(|| format!("binding {listen_addr}"))?;
+        .with_context(|| format!("binding {}:{}", config.listen_addr, config.port))?;
 
     tracing::info!(
         event = "listening",
-        addr = "0.0.0.0",
-        port = DEFAULT_PORT,
-        max_sessions = DEFAULT_MAX_SESSIONS,
-        per_ip = DEFAULT_PER_IP,
+        addr = %config.listen_addr,
+        port = config.port,
+        max_sessions = config.max_sessions,
+        per_ip_connections = config.per_ip_connections,
     );
 
     loop {
@@ -109,6 +85,7 @@ pub async fn serve() -> Result<()> {
         event::connection_opened(session_id, peer);
 
         let handler = MimicHandler {
+            config: Arc::clone(&config),
             session_id,
             peer,
             auth_attempts: 0,
@@ -117,7 +94,7 @@ pub async fn serve() -> Result<()> {
         };
 
         let server_config = Arc::clone(&server_config);
-        let max_session = Duration::from_secs(DEFAULT_MAX_SESSION_SECS);
+        let max_session = Duration::from_secs(config.max_session_secs);
         tokio::spawn(async move {
             match russh::server::run_stream(server_config, stream, handler).await {
                 Ok(session) => {
@@ -190,6 +167,8 @@ fn debian_openssh_preferred() -> russh::Preferred {
 /// Per-connection handler holding connection state and credentials captured
 /// during the SSH handshake.
 struct MimicHandler {
+    /// Shared runtime configuration (auth policy, hostname, ...).
+    config: Arc<Config>,
     session_id: u64,
     peer: SocketAddr,
     auth_attempts: u32,
@@ -199,12 +178,29 @@ struct MimicHandler {
     _guard: ConnectionGuard,
 }
 
+impl MimicHandler {
+    /// Apply the configured authentication policy to one attempt.
+    fn decide_auth(&self, user: &str, password: &str) -> bool {
+        match self.config.auth.mode {
+            AuthMode::AcceptAll => true,
+            AuthMode::RejectAll => false,
+            AuthMode::AcceptAfter => self.auth_attempts >= self.config.auth.accept_after,
+            AuthMode::Credentials => self
+                .config
+                .auth
+                .credentials
+                .iter()
+                .any(|c| c.username == user && c.password == password),
+        }
+    }
+}
+
 impl Handler for MimicHandler {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         self.auth_attempts += 1;
-        let accepted = self.auth_attempts >= DEFAULT_ACCEPT_AFTER;
+        let accepted = self.decide_auth(user, password);
 
         event::auth_attempt(
             self.session_id,
@@ -261,8 +257,9 @@ impl Handler for MimicHandler {
     ) -> Result<(), Self::Error> {
         // Phase 2: send a Debian-style MOTD and close the channel. The full
         // interactive shell arrives in Phase 7.
+        let hostname = &self.config.hostname;
         let banner = format!(
-            "Linux {DEFAULT_HOSTNAME} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC \
+            "Linux {hostname} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC \
              Debian 6.1.90-1 (2024-05-03) x86_64\r\n\
              \r\n\
              The programs included with the Debian GNU/Linux system are free software;\r\n\
