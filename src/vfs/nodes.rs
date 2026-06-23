@@ -47,16 +47,6 @@ impl Metadata {
             mtime: DEFAULT_MTIME,
         }
     }
-
-    /// `true` if this node is a directory.
-    pub fn is_dir(&self) -> bool {
-        self.mode & S_IFMT == S_IFDIR
-    }
-
-    /// `true` if this node is a symbolic link.
-    pub fn is_symlink(&self) -> bool {
-        self.mode & S_IFMT == S_IFLNK
-    }
 }
 
 /// The payload of a node, discriminated by kind.
@@ -81,16 +71,4 @@ pub struct Node {
     pub kind: NodeKind,
     /// Ownership and permissions.
     pub meta: Metadata,
-}
-
-impl Node {
-    /// Byte length reported by `ls`/`stat`. Directories report 4096 like a
-    /// typical ext4 directory; symlinks report their target length.
-    pub fn size(&self) -> u64 {
-        match &self.kind {
-            NodeKind::File { contents } => contents.len() as u64,
-            NodeKind::Symlink { target } => target.len() as u64,
-            NodeKind::Directory { .. } => 4096,
-        }
-    }
 }
