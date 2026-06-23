@@ -1,0 +1,96 @@
+//! Node types for the in-memory virtual filesystem.
+//!
+//! Nodes live in an arena ([`super::Vfs`]) and reference each other by
+//! [`NodeId`] (an index) to keep the tree free of `Rc`/`RefCell` borrow
+//! gymnastics. Nothing here touches the real filesystem.
+
+use std::collections::BTreeMap;
+
+/// Default modification time for snapshot nodes: 2024-05-03 (a plausible
+/// Debian 12 point-release build date). Kept fixed so `ls -l` output is
+/// deterministic and free of "freshly created" tells.
+pub const DEFAULT_MTIME: i64 = 1_714_694_400;
+
+/// File-type bit (`S_IFDIR`) for a directory.
+pub const S_IFDIR: u32 = 0o040000;
+/// File-type bit (`S_IFREG`) for a regular file.
+pub const S_IFREG: u32 = 0o100000;
+/// File-type bit (`S_IFLNK`) for a symbolic link.
+pub const S_IFLNK: u32 = 0o120000;
+
+/// Mask isolating the file-type bits of a mode.
+pub const S_IFMT: u32 = 0o170000;
+
+/// An index into the [`super::Vfs`] arena.
+pub type NodeId = usize;
+
+/// Ownership and permission metadata for a node.
+#[derive(Debug, Clone)]
+pub struct Metadata {
+    /// Permission bits **plus** the file-type bits (e.g. `S_IFDIR | 0o755`).
+    pub mode: u32,
+    /// Owning user id (0 = root).
+    pub uid: u32,
+    /// Owning group id (0 = root).
+    pub gid: u32,
+    /// Last modification time, unix seconds.
+    pub mtime: i64,
+}
+
+impl Metadata {
+    /// Build metadata, OR-ing the file-type bits into `perms`.
+    pub fn new(file_type: u32, perms: u32, uid: u32, gid: u32) -> Self {
+        Self {
+            mode: file_type | (perms & 0o7777),
+            uid,
+            gid,
+            mtime: DEFAULT_MTIME,
+        }
+    }
+
+    /// `true` if this node is a directory.
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+
+    /// `true` if this node is a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
+    }
+}
+
+/// The payload of a node, discriminated by kind.
+#[derive(Debug, Clone)]
+pub enum NodeKind {
+    /// A directory mapping child names to their node ids.
+    Directory { children: BTreeMap<String, NodeId> },
+    /// A regular file holding raw bytes.
+    File { contents: Vec<u8> },
+    /// A symbolic link to another path (absolute or relative).
+    Symlink { target: String },
+}
+
+/// A single filesystem entry.
+#[derive(Debug, Clone)]
+pub struct Node {
+    /// The entry's own name (the root's name is empty).
+    pub name: String,
+    /// Parent node id; `None` only for the root.
+    pub parent: Option<NodeId>,
+    /// Node payload.
+    pub kind: NodeKind,
+    /// Ownership and permissions.
+    pub meta: Metadata,
+}
+
+impl Node {
+    /// Byte length reported by `ls`/`stat`. Directories report 4096 like a
+    /// typical ext4 directory; symlinks report their target length.
+    pub fn size(&self) -> u64 {
+        match &self.kind {
+            NodeKind::File { contents } => contents.len() as u64,
+            NodeKind::Symlink { target } => target.len() as u64,
+            NodeKind::Directory { .. } => 4096,
+        }
+    }
+}
