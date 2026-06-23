@@ -75,8 +75,7 @@ impl ConnectionRegistry {
         })
     }
 
-    /// Current number of active connections. Exposed for tests and the planned
-    /// metrics endpoint.
+    /// Current number of active connections. Used by the limiter tests.
     #[allow(dead_code)]
     pub fn active(&self) -> usize {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).total

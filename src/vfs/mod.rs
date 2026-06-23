@@ -61,11 +61,6 @@ impl Vfs {
         &self.nodes[id]
     }
 
-    /// Mutably borrow a node by id.
-    pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
-        &mut self.nodes[id]
-    }
-
     /// Resolve `path` starting from `start` (used for relative paths),
     /// following symlinks. Returns the target node id, or `None` if any
     /// component is missing or traverses through a non-directory.
@@ -344,7 +339,10 @@ impl Vfs {
 
 /// Current wall-clock time in unix seconds, for freshly created/modified nodes.
 fn now_ts() -> i64 {
-    chrono::Utc::now().timestamp()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
