@@ -1,0 +1,262 @@
+//! Shell state machine.
+//!
+//! Holds the per-session shell state — the virtual filesystem, environment,
+//! working directory, and identity — and the pure-text operations over it:
+//! prompt rendering, variable expansion, and tokenization. Command dispatch is
+//! layered on top of this by the command registry; nothing here touches real
+//! I/O or runs a real process.
+
+pub mod complete;
+pub mod env;
+pub mod line;
+pub mod parser;
+
+use crate::vfs::{snapshot, NodeId, Vfs};
+use env::Env;
+
+/// Per-session shell.
+pub struct Shell {
+    /// The in-memory Debian filesystem.
+    pub vfs: Vfs,
+    /// Environment variables.
+    pub env: Env,
+    /// Current working directory node.
+    pub cwd: NodeId,
+    /// Home directory node for this session.
+    pub home: NodeId,
+    /// Previous working directory (for `cd -`).
+    pub prev_cwd: NodeId,
+    /// Logged-in username.
+    pub username: String,
+    /// Emulated hostname.
+    pub hostname: String,
+    /// Effective user id.
+    pub uid: u32,
+    /// Effective group id.
+    pub gid: u32,
+    /// Exit status of the last command (for `$?`).
+    pub last_status: i32,
+    /// Fake shell PID (for `$$`).
+    pub pid: u32,
+    /// Submitted command lines this session, exposed by the `history` builtin.
+    /// Bounded to keep per-session memory predictable.
+    pub history: Vec<String>,
+}
+
+impl Shell {
+    /// Construct a fresh shell for `username` on a freshly built Debian
+    /// snapshot. `root` (and the empty username) get uid 0 and `/root`; any
+    /// other user is treated as a normal account (uid 1000) with a home under
+    /// `/home`, created on demand.
+    pub fn new(username: &str, hostname: &str) -> Self {
+        let mut vfs = snapshot::build(hostname);
+        let user = if username.is_empty() {
+            "root"
+        } else {
+            username
+        };
+
+        let (uid, gid, home_path) = if user == "root" {
+            (0, 0, "/root".to_string())
+        } else {
+            (1000, 1000, format!("/home/{user}"))
+        };
+
+        // Ensure the home directory exists (attackers may log in as any name).
+        let home = ensure_home(&mut vfs, &home_path, uid, gid);
+        let env = Env::login(user, &home_path, hostname);
+
+        Self {
+            vfs,
+            env,
+            cwd: home,
+            home,
+            prev_cwd: home,
+            username: user.to_string(),
+            hostname: hostname.to_string(),
+            uid,
+            gid,
+            last_status: 0,
+            pid: 1337,
+            history: Vec::new(),
+        }
+    }
+
+    /// Maximum command lines retained for the `history` builtin.
+    pub const MAX_HISTORY: usize = 1000;
+
+    /// Record a submitted command line in the session history (bounded).
+    pub fn record_history(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        self.history.push(line.to_string());
+        if self.history.len() > Self::MAX_HISTORY {
+            let overflow = self.history.len() - Self::MAX_HISTORY;
+            self.history.drain(0..overflow);
+        }
+    }
+
+    /// The absolute path of the current working directory.
+    pub fn cwd_path(&self) -> String {
+        self.vfs.path_of(self.cwd)
+    }
+
+    /// The interactive prompt string (no trailing newline).
+    pub fn prompt(&self) -> String {
+        let sigil = if self.uid == 0 { '#' } else { '$' };
+        let cwd = self.cwd_path();
+        let home = self.vfs.path_of(self.home);
+        let display = if cwd == home {
+            "~".to_string()
+        } else if let Some(rest) = cwd.strip_prefix(&format!("{home}/")) {
+            format!("~/{rest}")
+        } else {
+            cwd
+        };
+        format!("{}@{}:{}{} ", self.username, self.hostname, display, sigil)
+    }
+
+    /// Expand variables in `line` and split it into argument words — the argv
+    /// the command layer dispatches on. Expansion runs first so `$VAR` values
+    /// are subject to quoting/word-splitting by the tokenizer.
+    pub fn parse_line(&self, line: &str) -> Vec<String> {
+        parser::tokenize(&self.expand(line))
+    }
+
+    /// Expand `$VAR`, `${VAR}`, `$?`, and `$$` in `line`, respecting single
+    /// quotes (which suppress expansion).
+    fn expand(&self, line: &str) -> String {
+        let mut out = String::new();
+        let mut in_single = false;
+        let mut chars = line.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => {
+                    in_single = !in_single;
+                    out.push(c);
+                }
+                '$' if !in_single => match chars.peek() {
+                    Some('?') => {
+                        chars.next();
+                        out.push_str(&self.last_status.to_string());
+                    }
+                    Some('$') => {
+                        chars.next();
+                        out.push_str(&self.pid.to_string());
+                    }
+                    Some('{') => {
+                        chars.next();
+                        let mut name = String::new();
+                        for n in chars.by_ref() {
+                            if n == '}' {
+                                break;
+                            }
+                            name.push(n);
+                        }
+                        out.push_str(self.env.get(&name).unwrap_or(""));
+                    }
+                    Some(&n) if n.is_alphabetic() || n == '_' => {
+                        let mut name = String::new();
+                        while let Some(&n) = chars.peek() {
+                            if n.is_alphanumeric() || n == '_' {
+                                name.push(n);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        out.push_str(self.env.get(&name).unwrap_or(""));
+                    }
+                    _ => out.push('$'),
+                },
+                c => out.push(c),
+            }
+        }
+        out
+    }
+}
+
+/// Ensure `home_path` exists in `vfs`, creating it with skeleton dotfiles if
+/// the account is one the snapshot does not ship. Returns the home node id.
+fn ensure_home(vfs: &mut Vfs, home_path: &str, uid: u32, gid: u32) -> NodeId {
+    if let Some(id) = vfs.resolve(vfs.root(), home_path) {
+        return id;
+    }
+    let home = vfs.mkdir_p(home_path, 0o755, uid, gid);
+    vfs.add_file(home, ".bashrc", &b"# ~/.bashrc\n"[..], 0o644, uid, gid);
+    vfs.add_file(home, ".profile", &b"# ~/.profile\n"[..], 0o644, uid, gid);
+    home
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_starts_in_root_home() {
+        let shell = Shell::new("root", "debian");
+        assert_eq!(shell.cwd_path(), "/root");
+        assert_eq!(shell.uid, 0);
+        assert_eq!(shell.prompt(), "root@debian:~# ");
+    }
+
+    #[test]
+    fn unknown_user_gets_created_home() {
+        let shell = Shell::new("attacker", "debian");
+        assert_eq!(shell.cwd_path(), "/home/attacker");
+        assert_eq!(shell.uid, 1000);
+        assert_eq!(shell.prompt(), "attacker@debian:~$ ");
+    }
+
+    #[test]
+    fn prompt_abbreviates_paths_under_home() {
+        let mut shell = Shell::new("root", "debian");
+        // Move cwd outside home: absolute path is shown verbatim.
+        shell.cwd = shell.vfs.resolve(shell.vfs.root(), "/etc").unwrap();
+        assert_eq!(shell.prompt(), "root@debian:/etc# ");
+    }
+
+    #[test]
+    fn parse_line_expands_variables() {
+        let mut shell = Shell::new("root", "debian");
+        shell.last_status = 7;
+        assert_eq!(shell.parse_line("echo $USER"), vec!["echo", "root"]);
+        assert_eq!(shell.parse_line("echo ${HOME}"), vec!["echo", "/root"]);
+        assert_eq!(shell.parse_line("echo $?"), vec!["echo", "7"]);
+        assert_eq!(shell.parse_line("echo $$"), vec!["echo", "1337"]);
+        // Unset variables expand to nothing.
+        assert_eq!(shell.parse_line("echo $NOPE end"), vec!["echo", "end"]);
+    }
+
+    #[test]
+    fn single_quotes_suppress_expansion() {
+        let shell = Shell::new("root", "debian");
+        assert_eq!(shell.parse_line("echo '$USER'"), vec!["echo", "$USER"]);
+    }
+
+    #[test]
+    fn parse_line_honours_quoting_and_escapes() {
+        let shell = Shell::new("root", "debian");
+        assert_eq!(
+            shell.parse_line(r#"echo "a b"  c"#),
+            vec!["echo", "a b", "c"]
+        );
+        assert_eq!(shell.parse_line(r"echo a\ b"), vec!["echo", "a b"]);
+        assert!(shell.parse_line("   ").is_empty());
+    }
+
+    #[test]
+    fn history_skips_blank_and_is_bounded() {
+        let mut shell = Shell::new("root", "debian");
+        shell.record_history("   ");
+        assert!(shell.history.is_empty());
+        for i in 0..(Shell::MAX_HISTORY + 50) {
+            shell.record_history(&format!("cmd{i}"));
+        }
+        assert_eq!(shell.history.len(), Shell::MAX_HISTORY);
+        assert_eq!(shell.history.last().unwrap(), "cmd1049");
+    }
+}
