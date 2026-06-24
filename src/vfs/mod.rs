@@ -8,6 +8,7 @@
 //! ever opens, reads, or writes a real path.
 
 pub mod nodes;
+pub mod snapshot;
 
 pub use nodes::{Metadata, Node, NodeId, NodeKind, S_IFDIR, S_IFLNK, S_IFREG};
 

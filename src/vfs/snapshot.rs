@@ -1,0 +1,324 @@
+//! Debian 12 (Bookworm) filesystem snapshot.
+//!
+//! Builds a believable skeleton of `/`, `/etc`, `/home`, `/var`, `/proc`, and
+//! the usual top-level directories, populated with realistic content for the
+//! files attackers most commonly inspect (`/etc/passwd`, `/etc/os-release`,
+//! `/proc/cpuinfo`, ...). Everything is static and in-memory.
+
+use super::Vfs;
+
+/// File contents for `/etc/os-release` on Debian 12.
+const OS_RELEASE: &str = "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n\
+NAME=\"Debian GNU/Linux\"\n\
+VERSION_ID=\"12\"\n\
+VERSION=\"12 (bookworm)\"\n\
+VERSION_CODENAME=bookworm\n\
+ID=debian\n\
+HOME_URL=\"https://www.debian.org/\"\n\
+SUPPORT_URL=\"https://www.debian.org/support\"\n\
+BUG_REPORT_URL=\"https://bugs.debian.org/\"\n";
+
+/// File contents for `/etc/passwd` — the standard Debian system accounts plus
+/// one regular user (`user`, uid 1000).
+const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+bin:x:2:2:bin:/bin:/usr/sbin/nologin\n\
+sys:x:3:3:sys:/dev:/usr/sbin/nologin\n\
+sync:x:4:65534:sync:/bin:/bin/sync\n\
+games:x:5:60:games:/usr/games:/usr/sbin/nologin\n\
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin\n\
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin\n\
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin\n\
+news:x:9:9:news:/var/spool/news:/usr/sbin/nologin\n\
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin\n\
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
+sshd:x:100:65534::/run/sshd:/usr/sbin/nologin\n\
+user:x:1000:1000:user,,,:/home/user:/bin/bash\n";
+
+/// File contents for `/etc/group`.
+const GROUP: &str = "root:x:0:\n\
+daemon:x:1:\n\
+bin:x:2:\n\
+sys:x:3:\n\
+adm:x:4:\n\
+tty:x:5:\n\
+disk:x:6:\n\
+sudo:x:27:user\n\
+www-data:x:33:\n\
+ssh:x:114:\n\
+user:x:1000:\n";
+
+/// `/etc/shadow` — passwords shown as locked/hashed placeholders.
+const SHADOW: &str = "root:!:19000:0:99999:7:::\n\
+daemon:*:19000:0:99999:7:::\n\
+sshd:!:19000:0:99999:7:::\n\
+user:$6$rounds=656000$Yl9p1.salt$8N.placeholderhashvalueforhoneypotuseonlyx0123456789abcdefXYZ:19000:0:99999:7:::\n";
+
+/// `.bashrc` skeleton shipped by Debian's `bash` package.
+const BASHRC: &str = "# ~/.bashrc: executed by bash(1) for non-login shells.\n\
+\n\
+case $- in\n\
+    *i*) ;;\n\
+      *) return;;\n\
+esac\n\
+\n\
+HISTCONTROL=ignoreboth\n\
+HISTSIZE=1000\n\
+HISTFILESIZE=2000\n\
+shopt -s checkwinsize\n\
+\n\
+if [ -x /usr/bin/dircolors ]; then\n\
+    alias ls='ls --color=auto'\n\
+    alias grep='grep --color=auto'\n\
+fi\n\
+\n\
+alias ll='ls -alF'\n\
+alias la='ls -A'\n\
+alias l='ls -CF'\n";
+
+/// `.profile` skeleton.
+const PROFILE: &str = "# ~/.profile: executed by the command interpreter for login shells.\n\
+\n\
+if [ -n \"$BASH_VERSION\" ]; then\n\
+    if [ -f \"$HOME/.bashrc\" ]; then\n\
+\t. \"$HOME/.bashrc\"\n\
+    fi\n\
+fi\n\
+\n\
+if [ -d \"$HOME/bin\" ] ; then\n\
+    PATH=\"$HOME/bin:$PATH\"\n\
+fi\n";
+
+/// `/proc/cpuinfo` for a single-core virtual machine.
+const CPUINFO: &str = "processor\t: 0\n\
+vendor_id\t: GenuineIntel\n\
+cpu family\t: 6\n\
+model\t\t: 85\n\
+model name\t: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n\
+stepping\t: 7\n\
+microcode\t: 0x5003604\n\
+cpu MHz\t\t: 2500.000\n\
+cache size\t: 36608 KB\n\
+physical id\t: 0\n\
+siblings\t: 1\n\
+core id\t\t: 0\n\
+cpu cores\t: 1\n\
+apicid\t\t: 0\n\
+initial apicid\t: 0\n\
+fpu\t\t: yes\n\
+fpu_exception\t: yes\n\
+cpuid level\t: 13\n\
+wp\t\t: yes\n\
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single pti fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves ida arat pku ospke\n\
+bugs\t\t: spectre_v1 spectre_v2 spec_store_bypass mds swapgs taa itlb_multihit mmio_stale_data retbleed\n\
+bogomips\t: 5000.00\n\
+clflush size\t: 64\n\
+cache_alignment\t: 64\n\
+address sizes\t: 46 bits physical, 48 bits virtual\n\
+power management:\n\n";
+
+/// `/proc/meminfo` for a ~2 GiB VM.
+const MEMINFO: &str = "MemTotal:        2041208 kB\n\
+MemFree:         1503544 kB\n\
+MemAvailable:    1764920 kB\n\
+Buffers:           28104 kB\n\
+Cached:           284992 kB\n\
+SwapCached:            0 kB\n\
+Active:           296340 kB\n\
+Inactive:         148512 kB\n\
+SwapTotal:             0 kB\n\
+SwapFree:              0 kB\n\
+Dirty:                88 kB\n\
+Writeback:             0 kB\n\
+AnonPages:        131800 kB\n\
+Mapped:            73548 kB\n\
+Shmem:               992 kB\n\
+Slab:              58420 kB\n";
+
+/// `/proc/version`.
+const VERSION: &str = "Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n";
+
+/// `/etc/hosts`.
+const HOSTS_TAIL: &str = "\n\
+::1     localhost ip6-localhost ip6-loopback\n\
+ff02::1 ip6-allnodes\n\
+ff02::2 ip6-allrouters\n";
+
+/// `/etc/hosts` with the loopback alias pointing at the configured hostname,
+/// matching how `debconf` writes the file on a fresh Debian install.
+fn hosts_file(hostname: &str) -> String {
+    format!("127.0.0.1\tlocalhost\n127.0.1.1\t{hostname}\n{HOSTS_TAIL}")
+}
+
+/// Build and return a fully populated Debian 12 snapshot for `hostname`.
+pub fn build(hostname: &str) -> Vfs {
+    let mut fs = Vfs::new();
+    let root = fs.root();
+
+    // Top-level directories.
+    let etc = fs.mkdir(root, "etc", 0o755, 0, 0);
+    let home = fs.mkdir(root, "home", 0o755, 0, 0);
+    let root_home = fs.mkdir(root, "root", 0o700, 0, 0);
+    let proc = fs.mkdir(root, "proc", 0o555, 0, 0);
+    let var = fs.mkdir(root, "var", 0o755, 0, 0);
+    let usr = fs.mkdir(root, "usr", 0o755, 0, 0);
+    let tmp = fs.mkdir(root, "tmp", 0o1777, 0, 0);
+    fs.mkdir(root, "boot", 0o755, 0, 0);
+    fs.mkdir(root, "dev", 0o755, 0, 0);
+    fs.mkdir(root, "opt", 0o755, 0, 0);
+    fs.mkdir(root, "run", 0o755, 0, 0);
+    fs.mkdir(root, "srv", 0o755, 0, 0);
+    fs.mkdir(root, "sys", 0o555, 0, 0);
+    fs.mkdir(root, "mnt", 0o755, 0, 0);
+    fs.mkdir(root, "media", 0o755, 0, 0);
+
+    // Usual merged-/usr symlinks.
+    fs.add_symlink(root, "bin", "usr/bin");
+    fs.add_symlink(root, "sbin", "usr/sbin");
+    fs.add_symlink(root, "lib", "usr/lib");
+    fs.add_symlink(root, "lib64", "usr/lib64");
+
+    // /usr subtree.
+    let usr_bin = fs.mkdir(usr, "bin", 0o755, 0, 0);
+    fs.mkdir(usr, "sbin", 0o755, 0, 0);
+    fs.mkdir(usr, "lib", 0o755, 0, 0);
+    fs.mkdir(usr, "lib64", 0o755, 0, 0);
+    fs.mkdir(usr, "local", 0o755, 0, 0);
+    fs.mkdir(usr, "share", 0o755, 0, 0);
+    fs.mkdir(usr, "include", 0o755, 0, 0);
+    fs.mkdir(usr, "games", 0o755, 0, 0);
+    // A handful of "binaries" so `ls /usr/bin` and `which` look plausible.
+    for bin in [
+        "bash", "sh", "ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "echo", "grep", "sed",
+        "awk", "ps", "top", "kill", "wget", "curl", "ssh", "scp", "sudo", "su", "id", "whoami",
+        "uname", "apt", "apt-get", "dpkg", "python3", "perl", "vi", "nano", "tar", "gzip",
+    ] {
+        fs.add_file(usr_bin, bin, &b""[..], 0o755, 0, 0);
+    }
+
+    // /etc files.
+    fs.add_file(etc, "os-release", OS_RELEASE, 0o644, 0, 0);
+    fs.add_file(etc, "debian_version", "12.5\n", 0o644, 0, 0);
+    fs.add_file(etc, "hostname", format!("{hostname}\n"), 0o644, 0, 0);
+    fs.add_file(etc, "hosts", hosts_file(hostname), 0o644, 0, 0);
+    fs.add_file(etc, "passwd", PASSWD, 0o644, 0, 0);
+    fs.add_file(etc, "group", GROUP, 0o644, 0, 0);
+    fs.add_file(etc, "shadow", SHADOW, 0o640, 0, 42);
+    fs.add_file(
+        etc,
+        "resolv.conf",
+        "nameserver 127.0.0.53\noptions edns0 trust-ad\n",
+        0o644,
+        0,
+        0,
+    );
+    fs.add_file(etc, "issue", "Debian GNU/Linux 12 \\n \\l\n\n", 0o644, 0, 0);
+    fs.add_file(
+        etc,
+        "machine-id",
+        "1a2b3c4d5e6f70819aabbccddeeff001\n",
+        0o444,
+        0,
+        0,
+    );
+    fs.mkdir(etc, "ssh", 0o755, 0, 0);
+    fs.mkdir(etc, "apt", 0o755, 0, 0);
+    fs.mkdir(etc, "systemd", 0o755, 0, 0);
+    fs.mkdir(etc, "network", 0o755, 0, 0);
+
+    // /proc files.
+    fs.add_file(proc, "cpuinfo", CPUINFO, 0o444, 0, 0);
+    fs.add_file(proc, "meminfo", MEMINFO, 0o444, 0, 0);
+    fs.add_file(proc, "version", VERSION, 0o444, 0, 0);
+    fs.add_file(proc, "uptime", "184523.45 182013.12\n", 0o444, 0, 0);
+    fs.add_file(proc, "loadavg", "0.08 0.03 0.01 1/128 9241\n", 0o444, 0, 0);
+
+    // /var subtree.
+    let var_log = fs.mkdir(var, "log", 0o755, 0, 0);
+    fs.mkdir(var, "www", 0o755, 0, 0);
+    fs.mkdir(var, "cache", 0o755, 0, 0);
+    fs.mkdir(var, "lib", 0o755, 0, 0);
+    fs.mkdir(var, "spool", 0o755, 0, 0);
+    fs.mkdir(var, "tmp", 0o1777, 0, 0);
+    fs.mkdir(var, "backups", 0o755, 0, 0);
+    fs.add_file(var_log, "wtmp", &b""[..], 0o664, 0, 43);
+    fs.add_file(var_log, "lastlog", &b""[..], 0o664, 0, 43);
+    fs.add_file(var_log, "auth.log", &b""[..], 0o640, 0, 4);
+    fs.add_file(var_log, "syslog", &b""[..], 0o640, 0, 4);
+
+    // /tmp is empty by default.
+    let _ = tmp;
+
+    // /root dotfiles.
+    fs.add_file(root_home, ".bashrc", BASHRC, 0o644, 0, 0);
+    fs.add_file(root_home, ".profile", PROFILE, 0o644, 0, 0);
+    fs.add_file(root_home, ".bash_logout", "# ~/.bash_logout\n", 0o644, 0, 0);
+
+    // The standard regular user (uid 1000).
+    let user_home = fs.mkdir(home, "user", 0o755, 1000, 1000);
+    fs.add_file(user_home, ".bashrc", BASHRC, 0o644, 1000, 1000);
+    fs.add_file(user_home, ".profile", PROFILE, 0o644, 1000, 1000);
+    fs.add_file(
+        user_home,
+        ".bash_logout",
+        "# ~/.bash_logout\n",
+        0o644,
+        1000,
+        1000,
+    );
+
+    fs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::nodes::NodeKind;
+
+    fn read(fs: &Vfs, path: &str) -> String {
+        let id = fs.resolve(fs.root(), path).expect("path should resolve");
+        match &fs.node(id).kind {
+            NodeKind::File { contents } => String::from_utf8_lossy(contents).into_owned(),
+            _ => panic!("{path} is not a regular file"),
+        }
+    }
+
+    #[test]
+    fn hostname_is_consistent_across_files() {
+        let fs = build("web-prod-01");
+
+        assert_eq!(read(&fs, "/etc/hostname"), "web-prod-01\n");
+
+        let hosts = read(&fs, "/etc/hosts");
+        assert!(
+            hosts.contains("127.0.1.1\tweb-prod-01\n"),
+            "/etc/hosts should alias the configured hostname, got: {hosts:?}"
+        );
+        assert!(hosts.contains("127.0.0.1\tlocalhost\n"));
+    }
+
+    #[test]
+    fn common_paths_exist_with_expected_content() {
+        let fs = build("srv1");
+        let root = fs.root();
+
+        assert!(read(&fs, "/etc/os-release").contains("bookworm"));
+        assert!(read(&fs, "/etc/passwd").contains("user:x:1000:1000:"));
+        assert!(read(&fs, "/proc/cpuinfo").contains("model name\t: Intel"));
+
+        // Merged-/usr symlink resolves to a real binary.
+        assert!(fs.resolve(root, "/bin/ls").is_some());
+    }
+
+    #[test]
+    fn shadow_holds_no_real_credentials() {
+        let fs = build("srv1");
+        let shadow = read(&fs, "/etc/shadow");
+        assert!(shadow.contains("root:!:"), "root must be locked");
+        assert!(
+            shadow.contains("placeholderhash"),
+            "user hash must be an obvious placeholder, not a real hash"
+        );
+    }
+}
