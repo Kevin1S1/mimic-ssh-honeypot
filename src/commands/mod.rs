@@ -1,0 +1,126 @@
+//! Emulated command registry and dispatch.
+//!
+//! Every command is a pure Rust function that reads and mutates the in-memory
+//! [`Shell`] state and returns a [`CommandResult`]. No real process is ever
+//! spawned and no real path is ever touched.
+
+pub mod fs;
+pub mod system;
+
+use crate::shell::Shell;
+
+/// Hard cap on command output to prevent memory-amplification DoS.
+///
+/// The VFS is node-bounded, but a single command such as `cat` on a large
+/// attacker-written file can still amplify into an unbounded `String`. This
+/// constant bounds that amplification at the dispatch layer so *every* command
+/// is covered without per-command changes. 1 MiB is generous enough that
+/// legitimate interactions never hit it, yet small enough to make deliberate
+/// memory exhaustion infeasible.
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// The result of running one command.
+pub struct CommandResult {
+    /// Text written to the client (LF line endings).
+    pub output: String,
+    /// Process-style exit status.
+    pub status: i32,
+    /// Whether the session should end after this command.
+    pub exit: bool,
+}
+
+impl CommandResult {
+    /// A successful result (status 0) with the given output.
+    pub fn ok(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            status: 0,
+            exit: false,
+        }
+    }
+
+    /// A failing result with `status` and the given output.
+    pub fn err(output: impl Into<String>, status: i32) -> Self {
+        Self {
+            output: output.into(),
+            status,
+            exit: false,
+        }
+    }
+
+    /// A successful empty result (status 0, no output).
+    pub fn empty() -> Self {
+        Self::ok(String::new())
+    }
+
+    /// Mark this result as ending the session.
+    pub fn exiting(mut self) -> Self {
+        self.exit = true;
+        self
+    }
+
+    /// Truncate the output to at most [`MAX_COMMAND_OUTPUT_BYTES`], snapping to
+    /// a UTF-8 char boundary and appending a notice. Defence-in-depth: even if a
+    /// handler produces too much, dispatch caps it here.
+    fn truncate(&mut self) {
+        if self.output.len() <= MAX_COMMAND_OUTPUT_BYTES {
+            return;
+        }
+        let mut cut = MAX_COMMAND_OUTPUT_BYTES;
+        while cut > 0 && !self.output.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.output.truncate(cut);
+        self.output.push_str("\n... (output truncated)\n");
+    }
+}
+
+/// A command handler that either mutates the shell or reads it.
+enum CommandHandler {
+    Mut(fn(&mut Shell, &[String]) -> CommandResult),
+    Read(fn(&Shell, &[String]) -> CommandResult),
+}
+
+impl CommandHandler {
+    fn run(self, shell: &mut Shell, args: &[String]) -> CommandResult {
+        match self {
+            CommandHandler::Mut(f) => f(shell, args),
+            CommandHandler::Read(f) => f(shell, args),
+        }
+    }
+}
+
+/// Look up `argv[0]` and run the matching command.
+pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
+    let cmd = argv[0].as_str();
+    let args = &argv[1..];
+
+    let handler = match cmd {
+        // Filesystem reads.
+        "ls" | "dir" => CommandHandler::Read(fs::ls),
+        "cd" => CommandHandler::Mut(fs::cd),
+        "pwd" => CommandHandler::Read(fs::pwd),
+        "cat" => CommandHandler::Read(fs::cat),
+
+        // System / identity commands.
+        "whoami" => CommandHandler::Read(system::whoami),
+        "id" => CommandHandler::Read(system::id),
+        "uname" => CommandHandler::Read(system::uname),
+        "hostname" => CommandHandler::Read(system::hostname),
+        "echo" => CommandHandler::Read(system::echo),
+        "env" | "printenv" => CommandHandler::Read(system::env),
+        "export" => CommandHandler::Mut(system::export),
+        "unset" => CommandHandler::Mut(system::unset),
+        "clear" => CommandHandler::Read(system::clear),
+
+        "true" => return CommandResult::ok(""),
+        "false" => return CommandResult::err("", 1),
+        "exit" | "logout" => return CommandResult::ok("logout\n").exiting(),
+
+        other => return CommandResult::err(format!("-bash: {other}: command not found\n"), 127),
+    };
+
+    let mut result = handler.run(shell, args);
+    result.truncate();
+    result
+}
