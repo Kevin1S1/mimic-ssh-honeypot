@@ -47,6 +47,16 @@ impl Metadata {
             mtime: DEFAULT_MTIME,
         }
     }
+
+    /// Whether this node is a directory.
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+
+    /// Whether this node is a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
+    }
 }
 
 /// The payload of a node, discriminated by kind.
