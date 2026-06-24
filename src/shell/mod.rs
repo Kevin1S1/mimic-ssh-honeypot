@@ -11,8 +11,17 @@ pub mod env;
 pub mod line;
 pub mod parser;
 
+use crate::commands;
 use crate::vfs::{snapshot, NodeId, Vfs};
 use env::Env;
+
+/// The result of running one command line.
+pub struct Output {
+    /// Text to write back to the client.
+    pub text: String,
+    /// Whether the session should end (e.g. after `exit`).
+    pub exit: bool,
+}
 
 /// Per-session shell.
 pub struct Shell {
@@ -176,6 +185,24 @@ impl Shell {
             }
         }
         out
+    }
+
+    /// Run one command line: expand variables, tokenize, dispatch to the
+    /// command registry, and record the resulting `$?`. Empty lines are no-ops.
+    pub fn execute(&mut self, line: &str) -> Output {
+        let argv = self.parse_line(line);
+        if argv.is_empty() {
+            return Output {
+                text: String::new(),
+                exit: false,
+            };
+        }
+        let result = commands::dispatch(self, &argv);
+        self.last_status = result.status;
+        Output {
+            text: result.output,
+            exit: result.exit,
+        }
     }
 }
 
