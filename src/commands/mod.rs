@@ -5,6 +5,7 @@
 //! spawned and no real path is ever touched.
 
 pub mod fs;
+pub mod net;
 pub mod system;
 
 use crate::shell::Shell;
@@ -112,6 +113,14 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "export" => CommandHandler::Mut(system::export),
         "unset" => CommandHandler::Mut(system::unset),
         "clear" => CommandHandler::Read(system::clear),
+
+        // Network tools (no real network is ever touched).
+        "wget" => CommandHandler::Mut(net::wget),
+        "curl" => CommandHandler::Mut(net::curl),
+        "ping" | "ping6" => CommandHandler::Read(net::ping),
+        "netstat" => CommandHandler::Read(net::netstat),
+        "ss" => CommandHandler::Read(net::ss),
+        "ip" => CommandHandler::Read(net::ip),
 
         "true" => return CommandResult::ok(""),
         "false" => return CommandResult::err("", 1),
