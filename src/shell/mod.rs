@@ -23,6 +23,22 @@ pub struct Output {
     pub exit: bool,
 }
 
+/// A structured event produced by a command that the network layer drains and
+/// logs after each line. Keeps the emulation layer free of real I/O while still
+/// surfacing forensic events.
+#[derive(Debug, Clone)]
+pub enum Capture {
+    /// An attacker fetched a remote URL (`wget`/`curl`).
+    Download {
+        /// The tool used (`wget` or `curl`).
+        tool: String,
+        /// The requested URL.
+        url: String,
+        /// Where the body was written (a VFS path, or `-` for stdout).
+        dest: String,
+    },
+}
+
 /// Per-session shell.
 pub struct Shell {
     /// The in-memory Debian filesystem.
@@ -50,6 +66,9 @@ pub struct Shell {
     /// Submitted command lines this session, exposed by the `history` builtin.
     /// Bounded to keep per-session memory predictable.
     pub history: Vec<String>,
+    /// Captures (downloads, ...) produced by the last command, awaiting logging
+    /// by the network layer. Cleared at the start of every command line.
+    pub captures: Vec<Capture>,
 }
 
 impl Shell {
@@ -88,6 +107,7 @@ impl Shell {
             last_status: 0,
             pid: 1337,
             history: Vec::new(),
+            captures: Vec::new(),
         }
     }
 
@@ -190,6 +210,7 @@ impl Shell {
     /// Run one command line: expand variables, tokenize, dispatch to the
     /// command registry, and record the resulting `$?`. Empty lines are no-ops.
     pub fn execute(&mut self, line: &str) -> Output {
+        self.captures.clear();
         let argv = self.parse_line(line);
         if argv.is_empty() {
             return Output {

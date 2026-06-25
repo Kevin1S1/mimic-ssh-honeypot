@@ -41,6 +41,12 @@ pub fn connection_closed(session_id: u64, peer: SocketAddr) {
     info!(event = "connection_closed", session_id, peer = %peer);
 }
 
+/// An attacker fetched a remote URL with `wget`/`curl`. `dest` is the VFS path
+/// the body was "saved" to (or `-` for stdout). No real request was made.
+pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: &str) {
+    info!(event = "download", session_id, peer = %peer, tool, url, dest);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +140,18 @@ mod tests {
         let closed = fields(&events[3]);
         assert_eq!(closed["event"], "connection_closed");
         assert_eq!(closed["session_id"], 1);
+    }
+
+    #[test]
+    fn download_event_records_tool_url_and_dest() {
+        let (_, events) = capture(|| {
+            download(3, peer(), "wget", "http://evil.example/x.sh", "/root/x.sh");
+        });
+        let dl = fields(&events[0]);
+        assert_eq!(dl["event"], "download");
+        assert_eq!(dl["tool"], "wget");
+        assert_eq!(dl["url"], "http://evil.example/x.sh");
+        assert_eq!(dl["dest"], "/root/x.sh");
     }
 
     #[test]
