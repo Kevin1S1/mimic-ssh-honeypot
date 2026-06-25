@@ -1,5 +1,11 @@
 //! System and identity commands: `whoami`, `id`, `uname`, `hostname`, `echo`,
-//! `env`, `export`, `unset`, `clear`.
+//! `env`, `export`, `unset`, `clear`, plus process-table emulation (`ps`,
+//! `top`, `kill`, `free`, `uptime`).
+//!
+//! There is no real process table — every row is fabricated from a static base
+//! plus the session's own fake shell PID. `kill` never signals anything; it
+//! only validates the target PID against the fake table and returns the message
+//! a real shell would.
 
 use super::CommandResult;
 use crate::shell::Shell;
@@ -216,6 +222,451 @@ pub fn clear(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("\x1b[H\x1b[2J\x1b[3J")
 }
 
+/// One row of the fabricated process table.
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    user: String,
+    tty: &'static str,
+    stat: &'static str,
+    /// %CPU.
+    cpu: &'static str,
+    /// %MEM.
+    mem: &'static str,
+    /// Virtual size in KiB.
+    vsz: u32,
+    /// Resident set size in KiB.
+    rss: u32,
+    time: &'static str,
+    start: &'static str,
+    cmd: String,
+}
+
+/// The static system processes a freshly booted Debian 12 VM shows.
+fn base_table() -> Vec<Proc> {
+    vec![
+        Proc {
+            pid: 1,
+            ppid: 0,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "Ss",
+            cpu: "0.0",
+            mem: "0.4",
+            vsz: 167404,
+            rss: 13072,
+            time: "0:02",
+            start: "May03",
+            cmd: "/sbin/init".to_string(),
+        },
+        Proc {
+            pid: 2,
+            ppid: 0,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "S",
+            cpu: "0.0",
+            mem: "0.0",
+            vsz: 0,
+            rss: 0,
+            time: "0:00",
+            start: "May03",
+            cmd: "[kthreadd]".to_string(),
+        },
+        Proc {
+            pid: 312,
+            ppid: 1,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "Ss",
+            cpu: "0.0",
+            mem: "0.3",
+            vsz: 24684,
+            rss: 9216,
+            time: "0:01",
+            start: "May03",
+            cmd: "/lib/systemd/systemd-journald".to_string(),
+        },
+        Proc {
+            pid: 334,
+            ppid: 1,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "Ss",
+            cpu: "0.0",
+            mem: "0.2",
+            vsz: 21916,
+            rss: 6400,
+            time: "0:00",
+            start: "May03",
+            cmd: "/lib/systemd/systemd-udevd".to_string(),
+        },
+        Proc {
+            pid: 501,
+            ppid: 1,
+            user: "systemd+".to_string(),
+            tty: "?",
+            stat: "Ssl",
+            cpu: "0.0",
+            mem: "0.3",
+            vsz: 90264,
+            rss: 9088,
+            time: "0:00",
+            start: "May03",
+            cmd: "/lib/systemd/systemd-resolved".to_string(),
+        },
+        Proc {
+            pid: 512,
+            ppid: 1,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "Ss",
+            cpu: "0.0",
+            mem: "0.2",
+            vsz: 6892,
+            rss: 4992,
+            time: "0:00",
+            start: "May03",
+            cmd: "/usr/sbin/cron -f".to_string(),
+        },
+        Proc {
+            pid: 528,
+            ppid: 1,
+            user: "message+".to_string(),
+            tty: "?",
+            stat: "Ss",
+            cpu: "0.0",
+            mem: "0.2",
+            vsz: 8460,
+            rss: 4736,
+            time: "0:00",
+            start: "May03",
+            cmd: "/usr/bin/dbus-daemon --system".to_string(),
+        },
+        Proc {
+            pid: 604,
+            ppid: 1,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "Ss",
+            cpu: "0.0",
+            mem: "0.4",
+            vsz: 15420,
+            rss: 9472,
+            time: "0:00",
+            start: "May03",
+            cmd: "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups".to_string(),
+        },
+        Proc {
+            pid: 611,
+            ppid: 1,
+            user: "root".to_string(),
+            tty: "?",
+            stat: "Ssl",
+            cpu: "0.0",
+            mem: "0.5",
+            vsz: 313196,
+            rss: 12544,
+            time: "0:01",
+            start: "May03",
+            cmd: "/usr/lib/systemd/systemd-logind".to_string(),
+        },
+        Proc {
+            pid: 1188,
+            ppid: 1,
+            user: "root".to_string(),
+            tty: "tty1",
+            stat: "Ss+",
+            cpu: "0.0",
+            mem: "0.1",
+            vsz: 5612,
+            rss: 3200,
+            time: "0:00",
+            start: "May03",
+            cmd: "/sbin/agetty -o -p -- \\u --noclear tty1 linux".to_string(),
+        },
+    ]
+}
+
+/// Build the full table including this session's own login chain.
+fn session_table(shell: &Shell) -> Vec<Proc> {
+    let mut table = base_table();
+    let user = shell.username.clone();
+    let sshd_pid = shell.pid.saturating_sub(2).max(1000);
+    let bash_pid = shell.pid;
+    let ps_pid = shell.pid + 1;
+
+    table.push(Proc {
+        pid: sshd_pid,
+        ppid: 604,
+        user: user.clone(),
+        tty: "?",
+        stat: "Ss",
+        cpu: "0.0",
+        mem: "0.4",
+        vsz: 17668,
+        rss: 10880,
+        time: "0:00",
+        start: "10:14",
+        cmd: format!("sshd: {}@pts/0", shell.username),
+    });
+    table.push(Proc {
+        pid: bash_pid,
+        ppid: sshd_pid,
+        user: user.clone(),
+        tty: "pts/0",
+        stat: "Ss",
+        cpu: "0.0",
+        mem: "0.2",
+        vsz: 8228,
+        rss: 5376,
+        time: "0:00",
+        start: "10:14",
+        cmd: "-bash".to_string(),
+    });
+    table.push(Proc {
+        pid: ps_pid,
+        ppid: bash_pid,
+        user: user.clone(),
+        tty: "pts/0",
+        stat: "R+",
+        cpu: "0.0",
+        mem: "0.1",
+        vsz: 10072,
+        rss: 3200,
+        time: "0:00",
+        start: "10:15",
+        cmd: "ps aux".to_string(),
+    });
+    table
+}
+
+/// `ps [aux|-ef|...]`
+pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
+    let joined: String = args.join("");
+    let table = session_table(shell);
+
+    // `ps aux` / `ps -ef` style: show every process. Bare `ps` shows only this
+    // session's processes on its tty.
+    let show_all = joined.contains('a')
+        || joined.contains('e')
+        || joined.contains('A')
+        || args.iter().any(|a| a == "-ef" || a == "aux");
+    let ef = args.iter().any(|a| a == "-ef") || joined.contains('f') && !joined.contains('u');
+    let user_fmt = joined.contains('u') || args.iter().any(|a| a == "aux");
+
+    let mut out = String::new();
+    if ef {
+        out.push_str("UID          PID    PPID  C STIME TTY          TIME CMD\n");
+        for p in &table {
+            if !show_all && p.tty != "pts/0" {
+                continue;
+            }
+            out.push_str(&format!(
+                "{:<8} {:>6} {:>7}  0 {:>5} {:<8} {:>8} {}\n",
+                p.user, p.pid, p.ppid, p.start, p.tty, p.time, p.cmd
+            ));
+        }
+    } else if user_fmt {
+        out.push_str(
+            "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n",
+        );
+        for p in &table {
+            if !show_all && p.tty != "pts/0" {
+                continue;
+            }
+            out.push_str(&format!(
+                "{:<8} {:>5} {:>4} {:>4} {:>6} {:>5} {:<8} {:<4} {:>5} {:>6} {}\n",
+                p.user, p.pid, p.cpu, p.mem, p.vsz, p.rss, p.tty, p.stat, p.start, p.time, p.cmd
+            ));
+        }
+    } else {
+        out.push_str("    PID TTY          TIME CMD\n");
+        for p in &table {
+            if !show_all && p.tty != "pts/0" {
+                continue;
+            }
+            out.push_str(&format!(
+                "{:>7} {:<12} {:>5} {}\n",
+                p.pid,
+                p.tty,
+                p.time,
+                p.cmd.split_whitespace().next().unwrap_or(&p.cmd)
+            ));
+        }
+    }
+    CommandResult::ok(out)
+}
+
+/// `top` (batch-mode snapshot; the interactive UI is not emulated).
+pub fn top(shell: &Shell, _args: &[String]) -> CommandResult {
+    let table = session_table(shell);
+    let running = table.iter().filter(|p| p.stat.starts_with('R')).count();
+    let sleeping = table.len() - running;
+
+    let mut out = String::new();
+    out.push_str("top - 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n");
+    out.push_str(&format!(
+        "Tasks: {:>3} total,   {} running, {:>3} sleeping,   0 stopped,   0 zombie\n",
+        table.len(),
+        running,
+        sleeping
+    ));
+    out.push_str(
+        "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n",
+    );
+    out.push_str("MiB Mem :   1993.4 total,   1468.3 free,    128.7 used,    396.4 buff/cache\n");
+    out.push_str("MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1723.6 avail Mem\n");
+    out.push('\n');
+    out.push_str(
+        "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n",
+    );
+    for p in &table {
+        out.push_str(&format!(
+            "{:>7} {:<8}  20   0 {:>7} {:>6} {:>6} {} {:>5} {:>5}   {:>7} {}\n",
+            p.pid,
+            p.user,
+            p.vsz,
+            p.rss,
+            p.rss / 2,
+            &p.stat[..1],
+            p.cpu,
+            p.mem,
+            p.time,
+            p.cmd.split_whitespace().next().unwrap_or(&p.cmd)
+        ));
+    }
+    CommandResult::ok(out)
+}
+
+/// `kill [-SIG] PID...`
+pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut pids: Vec<&str> = Vec::new();
+    let mut list = false;
+    for arg in args {
+        match arg.as_str() {
+            "-l" | "--list" => list = true,
+            // Signal specifiers (e.g. -9, -SIGKILL, -s TERM): accepted, ignored.
+            s if s.starts_with('-') => {}
+            other => pids.push(other),
+        }
+    }
+
+    if list {
+        return CommandResult::ok(
+            " 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 4) SIGILL\t 5) SIGTRAP\n\
+             6) SIGABRT\t 7) SIGBUS\t 8) SIGFPE\t 9) SIGKILL\t10) SIGUSR1\n\
+            11) SIGSEGV\t12) SIGUSR2\t13) SIGPIPE\t14) SIGALRM\t15) SIGTERM\n",
+        );
+    }
+
+    if pids.is_empty() {
+        return CommandResult::err(
+            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]\n",
+            2,
+        );
+    }
+
+    let table = session_table(shell);
+    let mut out = String::new();
+    let mut status = 0;
+    for pid_str in pids {
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            out.push_str(&format!(
+                "-bash: kill: {pid_str}: arguments must be process or job IDs\n"
+            ));
+            status = 1;
+            continue;
+        };
+        match table.iter().find(|p| p.pid == pid) {
+            None => {
+                out.push_str(&format!("-bash: kill: ({pid}) - No such process\n"));
+                status = 1;
+            }
+            Some(p) => {
+                // Non-root may only signal its own processes; system PIDs are
+                // owned by root, so an unprivileged attacker is denied.
+                if shell.uid != 0 && p.user != shell.username {
+                    out.push_str(&format!("-bash: kill: ({pid}) - Operation not permitted\n"));
+                    status = 1;
+                }
+                // Otherwise: silently "succeed" without affecting anything.
+            }
+        }
+    }
+    if status == 0 {
+        CommandResult::empty()
+    } else {
+        CommandResult::err(out, status)
+    }
+}
+
+/// `free [-h|-m|-g]`
+pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
+    let human = args.iter().any(|a| a == "-h" || a == "--human");
+    let mega = args.iter().any(|a| a == "-m");
+    let giga = args.iter().any(|a| a == "-g");
+
+    // Base figures in KiB.
+    let (total, used, free_mem, shared, buff, available) =
+        (2041208u64, 131800, 1503544, 992, 313072, 1764920);
+
+    let fmt = |kb: u64| -> String {
+        if human {
+            human_kib(kb)
+        } else if mega {
+            (kb / 1024).to_string()
+        } else if giga {
+            (kb / 1024 / 1024).to_string()
+        } else {
+            kb.to_string()
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str(
+        "               total        used        free      shared  buff/cache   available\n",
+    );
+    out.push_str(&format!(
+        "Mem:    {:>12} {:>11} {:>11} {:>11} {:>11} {:>11}\n",
+        fmt(total),
+        fmt(used),
+        fmt(free_mem),
+        fmt(shared),
+        fmt(buff),
+        fmt(available)
+    ));
+    out.push_str(&format!(
+        "Swap:   {:>12} {:>11} {:>11}\n",
+        fmt(0),
+        fmt(0),
+        fmt(0)
+    ));
+    CommandResult::ok(out)
+}
+
+/// Human-readable size for `free -h` (Gi/Mi/Ki units).
+fn human_kib(kb: u64) -> String {
+    let bytes = kb as f64 * 1024.0;
+    const UNITS: [&str; 5] = ["B", "Ki", "Mi", "Gi", "Ti"];
+    let mut value = bytes;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}B", value as u64)
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// `uptime`
+pub fn uptime(_shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok(" 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::shell::Shell;
@@ -283,5 +734,53 @@ mod tests {
     fn clear_emits_ansi_reset() {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "clear"), "\x1b[H\x1b[2J\x1b[3J");
+    }
+
+    #[test]
+    fn ps_aux_lists_system_and_session() {
+        let mut shell = Shell::new("root", "debian");
+        let out = run(&mut shell, "ps aux");
+        assert!(out.contains("USER"));
+        assert!(out.contains("/sbin/init"));
+        assert!(out.contains("sshd"));
+        assert!(out.contains("-bash"));
+    }
+
+    #[test]
+    fn ps_ef_format() {
+        let mut shell = Shell::new("root", "debian");
+        let out = run(&mut shell, "ps -ef");
+        assert!(out.contains("UID"));
+        assert!(out.contains("PPID"));
+    }
+
+    #[test]
+    fn kill_unknown_pid_errors() {
+        let mut shell = Shell::new("root", "debian");
+        let out = shell.execute("kill 999999");
+        assert!(out.text.contains("No such process"));
+        assert_eq!(shell.last_status, 1);
+    }
+
+    #[test]
+    fn kill_system_pid_denied_for_nonroot() {
+        let mut shell = Shell::new("attacker", "debian");
+        let out = shell.execute("kill 1");
+        assert!(out.text.contains("Operation not permitted"));
+        assert_eq!(shell.last_status, 1);
+    }
+
+    #[test]
+    fn top_and_free_render() {
+        let mut shell = Shell::new("root", "debian");
+        assert!(run(&mut shell, "top").contains("Tasks:"));
+        assert!(run(&mut shell, "free").contains("Mem:"));
+        assert!(run(&mut shell, "free -h").contains("Mi"));
+    }
+
+    #[test]
+    fn uptime_renders() {
+        let mut shell = Shell::new("root", "debian");
+        assert!(run(&mut shell, "uptime").contains("load average:"));
     }
 }
