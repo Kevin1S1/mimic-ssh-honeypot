@@ -114,6 +114,13 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "unset" => CommandHandler::Mut(system::unset),
         "clear" => CommandHandler::Read(system::clear),
 
+        // Process-table emulation (no real process is ever signalled).
+        "ps" => CommandHandler::Read(system::ps),
+        "top" => CommandHandler::Read(system::top),
+        "kill" => CommandHandler::Read(system::kill),
+        "free" => CommandHandler::Read(system::free),
+        "uptime" => CommandHandler::Read(system::uptime),
+
         // Network tools (no real network is ever touched).
         "wget" => CommandHandler::Mut(net::wget),
         "curl" => CommandHandler::Mut(net::curl),
