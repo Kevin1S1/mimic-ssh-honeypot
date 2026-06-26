@@ -363,6 +363,611 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
+// --- Mutating file operations ---------------------------------------------
+//
+// Every operand resolves through the VFS only; the helpers below never touch a
+// real path. Destructive ops act on the per-session VFS copy, which is bounded
+// by the arena node cap, so `rm -rf /` and friends cannot harm the host.
+
+/// Strip trailing `/` from a path operand (keeping a lone `/`).
+fn strip_trailing_slashes(p: &str) -> &str {
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// Resolve `path` to the `(parent_directory, final_name)` pair used when
+/// creating, removing, or renaming an entry. Returns `None` if the parent
+/// directory does not exist or is not a directory, or the final component is
+/// empty/`.`/`..`.
+fn resolve_parent(shell: &Shell, path: &str) -> Option<(NodeId, String)> {
+    let path = strip_trailing_slashes(path);
+    let (dir, name) = Vfs::split_path(path);
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    let parent = shell.vfs.resolve(shell.cwd, dir)?;
+    if !shell.vfs.node(parent).meta.is_dir() {
+        return None;
+    }
+    Some((parent, name.to_string()))
+}
+
+/// The basename of a path operand (final non-empty component).
+fn basename(path: &str) -> &str {
+    Vfs::split_path(strip_trailing_slashes(path)).1
+}
+
+/// Build a [`CommandResult`] from accumulated output and an exit status.
+fn finish(out: String, status: i32) -> CommandResult {
+    if status == 0 {
+        CommandResult::ok(out)
+    } else {
+        CommandResult::err(out, status)
+    }
+}
+
+/// `touch [OPTION]... FILE...`
+pub fn touch(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut no_create = false;
+    let mut operands: Vec<&str> = Vec::new();
+    let mut skip_value = false;
+
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        match arg.as_str() {
+            "-c" | "--no-create" => no_create = true,
+            // Options that take a following value we accept but ignore.
+            "-r" | "--reference" | "-d" | "--date" | "-t" => skip_value = true,
+            "-a" | "-m" | "--time" => {}
+            other if other.starts_with('-') && other.len() > 1 && !other.starts_with("--") => {
+                // Bundled short flags like -am; ignore unknown ones quietly.
+            }
+            other => operands.push(other),
+        }
+    }
+
+    if operands.is_empty() {
+        return CommandResult::err(
+            "touch: missing file operand\nTry 'touch --help' for more information.\n",
+            1,
+        );
+    }
+
+    let (uid, gid) = (shell.uid, shell.gid);
+    let mut out = String::new();
+    let mut status = 0;
+    for path in operands {
+        match resolve_parent(shell, path) {
+            // `vfs.touch` creates the file or refreshes mtime if it exists.
+            Some((parent, name)) => {
+                if no_create && shell.vfs.child(parent, &name).is_none() {
+                    continue;
+                }
+                shell.vfs.touch(parent, &name, uid, gid);
+            }
+            None => {
+                out.push_str(&format!(
+                    "touch: cannot touch '{path}': No such file or directory\n"
+                ));
+                status = 1;
+            }
+        }
+    }
+    finish(out, status)
+}
+
+/// `mkdir [OPTION]... DIRECTORY...`
+pub fn mkdir(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut parents = false;
+    let mut operands: Vec<&str> = Vec::new();
+    let mut skip_value = false;
+
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        match arg.as_str() {
+            "-p" | "--parents" => parents = true,
+            "-v" | "--verbose" => {}
+            "-m" | "--mode" => skip_value = true,
+            other if other.starts_with("-m") && other.len() > 2 => {} // -m755
+            other if other.starts_with('-') && other.len() > 1 && !other.starts_with("--") => {
+                if other.contains('p') {
+                    parents = true;
+                }
+            }
+            other => operands.push(other),
+        }
+    }
+
+    if operands.is_empty() {
+        return CommandResult::err(
+            "mkdir: missing operand\nTry 'mkdir --help' for more information.\n",
+            1,
+        );
+    }
+
+    let (uid, gid) = (shell.uid, shell.gid);
+    let mut out = String::new();
+    let mut status = 0;
+    for path in operands {
+        if parents {
+            // Walk component by component, creating directories as needed.
+            let mut current = if path.starts_with('/') {
+                shell.vfs.root()
+            } else {
+                shell.cwd
+            };
+            for comp in strip_trailing_slashes(path).split('/') {
+                match comp {
+                    "" | "." => continue,
+                    ".." => current = shell.vfs.node(current).parent.unwrap_or(current),
+                    name => {
+                        if let Some(child) = shell.vfs.child(current, name) {
+                            if !shell.vfs.node(child).meta.is_dir() {
+                                out.push_str(&format!(
+                                    "mkdir: cannot create directory '{path}': Not a directory\n"
+                                ));
+                                status = 1;
+                                break;
+                            }
+                            current = child;
+                        } else {
+                            current = shell.vfs.mkdir(current, name, 0o755, uid, gid);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        match resolve_parent(shell, path) {
+            Some((parent, name)) => {
+                if shell.vfs.child(parent, &name).is_some() {
+                    out.push_str(&format!(
+                        "mkdir: cannot create directory '{path}': File exists\n"
+                    ));
+                    status = 1;
+                } else {
+                    shell.vfs.mkdir(parent, &name, 0o755, uid, gid);
+                }
+            }
+            None => {
+                out.push_str(&format!(
+                    "mkdir: cannot create directory '{path}': No such file or directory\n"
+                ));
+                status = 1;
+            }
+        }
+    }
+    finish(out, status)
+}
+
+/// `rmdir [OPTION]... DIRECTORY...`
+pub fn rmdir(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut parents = false;
+    let mut operands: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-p" | "--parents" => parents = true,
+            "-v" | "--verbose" | "--ignore-fail-on-non-empty" => {}
+            other if other.starts_with('-') && other.len() > 1 => {}
+            other => operands.push(other),
+        }
+    }
+
+    if operands.is_empty() {
+        return CommandResult::err(
+            "rmdir: missing operand\nTry 'rmdir --help' for more information.\n",
+            1,
+        );
+    }
+
+    let mut out = String::new();
+    let mut status = 0;
+    for path in operands {
+        let mut p = strip_trailing_slashes(path).to_string();
+        loop {
+            let Some((parent, name)) = resolve_parent(shell, &p) else {
+                out.push_str(&format!(
+                    "rmdir: failed to remove '{p}': No such file or directory\n"
+                ));
+                status = 1;
+                break;
+            };
+            let Some(target) = shell.vfs.child(parent, &name) else {
+                out.push_str(&format!(
+                    "rmdir: failed to remove '{p}': No such file or directory\n"
+                ));
+                status = 1;
+                break;
+            };
+            if !shell.vfs.node(target).meta.is_dir() {
+                out.push_str(&format!("rmdir: failed to remove '{p}': Not a directory\n"));
+                status = 1;
+                break;
+            }
+            let empty = shell
+                .vfs
+                .entries(target)
+                .map(|e| e.is_empty())
+                .unwrap_or(true);
+            if !empty {
+                out.push_str(&format!(
+                    "rmdir: failed to remove '{p}': Directory not empty\n"
+                ));
+                status = 1;
+                break;
+            }
+            shell.vfs.unlink(parent, &name);
+            if !parents {
+                break;
+            }
+            // `-p`: ascend and remove now-empty parents.
+            let (dir, _) = Vfs::split_path(&p);
+            if dir == "." || dir == "/" || dir.is_empty() {
+                break;
+            }
+            p = dir.to_string();
+        }
+    }
+    finish(out, status)
+}
+
+/// `rm [OPTION]... FILE...`
+pub fn rm(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut recursive = false;
+    let mut force = false;
+    let mut dir_ok = false;
+    let mut operands: Vec<&str> = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "-r" | "-R" | "--recursive" => recursive = true,
+            "-f" | "--force" => force = true,
+            "-d" | "--dir" => dir_ok = true,
+            "-v" | "--verbose" | "-i" => {}
+            other if other.starts_with('-') && other.len() > 1 && !other.starts_with("--") => {
+                for ch in other[1..].chars() {
+                    match ch {
+                        'r' | 'R' => recursive = true,
+                        'f' => force = true,
+                        'd' => dir_ok = true,
+                        _ => {}
+                    }
+                }
+            }
+            other => operands.push(other),
+        }
+    }
+
+    if operands.is_empty() {
+        if force {
+            return CommandResult::empty();
+        }
+        return CommandResult::err(
+            "rm: missing operand\nTry 'rm --help' for more information.\n",
+            1,
+        );
+    }
+
+    let mut out = String::new();
+    let mut status = 0;
+    for path in operands {
+        let base = basename(path);
+        if base == "." || base == ".." {
+            out.push_str(&format!(
+                "rm: refusing to remove '.' or '..' directory: skipping '{path}'\n"
+            ));
+            status = 1;
+            continue;
+        }
+
+        let Some((parent, name)) = resolve_parent(shell, path) else {
+            if !force {
+                out.push_str(&format!(
+                    "rm: cannot remove '{path}': No such file or directory\n"
+                ));
+                status = 1;
+            }
+            continue;
+        };
+        let Some(target) = shell.vfs.child(parent, &name) else {
+            if !force {
+                out.push_str(&format!(
+                    "rm: cannot remove '{path}': No such file or directory\n"
+                ));
+                status = 1;
+            }
+            continue;
+        };
+
+        if shell.vfs.node(target).meta.is_dir() {
+            let empty = shell
+                .vfs
+                .entries(target)
+                .map(|e| e.is_empty())
+                .unwrap_or(true);
+            if !recursive {
+                if !dir_ok {
+                    out.push_str(&format!("rm: cannot remove '{path}': Is a directory\n"));
+                    status = 1;
+                    continue;
+                }
+                if !empty {
+                    out.push_str(&format!(
+                        "rm: cannot remove '{path}': Directory not empty\n"
+                    ));
+                    status = 1;
+                    continue;
+                }
+            }
+        }
+        shell.vfs.unlink(parent, &name);
+    }
+    finish(out, status)
+}
+
+/// `cp [OPTION]... SOURCE... DEST`
+pub fn cp(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut recursive = false;
+    let mut operands: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-r" | "-R" | "--recursive" | "-a" | "--archive" => recursive = true,
+            "-v" | "--verbose" | "-f" | "-p" | "-i" => {}
+            other if other.starts_with('-') && other.len() > 1 && !other.starts_with("--") => {
+                for ch in other[1..].chars() {
+                    if ch == 'r' || ch == 'R' || ch == 'a' {
+                        recursive = true;
+                    }
+                }
+            }
+            other => operands.push(other),
+        }
+    }
+
+    if operands.len() < 2 {
+        let missing = if operands.is_empty() {
+            "missing file operand"
+        } else {
+            "missing destination file operand"
+        };
+        return CommandResult::err(
+            format!("cp: {missing}\nTry 'cp --help' for more information.\n"),
+            1,
+        );
+    }
+
+    let dest = operands.pop().unwrap();
+    let dest_dir = shell
+        .vfs
+        .resolve(shell.cwd, dest)
+        .filter(|&id| shell.vfs.node(id).meta.is_dir());
+
+    if operands.len() > 1 && dest_dir.is_none() {
+        return CommandResult::err(format!("cp: target '{dest}' is not a directory\n"), 1);
+    }
+
+    let mut out = String::new();
+    let mut status = 0;
+    for src in operands {
+        let Some(src_id) = shell.vfs.resolve(shell.cwd, src) else {
+            out.push_str(&format!(
+                "cp: cannot stat '{src}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+        if shell.vfs.node(src_id).meta.is_dir() && !recursive {
+            out.push_str(&format!(
+                "cp: -r not specified; omitting directory '{src}'\n"
+            ));
+            status = 1;
+            continue;
+        }
+
+        let (parent, name) = if let Some(dir) = dest_dir {
+            (dir, basename(src).to_string())
+        } else {
+            match resolve_parent(shell, dest) {
+                Some(pn) => pn,
+                None => {
+                    out.push_str(&format!(
+                        "cp: cannot create regular file '{dest}': No such file or directory\n"
+                    ));
+                    status = 1;
+                    continue;
+                }
+            }
+        };
+        shell.vfs.deep_copy(src_id, parent, &name);
+    }
+    finish(out, status)
+}
+
+/// `mv [OPTION]... SOURCE... DEST`
+pub fn mv(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut operands: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-v" | "--verbose" | "-f" | "-i" | "-n" | "--no-clobber" => {}
+            other if other.starts_with('-') && other.len() > 1 && !other.starts_with("--") => {}
+            other => operands.push(other),
+        }
+    }
+
+    if operands.len() < 2 {
+        let missing = if operands.is_empty() {
+            "missing file operand"
+        } else {
+            "missing destination file operand"
+        };
+        return CommandResult::err(
+            format!("mv: {missing}\nTry 'mv --help' for more information.\n"),
+            1,
+        );
+    }
+
+    let dest = operands.pop().unwrap();
+    let dest_dir = shell
+        .vfs
+        .resolve(shell.cwd, dest)
+        .filter(|&id| shell.vfs.node(id).meta.is_dir());
+
+    if operands.len() > 1 && dest_dir.is_none() {
+        return CommandResult::err(format!("mv: target '{dest}' is not a directory\n"), 1);
+    }
+
+    let mut out = String::new();
+    let mut status = 0;
+    for src in operands {
+        let Some((src_parent, src_name)) = resolve_parent(shell, src) else {
+            out.push_str(&format!(
+                "mv: cannot stat '{src}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+        let Some(src_id) = shell.vfs.child(src_parent, &src_name) else {
+            out.push_str(&format!(
+                "mv: cannot stat '{src}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+
+        let (parent, name) = if let Some(dir) = dest_dir {
+            (dir, basename(src).to_string())
+        } else {
+            match resolve_parent(shell, dest) {
+                Some(pn) => pn,
+                None => {
+                    out.push_str(&format!(
+                        "mv: cannot move '{src}' to '{dest}': No such file or directory\n"
+                    ));
+                    status = 1;
+                    continue;
+                }
+            }
+        };
+        shell.vfs.rename(src_id, parent, &name);
+    }
+    finish(out, status)
+}
+
+/// `chmod [OPTION]... MODE FILE...`
+pub fn chmod(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut recursive = false;
+    let mut rest: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-R" | "--recursive" => recursive = true,
+            "-v" | "--verbose" | "-c" | "-f" => {}
+            other => rest.push(other),
+        }
+    }
+
+    if rest.len() < 2 {
+        return CommandResult::err(
+            "chmod: missing operand\nTry 'chmod --help' for more information.\n",
+            1,
+        );
+    }
+
+    let mode_spec = rest.remove(0);
+    let mut out = String::new();
+    let mut status = 0;
+    for path in rest {
+        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
+            out.push_str(&format!(
+                "chmod: cannot access '{path}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+        match compute_mode(mode_spec, shell.vfs.node(id).meta.mode & 0o7777) {
+            Some(new_perms) => apply_chmod(shell, id, new_perms, mode_spec, recursive),
+            None => {
+                return CommandResult::err(format!("chmod: invalid mode: '{mode_spec}'\n"), 1);
+            }
+        }
+    }
+    finish(out, status)
+}
+
+/// Apply a chmod to `id`, recursing into directories when requested.
+fn apply_chmod(shell: &mut Shell, id: NodeId, perms: u32, spec: &str, recursive: bool) {
+    shell.vfs.chmod(id, perms);
+    if recursive && shell.vfs.node(id).meta.is_dir() {
+        for (_, child) in shell.vfs.entries(id).unwrap_or_default() {
+            let child_perms =
+                compute_mode(spec, shell.vfs.node(child).meta.mode & 0o7777).unwrap_or(perms);
+            apply_chmod(shell, child, child_perms, spec, recursive);
+        }
+    }
+}
+
+/// Resolve a chmod mode spec (octal like `755`/`0644` or symbolic like
+/// `u+x`,`go-w`,`a=r`) against the current permission bits. Returns `None` for
+/// a malformed spec.
+fn compute_mode(spec: &str, current: u32) -> Option<u32> {
+    if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
+        return u32::from_str_radix(spec, 8).ok().map(|m| m & 0o7777);
+    }
+
+    let mut mode = current;
+    for clause in spec.split(',') {
+        let pos = clause.find(['+', '-', '='])?;
+        let (who, rest) = clause.split_at(pos);
+        let op = rest.chars().next()?;
+        let perms = &rest[1..];
+
+        let mut who_mask = 0u32;
+        if who.is_empty() || who.contains('a') {
+            who_mask = 0o7777;
+        } else {
+            for c in who.chars() {
+                match c {
+                    'u' => who_mask |= 0o4700,
+                    'g' => who_mask |= 0o2070,
+                    'o' => who_mask |= 0o1007,
+                    _ => return None,
+                }
+            }
+        }
+
+        let mut perm_bits = 0u32;
+        for c in perms.chars() {
+            match c {
+                'r' => perm_bits |= 0o444,
+                'w' => perm_bits |= 0o222,
+                'x' | 'X' => perm_bits |= 0o111,
+                's' => perm_bits |= 0o6000,
+                't' => perm_bits |= 0o1000,
+                _ => return None,
+            }
+        }
+        let effective = perm_bits & who_mask;
+
+        match op {
+            '+' => mode |= effective,
+            '-' => mode &= !effective,
+            '=' => mode = (mode & !who_mask) | effective,
+            _ => return None,
+        }
+    }
+    Some(mode & 0o7777)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +1030,61 @@ mod tests {
         assert!(run(&mut shell, "cat /etc/hostname").contains("debian"));
         assert!(run(&mut shell, "cat /nope").contains("No such file or directory"));
         assert!(run(&mut shell, "cat /etc").contains("Is a directory"));
+    }
+
+    #[test]
+    fn touch_mkdir_and_cat_roundtrip() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(run(&mut shell, "mkdir /tmp/d"), "");
+        assert_eq!(run(&mut shell, "touch /tmp/d/f"), "");
+        // The new file shows up and reads back empty.
+        assert!(run(&mut shell, "ls /tmp/d").contains("f"));
+        assert_eq!(run(&mut shell, "cat /tmp/d/f"), "");
+        // mkdir on an existing entry fails; -p is idempotent.
+        assert!(run(&mut shell, "mkdir /tmp/d").contains("File exists"));
+        assert_eq!(run(&mut shell, "mkdir -p /tmp/d/e/f"), "");
+        assert!(run(&mut shell, "ls /tmp/d/e").contains("f"));
+    }
+
+    #[test]
+    fn rm_and_rmdir_enforce_directory_rules() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir /tmp/x");
+        run(&mut shell, "touch /tmp/x/f");
+        // rm on a non-empty dir without -r fails.
+        assert!(run(&mut shell, "rm /tmp/x").contains("Is a directory"));
+        assert!(run(&mut shell, "rmdir /tmp/x").contains("Directory not empty"));
+        // -r removes the whole tree.
+        assert_eq!(run(&mut shell, "rm -rf /tmp/x"), "");
+        assert!(run(&mut shell, "ls /tmp/x").contains("No such file or directory"));
+        // rm -f on a missing path is silent.
+        assert_eq!(run(&mut shell, "rm -f /tmp/gone"), "");
+    }
+
+    #[test]
+    fn cp_and_mv_move_content() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir /tmp/src");
+        run(&mut shell, "touch /tmp/a");
+        assert_eq!(run(&mut shell, "cp /tmp/a /tmp/b"), "");
+        assert!(run(&mut shell, "ls /tmp").contains("b"));
+        // mv renames: source gone, dest present.
+        assert_eq!(run(&mut shell, "mv /tmp/a /tmp/src/c"), "");
+        assert!(run(&mut shell, "ls /tmp").contains("b"));
+        assert!(run(&mut shell, "cat /tmp/a").contains("No such file or directory"));
+        assert!(run(&mut shell, "ls /tmp/src").contains("c"));
+        // cp without -r refuses a directory.
+        assert!(run(&mut shell, "cp /tmp/src /tmp/d").contains("omitting directory"));
+    }
+
+    #[test]
+    fn chmod_octal_and_symbolic() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "touch /tmp/f");
+        assert_eq!(run(&mut shell, "chmod 600 /tmp/f"), "");
+        assert!(run(&mut shell, "ls -l /tmp/f").contains("-rw-------"));
+        assert_eq!(run(&mut shell, "chmod u+x /tmp/f"), "");
+        assert!(run(&mut shell, "ls -l /tmp/f").contains("-rwx------"));
+        assert!(run(&mut shell, "chmod 9z9 /tmp/f").contains("invalid mode"));
     }
 }
