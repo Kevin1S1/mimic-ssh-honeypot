@@ -47,6 +47,42 @@ pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: 
     info!(event = "download", session_id, peer = %peer, tool, url, dest);
 }
 
+/// A command line was submitted by the client (interactive shell or one-shot
+/// `exec`). Logged verbatim for forensic replay.
+pub fn command(session_id: u64, peer: SocketAddr, command: &str) {
+    info!(event = "command", session_id, peer = %peer, command);
+}
+
+/// A file was uploaded via SCP and written to the quarantine store. `name` is
+/// the attacker-supplied filename, `dest` the path it was materialised at in
+/// the emulated filesystem, `sha256` the content hash (also its quarantine
+/// filename), and `stored_path` where the bytes landed on the real disk
+/// (empty if the quarantine write failed). `truncated` flags uploads capped at
+/// the configured size limit.
+#[allow(clippy::too_many_arguments)]
+pub fn upload(
+    session_id: u64,
+    peer: SocketAddr,
+    name: &str,
+    dest: &str,
+    size: u64,
+    sha256: &str,
+    stored_path: &str,
+    truncated: bool,
+) {
+    info!(
+        event = "upload",
+        session_id,
+        peer = %peer,
+        name,
+        dest,
+        size,
+        sha256,
+        stored_path,
+        truncated,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

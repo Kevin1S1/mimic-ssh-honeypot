@@ -1,18 +1,23 @@
 //! SSH protocol engine built on `russh`.
 //!
-//! Phase 2 scope: TCP listener, SSH handshake, credential capture, and
-//! connection lifecycle. No interactive shell yet — after successful
-//! authentication the server sends a brief banner and closes the channel.
-//! Nothing in this file (or anywhere downstream) executes real commands or
-//! touches the real filesystem beyond host-key persistence.
+//! Drives the handshake, credential capture, and a full interactive
+//! line-editing shell over the emulated Debian filesystem. SCP uploads are
+//! intercepted, content-addressed, and quarantined. The only real I/O in this
+//! file is host-key persistence and the quarantine store; everything the
+//! attacker "runs" is a pure in-memory state machine.
 
 use crate::config::{AuthMode, Config};
 use crate::logging::event;
 use crate::network::limiter::{ConnectionGuard, ConnectionRegistry};
+use crate::network::scp::{self, ScpMode, ScpSink};
+use crate::shell::complete::{self, Completion};
+use crate::shell::line::{LineEditor, Reaction};
+use crate::shell::{Capture, Shell};
 
 use anyhow::{Context, Result};
 use russh::server::{Auth, Config as ServerConfig, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use sha2::{Digest, Sha256};
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,6 +95,9 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             peer,
             auth_attempts: 0,
             username: String::new(),
+            editor: LineEditor::new(4096, 1000),
+            shell: None,
+            scp: None,
             _guard: guard,
         };
 
@@ -173,6 +181,13 @@ struct MimicHandler {
     peer: SocketAddr,
     auth_attempts: u32,
     username: String,
+    /// Interactive readline-style editor (cursor, history, completion) for the
+    /// PTY session.
+    editor: LineEditor,
+    /// The emulated shell, created lazily once a session channel opens.
+    shell: Option<Shell>,
+    /// Active SCP upload sink, when the channel is running `scp -t`.
+    scp: Option<ScpSink>,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
@@ -193,6 +208,203 @@ impl MimicHandler {
                 .any(|c| c.username == user && c.password == password),
         }
     }
+
+    /// Borrow the session shell, creating it on first use from the captured
+    /// username and configured hostname.
+    fn shell(&mut self) -> &mut Shell {
+        if self.shell.is_none() {
+            self.shell = Some(Shell::new(&self.username, &self.config.hostname));
+        }
+        self.shell.as_mut().expect("shell just initialised")
+    }
+
+    /// Compute and apply a tab-completion for the word at the cursor. Returns
+    /// the bytes to send to the client (empty if nothing to do).
+    fn complete_current_word(&mut self) -> Vec<u8> {
+        let (word, is_command) = self.editor.current_word();
+        let completion = {
+            let shell = self.shell();
+            complete::complete(shell, &word, is_command)
+        };
+        match completion {
+            Completion::None => Vec::new(),
+            Completion::Single {
+                replacement,
+                add_space,
+            } => self.editor.apply_completion(&replacement, add_space),
+            Completion::Listing(items) => {
+                let listing = format_columns(&items);
+                self.editor.show_listing(&listing)
+            }
+        }
+    }
+
+    /// The message-of-the-day shown after a successful login. The leading
+    /// kernel line mirrors Debian's `/etc/update-motd.d/10-uname` output.
+    fn motd(&self) -> String {
+        format!(
+            "Linux {host} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64\r\n\
+             \r\n\
+             The programs included with the Debian GNU/Linux system are free software;\r\n\
+             the exact distribution terms for each program are described in the\r\n\
+             individual files in /usr/share/doc/*/copyright.\r\n\
+             \r\n\
+             Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\r\n\
+             permitted by applicable law.\r\n",
+            host = self.config.hostname,
+        )
+    }
+
+    /// Drain and log any captures (downloads) the last command produced.
+    fn drain_captures(&mut self) {
+        let (session_id, peer) = (self.session_id, self.peer);
+        let captures = std::mem::take(&mut self.shell().captures);
+        for capture in captures {
+            match capture {
+                Capture::Download { tool, url, dest } => {
+                    event::download(session_id, peer, &tool, &url, &dest);
+                }
+            }
+        }
+    }
+
+    /// Persist one SCP-uploaded file: write it into the session VFS, copy it to
+    /// the quarantine store on the real filesystem, and emit an `upload` event.
+    fn store_upload(&mut self, file: scp::CompletedFile) {
+        let (session_id, peer) = (self.session_id, self.peer);
+        let quarantine_dir = self.config.quarantine_dir.clone();
+
+        // Content-address the captured bytes so identical payloads dedupe and
+        // the attacker-supplied filename never influences the stored path.
+        let mut hasher = Sha256::new();
+        hasher.update(&file.data);
+        let sha256 = hex(&hasher.finalize());
+
+        // Resolve the destination path inside the emulated filesystem.
+        let target = self
+            .scp
+            .as_ref()
+            .map(|s| s.target().to_string())
+            .unwrap_or_else(|| "/tmp".to_string());
+        let recursive = self.scp.as_ref().map(|s| s.recursive()).unwrap_or(false);
+        let dest_path = self.write_to_vfs(&target, recursive, &file);
+
+        // Write to the quarantine store (real I/O is permitted in this layer).
+        let stored_path = match write_quarantine(&quarantine_dir, &sha256, &file.data) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    event = "quarantine_error",
+                    session_id,
+                    error = %err,
+                );
+                String::new()
+            }
+        };
+
+        event::upload(
+            session_id,
+            peer,
+            &file.name,
+            &dest_path,
+            file.size,
+            &sha256,
+            &stored_path,
+            file.truncated,
+        );
+    }
+
+    /// Materialise an uploaded file in the session VFS, returning its absolute
+    /// path. Best-effort: failures are non-fatal for the honeypot.
+    fn write_to_vfs(&mut self, target: &str, recursive: bool, file: &scp::CompletedFile) -> String {
+        let (uid, gid) = (self.shell().uid, self.shell().gid);
+        let cwd = self.shell().cwd;
+
+        // Determine the directory the file lands in and its final name.
+        let (dir_path, name): (String, String) = {
+            let shell = self.shell();
+            let target_abs = abs_path(&shell.vfs.path_of(cwd), target);
+            let mut base = target_abs.clone();
+            if !file.rel_dir.is_empty() {
+                base = format!("{}/{}", base.trim_end_matches('/'), file.rel_dir);
+            }
+
+            let target_is_dir = shell
+                .vfs
+                .resolve(cwd, &base)
+                .map(|id| shell.vfs.node(id).meta.is_dir())
+                .unwrap_or(false);
+
+            if target_is_dir || target.ends_with('/') || recursive || !file.rel_dir.is_empty() {
+                (base, file.name.clone())
+            } else {
+                // Target names the file itself.
+                let (d, n) = crate::vfs::Vfs::split_path(base.trim_end_matches('/'));
+                (d.to_string(), n.to_string())
+            }
+        };
+
+        let shell = self.shell();
+        let parent = shell.vfs.mkdir_p(&dir_path, 0o755, uid, gid);
+        let id = shell.vfs.add_file(
+            parent,
+            &name,
+            file.data.clone(),
+            file.mode & 0o7777,
+            uid,
+            gid,
+        );
+        shell.vfs.path_of(id)
+    }
+}
+
+/// Hex-encode a byte slice.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Resolve `path` against `cwd` into an absolute path string (no VFS lookup).
+fn abs_path(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else if cwd == "/" {
+        format!("/{path}")
+    } else {
+        format!("{cwd}/{path}")
+    }
+}
+
+/// Write `data` to `<dir>/<sha256>` (deduplicating by content hash), creating
+/// `dir` if needed. Returns the stored file's path. Files are written
+/// non-executable and owner-read/write only (`0600`) so a captured payload can
+/// never be run from the quarantine store.
+fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io::Result<String> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(sha256);
+    if !path.exists() {
+        std::fs::write(&path, data)?;
+        restrict_permissions(&path)?;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Set owner-only read/write permissions (`0600`) on `path`. No-op on
+/// platforms without Unix permission bits.
+fn restrict_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 impl Handler for MimicHandler {
@@ -255,25 +467,147 @@ impl Handler for MimicHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Phase 2: send a Debian-style MOTD and close the channel. The full
-        // interactive shell arrives in Phase 7.
-        let hostname = &self.config.hostname;
-        let banner = format!(
-            "Linux {hostname} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC \
-             Debian 6.1.90-1 (2024-05-03) x86_64\r\n\
-             \r\n\
-             The programs included with the Debian GNU/Linux system are free software;\r\n\
-             the exact distribution terms for each program are described in the\r\n\
-             individual files in /usr/share/doc/*/copyright.\r\n\
-             \r\n\
-             Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\r\n\
-             permitted by applicable law.\r\n"
-        );
+        let banner = self.motd();
         session.data(channel, banner.into_bytes())?;
+        let prompt = self.shell().prompt();
+        self.editor.set_prompt(&prompt);
+        session.data(channel, self.editor.render().to_vec())?;
+        Ok(())
+    }
 
-        // No interactive shell yet — close the channel after the MOTD.
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let cmd = String::from_utf8_lossy(data);
+        let cmd = cmd.trim().to_string();
+        event::command(self.session_id, self.peer, &cmd);
+
+        // SCP transfer requests keep the channel open and drive a sub-protocol
+        // over subsequent `data` frames rather than running a one-shot command.
+        if let Some(mode) = scp::parse_scp(&cmd) {
+            match mode {
+                ScpMode::Sink { target, recursive } => {
+                    event::command(
+                        self.session_id,
+                        self.peer,
+                        &format!("[scp upload to {target}]"),
+                    );
+                    self.scp = Some(ScpSink::new(
+                        target,
+                        recursive,
+                        self.config.max_upload_bytes,
+                    ));
+                    // Signal "ready" so the client starts sending control messages.
+                    session.data(channel, vec![0u8])?;
+                    return Ok(());
+                }
+                ScpMode::Source { path } => {
+                    // Download-from-honeypot is not emulated: report not found.
+                    let msg = format!("\x01scp: {path}: No such file or directory\n");
+                    session.data(channel, msg.into_bytes())?;
+                    session.exit_status_request(channel, 1)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let result = self.shell().execute(&cmd);
+        self.drain_captures();
+        jitter().await;
+        if !result.text.is_empty() {
+            session.data(channel, crlf(&result.text))?;
+        }
+        session.exit_status_request(channel, 0)?;
         session.eof(channel)?;
         session.close(channel)?;
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Route bytes to the SCP sink when an upload is in progress.
+        if self.scp.is_some() {
+            let (acks, files) = self.scp.as_mut().expect("scp active").feed(data);
+            for file in files {
+                self.store_upload(file);
+            }
+            if !acks.is_empty() {
+                session.data(channel, acks)?;
+            }
+            return Ok(());
+        }
+
+        for &byte in data {
+            match self.editor.input(byte) {
+                Reaction::Ignore => {}
+                Reaction::Write(bytes) => {
+                    session.data(channel, bytes)?;
+                }
+                Reaction::Complete => {
+                    let bytes = self.complete_current_word();
+                    if !bytes.is_empty() {
+                        session.data(channel, bytes)?;
+                    }
+                }
+                Reaction::Eof => {
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+                Reaction::Submit { echo, line } => {
+                    session.data(channel, echo)?;
+
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        event::command(self.session_id, self.peer, &trimmed);
+                        self.shell().record_history(&trimmed);
+                    }
+
+                    let result = self.shell().execute(&trimmed);
+                    self.drain_captures();
+
+                    // Small randomised delay so response latency is not
+                    // perfectly uniform (a passive timing tell).
+                    jitter().await;
+
+                    if !result.text.is_empty() {
+                        session.data(channel, crlf(&result.text))?;
+                    }
+                    if result.exit {
+                        session.eof(channel)?;
+                        session.close(channel)?;
+                        return Ok(());
+                    }
+                    let prompt = self.shell().prompt();
+                    self.editor.set_prompt(&prompt);
+                    session.data(channel, self.editor.render().to_vec())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // An SCP client signals end-of-transfer by closing its half of the
+        // channel; finish the exchange with a success status.
+        if self.scp.take().is_some() {
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+        }
         Ok(())
     }
 }
@@ -289,4 +623,32 @@ impl Drop for MimicHandler {
 async fn jitter() {
     let ms = rand::random_range(2..=18);
     tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Convert LF line endings to CRLF for transmission over the SSH PTY. Command
+/// output uses bare `\n`; terminals expect `\r\n`.
+fn crlf(text: &str) -> Vec<u8> {
+    text.replace('\n', "\r\n").into_bytes()
+}
+
+/// Lay candidate strings out in newline-separated columns the way bash prints
+/// ambiguous completions. Kept simple: a single space-padded grid.
+fn format_columns(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let width = items.iter().map(String::len).max().unwrap_or(0) + 2;
+    let cols = (80 / width).max(1);
+    let mut out = String::new();
+    for (i, item) in items.iter().enumerate() {
+        out.push_str(item);
+        if (i + 1) % cols == 0 || i + 1 == items.len() {
+            out.push('\n');
+        } else {
+            for _ in item.len()..width {
+                out.push(' ');
+            }
+        }
+    }
+    out
 }
