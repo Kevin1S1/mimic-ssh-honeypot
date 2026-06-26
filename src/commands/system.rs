@@ -8,6 +8,7 @@
 //! a real shell would.
 
 use super::CommandResult;
+use crate::shell::complete::COMMANDS;
 use crate::shell::Shell;
 
 /// Emulated kernel release (`uname -r`).
@@ -667,6 +668,146 @@ pub fn uptime(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(" 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n")
 }
 
+// --- Reconnaissance commands ---------------------------------------------
+//
+// The first things an attacker runs after login. Their *absence* is itself a
+// tell, so each emulates plausible, internally consistent output. As with the
+// process table, all values are fabricated and static (or per-session) so no
+// real host detail and no other honeypot session is ever exposed.
+
+/// Shell builtins that `which` reports as not on the PATH.
+const BUILTINS: &[&str] = &[
+    "cd", "export", "unset", "history", "exit", "logout", "alias", "source",
+];
+
+/// `history` — print the session's command history, bash-style.
+pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
+    if args.iter().any(|a| a == "-c") {
+        shell.history.clear();
+        return CommandResult::empty();
+    }
+    let mut out = String::new();
+    for (i, cmd) in shell.history.iter().enumerate() {
+        out.push_str(&format!("{:5}  {}\n", i + 1, cmd));
+    }
+    CommandResult::ok(out)
+}
+
+/// `which NAME...`
+pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
+    if args.is_empty() {
+        return CommandResult::empty();
+    }
+    let mut out = String::new();
+    let mut status = 0;
+    for name in args {
+        if BUILTINS.contains(&name.as_str()) {
+            status = 1; // builtins are not external binaries
+        } else if let Some(path) = binary_path(name) {
+            out.push_str(&format!("{path}\n"));
+        } else {
+            status = 1;
+        }
+    }
+    CommandResult::err(out, status)
+}
+
+/// Resolve a known command name to the absolute path `which` would print, or
+/// `None` if it is not a recognised external binary.
+fn binary_path(name: &str) -> Option<String> {
+    if !COMMANDS.contains(&name) || BUILTINS.contains(&name) {
+        return None;
+    }
+    let dir = match name {
+        "ip" | "ss" => "/usr/sbin",
+        _ => "/usr/bin",
+    };
+    Some(format!("{dir}/{name}"))
+}
+
+/// `w` — who is logged on and what they are doing. A single fabricated session
+/// for the current user; other connections are never revealed.
+pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
+    let header = " 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n";
+    let cols = "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n";
+    let row = format!(
+        "{user:<8} pts/0    10.0.0.5         10:01    0.00s  0.02s  0.00s w\n",
+        user = truncate(&shell.username, 8),
+    );
+    CommandResult::ok(format!("{header}{cols}{row}"))
+}
+
+/// `last` — listing of last logged-in users. Fabricated and static.
+pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
+    let out = format!(
+        "{user:<8} pts/0        10.0.0.5         Mon Jun 24 10:01   still logged in\n\
+         reboot   system boot  6.1.0-21-amd64   Mon Jun 24 07:00   still running\n\
+         \n\
+         wtmp begins Mon Jun 24 07:00:00 2024\n",
+        user = truncate(&shell.username, 8),
+    );
+    CommandResult::ok(out)
+}
+
+/// `df [-h]`
+pub fn df(_shell: &Shell, args: &[String]) -> CommandResult {
+    let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
+    let out = if human {
+        "Filesystem      Size  Used Avail Use% Mounted on\n\
+         udev            3.9G     0  3.9G   0% /dev\n\
+         tmpfs           789M  960K  788M   1% /run\n\
+         /dev/sda1        40G  6.3G   31G  17% /\n\
+         tmpfs           3.9G     0  3.9G   0% /dev/shm\n\
+         tmpfs           5.0M     0  5.0M   0% /run/lock\n\
+         tmpfs           789M     0  789M   0% /run/user/0\n"
+    } else {
+        "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
+         udev             4019216       0   4019216   0% /dev\n\
+         tmpfs             807868     960    806908   1% /run\n\
+         /dev/sda1       41019672 6552432  32352140  17% /\n\
+         tmpfs            4039332       0   4039332   0% /dev/shm\n\
+         tmpfs               5120       0      5120   0% /run/lock\n\
+         tmpfs             807864       0    807864   0% /run/user/0\n"
+    };
+    CommandResult::ok(out)
+}
+
+/// `mount` — print the (fabricated) mount table.
+pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
+    let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
+        proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
+        udev on /dev type devtmpfs (rw,nosuid,relatime,size=4019216k,nr_inodes=1004804,mode=755)\n\
+        devpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000)\n\
+        tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,size=807868k,mode=755)\n\
+        /dev/sda1 on / type ext4 (rw,relatime,errors=remount-ro)\n\
+        tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev,inode64)\n\
+        tmpfs on /run/lock type tmpfs (rw,nosuid,nodev,noexec,relatime,size=5120k,inode64)\n";
+    CommandResult::ok(out)
+}
+
+/// `crontab [-l|-e|-r]`
+pub fn crontab(shell: &Shell, args: &[String]) -> CommandResult {
+    if args.iter().any(|a| a == "-l") {
+        return CommandResult::err(format!("no crontab for {}\n", shell.username), 1);
+    }
+    if args.iter().any(|a| a == "-r" || a == "-e") {
+        // Removing/editing a non-existent crontab is a no-op / opens an editor;
+        // for an emulated session we simply report nothing.
+        return CommandResult::empty();
+    }
+    CommandResult::err(
+        "usage:  crontab [-u user] file\n\
+         \tcrontab [ -u user ] [ -i ] { -e | -l | -r }\n",
+        1,
+    )
+}
+
+/// Truncate `s` to at most `n` characters (ASCII usernames), for column
+/// alignment.
+fn truncate(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::shell::Shell;
@@ -782,5 +923,58 @@ mod tests {
     fn uptime_renders() {
         let mut shell = Shell::new("root", "debian");
         assert!(run(&mut shell, "uptime").contains("load average:"));
+    }
+
+    #[test]
+    fn history_numbers_then_clears() {
+        let mut shell = Shell::new("root", "debian");
+        shell.record_history("ls");
+        shell.record_history("pwd");
+        let out = run(&mut shell, "history");
+        assert!(out.contains("    1  ls"));
+        assert!(out.contains("    2  pwd"));
+        run(&mut shell, "history -c");
+        assert!(shell.history.is_empty());
+    }
+
+    #[test]
+    fn which_external_builtin_and_sbin() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(run(&mut shell, "which wget"), "/usr/bin/wget\n");
+        assert_eq!(run(&mut shell, "which ip"), "/usr/sbin/ip\n");
+        // Builtins are not external binaries: no output, status 1.
+        assert_eq!(run(&mut shell, "which cd"), "");
+        assert_eq!(shell.last_status, 1);
+    }
+
+    #[test]
+    fn w_and_last_show_current_user_only() {
+        let mut shell = Shell::new("attacker", "debian");
+        let w = run(&mut shell, "w");
+        assert!(w.contains("load average:"));
+        assert!(w.contains("attacker"));
+        let last = run(&mut shell, "last");
+        assert!(last.contains("attacker"));
+        assert!(last.contains("wtmp begins"));
+    }
+
+    #[test]
+    fn df_human_flag_changes_units() {
+        let mut shell = Shell::new("root", "debian");
+        assert!(run(&mut shell, "df").contains("1K-blocks"));
+        assert!(run(&mut shell, "df -h").contains("Size"));
+    }
+
+    #[test]
+    fn mount_lists_fabricated_table() {
+        let mut shell = Shell::new("root", "debian");
+        assert!(run(&mut shell, "mount").contains("/dev/sda1 on / type ext4"));
+    }
+
+    #[test]
+    fn crontab_l_reports_none() {
+        let mut shell = Shell::new("attacker", "debian");
+        assert_eq!(run(&mut shell, "crontab -l"), "no crontab for attacker\n");
+        assert_eq!(shell.last_status, 1);
     }
 }

@@ -130,6 +130,15 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "free" => CommandHandler::Read(system::free),
         "uptime" => CommandHandler::Read(system::uptime),
 
+        // Reconnaissance commands (fabricated, in-memory only).
+        "history" => CommandHandler::Mut(system::history),
+        "which" => CommandHandler::Read(system::which),
+        "w" => CommandHandler::Read(system::w),
+        "last" => CommandHandler::Read(system::last),
+        "df" => CommandHandler::Read(system::df),
+        "mount" => CommandHandler::Read(system::mount),
+        "crontab" => CommandHandler::Read(system::crontab),
+
         // Network tools (no real network is ever touched).
         "wget" => CommandHandler::Mut(net::wget),
         "curl" => CommandHandler::Mut(net::curl),
