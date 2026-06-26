@@ -103,6 +103,15 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "pwd" => CommandHandler::Read(fs::pwd),
         "cat" => CommandHandler::Read(fs::cat),
 
+        // Filesystem mutations (operate on the per-session VFS only).
+        "touch" => CommandHandler::Mut(fs::touch),
+        "mkdir" => CommandHandler::Mut(fs::mkdir),
+        "rmdir" => CommandHandler::Mut(fs::rmdir),
+        "rm" => CommandHandler::Mut(fs::rm),
+        "cp" => CommandHandler::Mut(fs::cp),
+        "mv" => CommandHandler::Mut(fs::mv),
+        "chmod" => CommandHandler::Mut(fs::chmod),
+
         // System / identity commands.
         "whoami" => CommandHandler::Read(system::whoami),
         "id" => CommandHandler::Read(system::id),
