@@ -6,6 +6,7 @@
 
 pub mod fs;
 pub mod net;
+pub mod pkg;
 pub mod system;
 
 use crate::shell::Shell;
@@ -146,6 +147,10 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "netstat" => CommandHandler::Read(net::netstat),
         "ss" => CommandHandler::Read(net::ss),
         "ip" => CommandHandler::Read(net::ip),
+
+        // Package-manager stubs (in-memory package DB; nothing is ever installed).
+        "apt" | "apt-get" => CommandHandler::Read(pkg::apt),
+        "dpkg" => CommandHandler::Read(pkg::dpkg),
 
         "true" => return CommandResult::ok(""),
         "false" => return CommandResult::err("", 1),
