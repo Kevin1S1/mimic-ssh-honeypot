@@ -469,6 +469,12 @@ impl Handler for MimicHandler {
     ) -> Result<(), Self::Error> {
         let banner = self.motd();
         session.data(channel, banner.into_bytes())?;
+        // PAM prints the previous login right before handing off to the shell.
+        // Kept in lockstep with the fabricated `last`/`w` session.
+        session.data(
+            channel,
+            b"Last login: Mon Jun 24 10:01:33 2024 from 10.0.0.5\r\n".to_vec(),
+        )?;
         let prompt = self.shell().prompt();
         self.editor.set_prompt(&prompt);
         session.data(channel, self.editor.render().to_vec())?;
