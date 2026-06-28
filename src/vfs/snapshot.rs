@@ -231,7 +231,9 @@ pub fn build(hostname: &str) -> Vfs {
     fs.add_file(proc, "cpuinfo", CPUINFO, 0o444, 0, 0);
     fs.add_file(proc, "meminfo", MEMINFO, 0o444, 0, 0);
     fs.add_file(proc, "version", VERSION, 0o444, 0, 0);
-    fs.add_file(proc, "uptime", "184523.45 182013.12\n", 0o444, 0, 0);
+    // 184860 s = 2 days, 3:21 — kept in lockstep with the `uptime`/`top`/`w`
+    // banners so `cat /proc/uptime` can't contradict them.
+    fs.add_file(proc, "uptime", "184860.42 182013.12\n", 0o444, 0, 0);
     fs.add_file(proc, "loadavg", "0.08 0.03 0.01 1/128 9241\n", 0o444, 0, 0);
 
     // /var subtree.
@@ -296,6 +298,20 @@ mod tests {
             "/etc/hosts should alias the configured hostname, got: {hosts:?}"
         );
         assert!(hosts.contains("127.0.0.1\tlocalhost\n"));
+    }
+
+    #[test]
+    fn proc_uptime_matches_command_banner() {
+        let fs = build("srv1");
+        let first = read(&fs, "/proc/uptime");
+        let secs: f64 = first
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("/proc/uptime first field should be a number");
+        let s = secs as u64;
+        // Must decode to the "up 2 days,  3:21" the system commands print.
+        assert_eq!((s / 86400, (s % 86400) / 3600, (s % 3600) / 60), (2, 3, 21));
     }
 
     #[test]
