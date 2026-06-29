@@ -7,6 +7,13 @@
 # is reachable on the standard SSH port without running as root.
 
 services:
+  # Init-Container: Bereitet die Rechte im Volume vor und beendet sich sofort wieder
+  mimic-init:
+    image: alpine
+    command: sh -c "mkdir -p /data/host_keys /data/quarantine && chown -R 65534:65534 /data"
+    volumes:
+      - mimic-data:/data
+
   mimic:
     build: .
     image: mimic-honeypot:latest
@@ -21,6 +28,10 @@ services:
     volumes:
       - mimic-data:/data
       - ./deploy/mimic.toml:/etc/mimic/mimic.toml:ro
+
+    depends_on:
+      mimic-init:
+        condition: service_completed_successfully
 
     command: ["/etc/mimic/mimic.toml"]
 
