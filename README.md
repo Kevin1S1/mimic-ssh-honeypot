@@ -117,27 +117,13 @@ Last login: Mon Jun 10 03:22:41 2024 from 192.168.1.50
 
 ## Quick Start (Docker)
 
-```bash
-# Build the image locally
-docker build -t mimic-honeypot .
-
-# Run the honeypot
-docker run -d \
-  --name mimic \
-  --restart unless-stopped \
-  -p 22:2222 \
-  -v mimic-data:/data \
-  mimic-honeypot:latest
-```
+The recommended deployment method is `docker compose`, as it automatically handles volume permission initialization, log rotation, and applies strict security hardening (read-only filesystem, dropped capabilities).
 
 ```bash
-# Stream forensic logs
-docker logs -f mimic
-```
-
-```bash
-# With docker-compose (recommended for production — config + log rotation included)
+# Build and run the stack
 docker compose up -d
+
+# Stream forensic logs
 docker compose logs -f
 ```
 
@@ -177,9 +163,9 @@ idle_timeout_secs = 300          # drop idle sessions after 5 minutes
 max_session_secs  = 1800         # absolute per-session lifetime cap
 
 # Capture
-quarantine_dir    = "quarantine" # SCP uploads land here (SHA-256 named)
+quarantine_dir    = "/data/quarantine" # SCP uploads land here (SHA-256 named)
 max_upload_bytes  = 16777216     # truncate stored files at 16 MiB
-host_key_dir      = "host_keys"  # persisted Ed25519 + RSA keys
+host_key_dir      = "/data/host_keys"  # persisted Ed25519 + RSA keys
 
 [auth]
 # accept_all   – every password succeeds immediately (maximum interaction)
