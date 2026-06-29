@@ -1,0 +1,51 @@
+# MIMIC SSH Honeypot — Docker Compose deployment.
+#
+# Quick start:
+#   docker compose up -d
+#
+# This maps host port 22 to the container's 2222 so the honeypot
+# is reachable on the standard SSH port without running as root.
+
+services:
+  mimic:
+    build: .
+    image: mimic-honeypot:latest
+    container_name: mimic
+    user: "65534:65534"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    ports:
+      - "22:2222"
+
+    volumes:
+      - mimic-data:/data
+      - ./deploy/mimic.toml:/etc/mimic/mimic.toml:ro
+
+    command: ["/etc/mimic/mimic.toml"]
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # ── Security hardening ──────────────────────────────────────────
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 256m
+    cpus: 1.0
+
+    networks:
+      - honeypot-net
+
+volumes:
+  mimic-data:
+
+networks:
+  honeypot-net:
+    driver: bridge
