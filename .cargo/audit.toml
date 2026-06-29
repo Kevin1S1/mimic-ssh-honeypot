@@ -7,7 +7,7 @@
 [advisories]
 ignore = [
     # rsa Marvin timing sidechannel — host-key recovery only (impersonation of a
-    # decoy), no escape; no fixed version exists upstream. Becomes relevant once
-    # the `russh`/`rsa` dependency lands in Phase 2.
+    # decoy), no escape; no fixed version exists upstream. Pulled in transitively
+    # by `russh`.
     "RUSTSEC-2023-0071",
 ]
