@@ -1,0 +1,72 @@
+# MIMIC SSH honeypot — systemd unit (Docker-free deployment).
+#
+# Install:
+#   sudo install -m0755 target/release/mimic /usr/local/bin/mimic
+#   sudo install -Dm0644 deploy/mimic.toml /etc/mimic/mimic.toml
+#   sudo install -Dm0644 deploy/mimic.service /etc/systemd/system/mimic.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mimic
+#
+# View captured events:
+#   journalctl -u mimic -f
+#
+# To listen directly on port 22, set `port = 22` in /etc/mimic/mimic.toml; the
+# CAP_NET_BIND_SERVICE capability below lets the unprivileged service bind it.
+
+[Unit]
+Description=MIMIC SSH honeypot
+Documentation=https://github.com/Kevin1S1/mimic-ssh-honeypot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mimic /etc/mimic/mimic.toml
+Restart=always
+RestartSec=5
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=1000
+
+# Hard memory ceiling — mitigates unbounded-allocation DoS vectors. A malicious
+# packet can at worst push the process to this cap, where the kernel OOM-kills
+# it and `Restart=always` brings it back in seconds. Containment (no escape) is
+# never affected; only this one process dies.
+# Raise if you run very high connection concurrency; lower for tighter blast radius.
+MemoryAccounting=yes
+MemoryHigh=192M
+MemoryMax=256M
+
+# Run as a transient, unprivileged user with a persistent state directory at
+# /var/lib/mimic (host keys + quarantine resolve here via WorkingDirectory).
+DynamicUser=yes
+StateDirectory=mimic
+WorkingDirectory=/var/lib/mimic
+
+# Allow binding low ports (e.g. 22) without full root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Sandboxing — the emulator never needs real OS access, so lock it all down.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
