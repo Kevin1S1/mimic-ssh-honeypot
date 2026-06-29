@@ -16,8 +16,8 @@ yanked = "deny"
 ignore = [
     # rsa 0.9.x Marvin timing sidechannel. Worst case: recovery of the SSH *host*
     # key, enabling impersonation of the honeypot — harmless for a sacrificial
-    # decoy and no escape. No fixed version exists upstream. Becomes relevant
-    # once the `russh`/`rsa` dependency lands in Phase 2.
+    # decoy and no escape. No fixed version exists upstream. Pulled in
+    # transitively by `russh`.
     "RUSTSEC-2023-0071",
 ]
 
