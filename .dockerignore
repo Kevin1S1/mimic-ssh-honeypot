@@ -15,6 +15,11 @@ data/
 *.md
 .agents/
 
+# Deployment and CI — config is bind-mounted at runtime, not baked in.
+deploy/
+docker-compose.yml
+deny.toml
+
 # Test files and environment secrets.
 tests/
 .env
