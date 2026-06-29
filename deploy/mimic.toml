@@ -31,7 +31,7 @@ max_session_secs = 1800
 
 # Directory where files uploaded over SCP are quarantined. Captured payloads
 # are written here named by their SHA-256 hash (content-addressed, deduplicated).
-quarantine_dir = "quarantine"
+quarantine_dir = "/data/quarantine"
 
 # Maximum number of bytes stored per uploaded file. Larger uploads are still
 # fully consumed off the wire (to keep the SCP protocol in sync) but truncated
@@ -41,7 +41,7 @@ max_upload_bytes = 16777216
 # Directory where SSH host keys are persisted. Keys (Ed25519 + RSA) are
 # generated on first start and reused afterwards so the server fingerprint stays
 # stable across restarts — a fingerprint that changes every boot is a tell.
-host_key_dir = "host_keys"
+host_key_dir = "/data/host_keys"
 
 [auth]
 # Acceptance strategy. One of:
