@@ -313,7 +313,9 @@ mod tests {
         let mut sink = ScpSink::new("/tmp/".into(), false, 1024);
         let body = b"x";
         let mut stream = Vec::new();
-        stream.extend_from_slice(format!("C0644 {} ../../etc/passwd\n", body.len()).as_bytes());
+        // `....//` is the classic bypass: stripping separators must not let two
+        // dots survive adjacent and re-form a `..` component.
+        stream.extend_from_slice(format!("C0644 {} ....//....//etc/passwd\n", body.len()).as_bytes());
         stream.extend_from_slice(body);
         stream.push(0);
 
@@ -321,6 +323,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         let name = &files[0].name;
         assert!(!name.contains('/'), "no path separators: {name}");
+        assert!(!name.contains('\\'), "no path separators: {name}");
         assert!(!name.contains(".."), "no parent refs: {name}");
     }
 }

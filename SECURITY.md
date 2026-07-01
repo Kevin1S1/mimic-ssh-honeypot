@@ -78,7 +78,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
 | T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; listener survives | Bounded to one session |
-| T10 | Honeypot fingerprinting | Banner/KEX/timing/`/proc`/missing-feature probes | Debian 12 OpenSSH-shaped handshake, persistent host key, readline emulation, response jitter, recon-command coverage | Ongoing — anti-detection is an evolving discipline |
+| T10 | Honeypot fingerprinting | Banner/KEX/timing/`/proc`/missing-feature probes | Debian 12 OpenSSH-shaped handshake, persistent host key, readline emulation, response jitter, recon-command coverage | Ongoing — anti-detection is an evolving discipline; TCP/IP-stack fingerprinting (TTL, window sizes) is host-kernel territory, addressed by host `sysctl`/firewall tuning, not the application |
 | T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); logs are structured JSON the operator controls | Operator data-handling duty |
 
 ### Security invariants (must always hold)
