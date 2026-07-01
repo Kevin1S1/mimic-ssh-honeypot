@@ -33,12 +33,12 @@ Even if thousands of malware samples are uploaded, they are safely written as in
 ### 6. Denial of Service (DoS) Resilience
 MIMIC is protected against resource exhaustion attacks:
 - **Connection limits** shed TCP floods before SSH crypto is even negotiated.
-- **VFS limits** cap the filesystem tree to 10,000 nodes, preventing RAM exhaustion from endless recursive `mkdir` loops.
+- **VFS limits** cap the filesystem tree to 10,000 nodes and 64 MiB of total file content, preventing RAM exhaustion from recursive `mkdir` loops or `cp`-amplifying an SCP upload (the quarantine store keeps the full upload, so no forensic data is lost).
 - **Environment and Process limits** strictly cap string lengths, variable counts, and prevent memory leaks.
 - **Per-command output cap** (`MAX_COMMAND_OUTPUT_BYTES = 1 MiB`) truncates any single command's output at the dispatch layer, preventing memory amplification from `cat`/`find`/`grep` on large VFS content.
 - **Idle timeouts** ensure dead connections are reaped aggressively.
 - **Absolute session lifetime cap** (`max_session_secs`) wraps every session, so a client cannot hold resources indefinitely with periodic keep-alive traffic.
-- **Line-editor bounds** cap the interactive input line (4096 bytes) and per-session command history (1000 entries), so the readline emulation cannot be driven into unbounded memory growth.
+- **Line-editor bounds** cap the interactive input line (4096 bytes) and per-session command history (1000 entries), so the readline emulation cannot be driven into unbounded memory growth. One-shot `exec` commands are capped at the same 4096 bytes, so an oversized exec request cannot bloat the logs or parser.
 - **Per-session crash isolation**: each connection runs in its own task; a panic in one session cannot take down the listener.
 
 ---
@@ -75,7 +75,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; fuzz/robustness tests on the line editor | Unknown bug in a dependency |
 | T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping` to attacker host | Network commands are faked; no real socket opened | None by design |
 | T5 | Disk exhaustion | SCP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec | Bounded by `max_upload_bytes` × distinct hashes |
-| T6 | RAM exhaustion | Recursive `mkdir`, huge env, long lines, history, large command output | VFS ≤ 10k nodes; bounded env, line (4096) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session |
+| T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output | VFS ≤ 10k nodes and ≤ 64 MiB content bytes; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session |
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
 | T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; listener survives | Bounded to one session |
@@ -86,7 +86,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 1. **No `unsafe`** anywhere (`#![forbid(unsafe_code)]`).
 2. **No real process execution** reachable from attacker input.
 3. **No real filesystem or network access** in `src/shell`, `src/vfs`, `src/commands` (test-enforced).
-4. **Every attacker-controlled allocation is bounded** (connections, sessions, VFS nodes, env, line length, history, upload size, per-command output).
+4. **Every attacker-controlled allocation is bounded** (connections, sessions, VFS nodes and content bytes, env, command length, history, upload size, per-command output).
 5. **Real disk writes are confined** to host keys and the content-addressed, non-executable quarantine store.
 6. **One session cannot affect another** or the listener (task isolation + RAII connection slots).
 
