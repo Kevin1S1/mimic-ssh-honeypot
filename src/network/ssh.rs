@@ -25,6 +25,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+/// Maximum bytes accepted for a single command line, on both the interactive
+/// path (line editor buffer) and the one-shot `exec` path. Without the exec
+/// cap, a client could ship a command bounded only by the SSH packet limit
+/// straight into the logs and parser.
+const MAX_COMMAND_LEN: usize = 4096;
+
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
     // Persist host keys so the server fingerprint stays stable across restarts.
@@ -95,7 +101,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             peer,
             auth_attempts: 0,
             username: String::new(),
-            editor: LineEditor::new(4096, 1000),
+            editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
             shell: None,
             scp: None,
             _guard: guard,
@@ -487,7 +493,7 @@ impl Handler for MimicHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let cmd = String::from_utf8_lossy(data);
+        let cmd = String::from_utf8_lossy(&data[..data.len().min(MAX_COMMAND_LEN)]);
         let cmd = cmd.trim().to_string();
         event::command(self.session_id, self.peer, &cmd);
 

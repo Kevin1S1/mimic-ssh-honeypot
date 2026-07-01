@@ -22,11 +22,21 @@ const MAX_SYMLINK_DEPTH: usize = 40;
 /// silently dropped.
 const MAX_VFS_NODES: usize = 10_000;
 
+/// Hard ceiling on total file-content bytes held in the arena. The node cap
+/// alone does not bound memory: an SCP upload (up to `max_upload_bytes`) can be
+/// amplified with `cp` up to the node cap. Uploads are preserved in full in the
+/// quarantine store, so capping the in-memory mirror loses no forensic data.
+/// Writes past the cap are silently dropped, like node-cap overflow.
+const MAX_VFS_BYTES: usize = 64 * 1024 * 1024;
+
 /// An in-memory filesystem tree.
 #[derive(Debug, Clone)]
 pub struct Vfs {
     nodes: Vec<Node>,
     root: NodeId,
+    /// Total file-content bytes allocated in the arena, including orphaned
+    /// tombstones (their buffers stay resident by design; see [`Vfs::unlink`]).
+    content_bytes: usize,
 }
 
 impl Default for Vfs {
@@ -49,6 +59,7 @@ impl Vfs {
         Self {
             nodes: vec![root],
             root: 0,
+            content_bytes: 0,
         }
     }
 
@@ -187,7 +198,10 @@ impl Vfs {
         self.insert(parent, name, kind, Metadata::new(S_IFDIR, perms, uid, gid))
     }
 
-    /// Create or overwrite a regular file with the given contents.
+    /// Create or overwrite a regular file with the given contents. If the write
+    /// would push total arena content past the byte cap, it is dropped: an
+    /// existing file keeps its old contents, otherwise `parent` is returned
+    /// unchanged.
     pub fn add_file(
         &mut self,
         parent: NodeId,
@@ -197,16 +211,35 @@ impl Vfs {
         uid: u32,
         gid: u32,
     ) -> NodeId {
-        let kind = NodeKind::File {
-            contents: contents.into(),
-        };
+        let contents = contents.into();
+        let new_len = contents.len();
+        let existing = self.child(parent, name);
+        // Only an in-place file overwrite frees its old buffer; replacing a
+        // dir/symlink or unlinking leaves tombstones resident, so those bytes
+        // stay counted.
+        let old_len = existing
+            .map(|id| match &self.nodes[id].kind {
+                NodeKind::File { contents } => contents.len(),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        if self.content_bytes - old_len + new_len > MAX_VFS_BYTES {
+            return existing.unwrap_or(parent);
+        }
+        let kind = NodeKind::File { contents };
         let meta = Metadata::new(S_IFREG, perms, uid, gid);
-        if let Some(existing) = self.child(parent, name) {
+        if let Some(existing) = existing {
             self.nodes[existing].kind = kind;
             self.nodes[existing].meta = meta;
+            self.content_bytes = self.content_bytes - old_len + new_len;
             return existing;
         }
-        self.insert(parent, name, kind, meta)
+        let id = self.insert(parent, name, kind, meta);
+        if id != parent {
+            // `insert` returns `parent` unchanged when the node cap drops it.
+            self.content_bytes += new_len;
+        }
+        id
     }
 
     /// Create a symbolic link node pointing at `target`.
@@ -433,6 +466,31 @@ mod tests {
             fs.add_file(root, &format!("f{i}"), &b""[..], 0o644, 0, 0);
         }
         assert!(fs.nodes.len() <= MAX_VFS_NODES);
+    }
+
+    #[test]
+    fn byte_cap_bounds_total_content() {
+        let mut fs = Vfs::new();
+        let root = fs.root();
+        let big = vec![0u8; MAX_VFS_BYTES / 2 + 1];
+
+        // First large file fits.
+        let a = fs.add_file(root, "a", big.clone(), 0o644, 0, 0);
+        assert!(fs.child(root, "a").is_some());
+
+        // A copy would exceed the cap: dropped without creating a node
+        // (this is the `scp` upload + `cp` amplification path).
+        assert_eq!(fs.add_file(root, "b", big.clone(), 0o644, 0, 0), root);
+        assert!(fs.child(root, "b").is_none());
+
+        // Small writes still fit under the cap.
+        fs.add_file(root, "c", &b"ok"[..], 0o644, 0, 0);
+        assert!(fs.child(root, "c").is_some());
+
+        // Overwriting `a` with empty contents frees its budget for new writes.
+        assert_eq!(fs.add_file(root, "a", Vec::new(), 0o644, 0, 0), a);
+        fs.add_file(root, "b", big, 0o644, 0, 0);
+        assert!(fs.child(root, "b").is_some());
     }
 
     #[test]
