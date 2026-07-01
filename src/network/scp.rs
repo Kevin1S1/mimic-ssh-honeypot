@@ -216,8 +216,23 @@ fn parse_cd(line: &str) -> Option<(u32, u64, String)> {
     let raw_name = it.next()?.trim().to_string();
     let mode = u32::from_str_radix(mode_field.get(1..)?, 8).ok()?;
     let size = size_field.parse::<u64>().ok()?;
-    // Sanitise: strip path separators and ".." to prevent directory traversal.
-    let name = raw_name.replace(['/', '\\'], "_").replace("..", "_");
+    // Sanitise the attacker-controlled name before it reaches the in-memory
+    // VFS or the structured logs. (The quarantine store is content-addressed by
+    // SHA-256, so this name never forms a real filesystem path — this is
+    // defence-in-depth for the two sinks that do echo it back.)
+    //
+    // ORDER IS A SECURITY INVARIANT: collapse path separators to `_` first,
+    // THEN `..`. The replacement char has no dots, so once separators are gone
+    // no new `..` can appear — reversing the two steps would let `....//`
+    // survive separator-stripping and re-collapse into a `..` traversal
+    // component. Control bytes (including NUL) are dropped last so the name
+    // can't truncate a path or smuggle terminal/log-injection escapes.
+    let name: String = raw_name
+        .replace(['/', '\\'], "_")
+        .replace("..", "_")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     let name = if name.is_empty() {
         "unnamed".to_string()
     } else {
@@ -307,23 +322,40 @@ mod tests {
 
     #[test]
     fn traversal_filename_is_neutralised() {
-        // A crafted control name must never carry path separators or `..`
-        // through to the caller — the stored name is flattened to a single
-        // path component so it cannot escape the upload directory.
+        // End-to-end: a crafted `....//` name (the classic bypass where
+        // stripping separators lets `..` re-form) is flattened to a single,
+        // inert path component by the time it reaches the caller.
         let mut sink = ScpSink::new("/tmp/".into(), false, 1024);
         let body = b"x";
         let mut stream = Vec::new();
-        // `....//` is the classic bypass: stripping separators must not let two
-        // dots survive adjacent and re-form a `..` component.
-        stream.extend_from_slice(format!("C0644 {} ....//....//etc/passwd\n", body.len()).as_bytes());
+        stream
+            .extend_from_slice(format!("C0644 {} ....//....//etc/passwd\n", body.len()).as_bytes());
         stream.extend_from_slice(body);
         stream.push(0);
 
         let (_, files) = sink.feed(&stream);
         assert_eq!(files.len(), 1);
-        let name = &files[0].name;
-        assert!(!name.contains('/'), "no path separators: {name}");
-        assert!(!name.contains('\\'), "no path separators: {name}");
-        assert!(!name.contains(".."), "no parent refs: {name}");
+        assert_eq!(files[0].name, "________etc_passwd");
+    }
+
+    #[test]
+    fn sanitises_hostile_control_names() {
+        // Pin the exact sanitised output for each hostile name. Negative checks
+        // (`!contains("..")`) can pass by luck; exact expectations make a future
+        // refactor that reorders the two replaces — a security invariant — fail
+        // loudly instead of coincidentally still looking clean.
+        let cases = [
+            ("../../etc/passwd", "____etc_passwd"),
+            ("....//....//etc/passwd", "________etc_passwd"),
+            ("....\\....\\etc\\passwd", "______etc_passwd"),
+            ("a/b\\c", "a_b_c"),
+            ("evil\0.sh", "evil.sh"), // NUL dropped: no path truncation
+            ("..\0../secret", "___secret"), // NUL between dots can't shield `..`
+        ];
+        for (raw, expected) in cases {
+            let line = format!("C0644 1 {raw}");
+            let (_, _, name) = parse_cd(&line).expect("control line parses");
+            assert_eq!(name, expected, "raw={raw:?}");
+        }
     }
 }
