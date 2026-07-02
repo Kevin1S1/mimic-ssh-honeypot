@@ -64,6 +64,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
 
     tracing::info!(
         event = "listening",
+        sensor_name = config.sensor_name.as_str(),
         addr = %config.listen_addr,
         port = config.port,
         max_sessions = config.max_sessions,

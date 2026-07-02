@@ -15,6 +15,7 @@ fn main() -> Result<()> {
     let config = Config::load(config_path.as_deref()).context("failed to load configuration")?;
 
     mimic::logging::init();
+    mimic::logging::event::init(&config.sensor_name);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

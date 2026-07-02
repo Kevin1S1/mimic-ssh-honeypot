@@ -2,11 +2,26 @@
 //! line tagged with an `event` field for easy downstream filtering.
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use tracing::info;
+
+/// Process-wide sensor name, set once at startup.
+static SENSOR_NAME: OnceLock<String> = OnceLock::new();
+
+/// Store the sensor name so every subsequent event log line includes it.
+pub fn init(name: &str) {
+    SENSOR_NAME
+        .set(name.to_owned())
+        .expect("event::init called more than once");
+}
+
+fn sensor_name() -> &'static str {
+    SENSOR_NAME.get().map_or("mimic", |s| s.as_str())
+}
 
 /// A new TCP/SSH connection was accepted.
 pub fn connection_opened(session_id: u64, peer: SocketAddr) {
-    info!(event = "connection_opened", session_id, peer = %peer);
+    info!(event = "connection_opened", sensor_name = sensor_name(), session_id, peer = %peer);
 }
 
 /// An authentication attempt was observed. `secret` is the captured password
@@ -21,6 +36,7 @@ pub fn auth_attempt(
 ) {
     info!(
         event = "auth_attempt",
+        sensor_name = sensor_name(),
         session_id,
         peer = %peer,
         username,
@@ -33,24 +49,24 @@ pub fn auth_attempt(
 /// A connection was refused before the SSH handshake because a concurrency
 /// limit was reached. `reason` is `"global_limit"` or `"per_ip_limit"`.
 pub fn connection_rejected(peer: SocketAddr, reason: &str) {
-    info!(event = "connection_rejected", peer = %peer, reason);
+    info!(event = "connection_rejected", sensor_name = sensor_name(), peer = %peer, reason);
 }
 
 /// The session ended.
 pub fn connection_closed(session_id: u64, peer: SocketAddr) {
-    info!(event = "connection_closed", session_id, peer = %peer);
+    info!(event = "connection_closed", sensor_name = sensor_name(), session_id, peer = %peer);
 }
 
 /// An attacker fetched a remote URL with `wget`/`curl`. `dest` is the VFS path
 /// the body was "saved" to (or `-` for stdout). No real request was made.
 pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: &str) {
-    info!(event = "download", session_id, peer = %peer, tool, url, dest);
+    info!(event = "download", sensor_name = sensor_name(), session_id, peer = %peer, tool, url, dest);
 }
 
 /// A command line was submitted by the client (interactive shell or one-shot
 /// `exec`). Logged verbatim for forensic replay.
 pub fn command(session_id: u64, peer: SocketAddr, command: &str) {
-    info!(event = "command", session_id, peer = %peer, command);
+    info!(event = "command", sensor_name = sensor_name(), session_id, peer = %peer, command);
 }
 
 /// A file was uploaded via SCP and written to the quarantine store. `name` is
@@ -72,6 +88,7 @@ pub fn upload(
 ) {
     info!(
         event = "upload",
+        sensor_name = sensor_name(),
         session_id,
         peer = %peer,
         name,
@@ -161,6 +178,7 @@ mod tests {
         assert_eq!(opened["event"], "connection_opened");
         assert_eq!(opened["session_id"], 1);
         assert_eq!(opened["peer"], "203.0.113.7:54321");
+        assert_eq!(opened["sensor_name"], "mimic");
 
         let auth = fields(&events[1]);
         assert_eq!(auth["event"], "auth_attempt");
@@ -168,14 +186,17 @@ mod tests {
         assert_eq!(auth["method"], "password");
         assert_eq!(auth["password"], "hunter2");
         assert_eq!(auth["accepted"], false);
+        assert_eq!(auth["sensor_name"], "mimic");
 
         let rejected = fields(&events[2]);
         assert_eq!(rejected["event"], "connection_rejected");
         assert_eq!(rejected["reason"], "per_ip_limit");
+        assert_eq!(rejected["sensor_name"], "mimic");
 
         let closed = fields(&events[3]);
         assert_eq!(closed["event"], "connection_closed");
         assert_eq!(closed["session_id"], 1);
+        assert_eq!(closed["sensor_name"], "mimic");
     }
 
     #[test]
