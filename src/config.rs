@@ -25,6 +25,9 @@ pub struct Config {
     pub server_id: String,
     /// Hostname presented in the shell prompt and `uname`.
     pub hostname: String,
+    /// Identifier included in every log line so operators running multiple
+    /// sensors can tell their streams apart.
+    pub sensor_name: String,
     /// Global cap on concurrent sessions.
     pub max_sessions: usize,
     /// Cap on concurrent connections per source IP.
@@ -93,6 +96,7 @@ impl Default for Config {
             port: 2222,
             server_id: "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3".to_string(),
             hostname: "debian".to_string(),
+            sensor_name: "mimic".to_string(),
             max_sessions: 256,
             per_ip_connections: 10,
             idle_timeout_secs: 300,

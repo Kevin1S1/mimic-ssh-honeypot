@@ -15,6 +15,10 @@ server_id = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
 # Hostname shown in the shell prompt.
 hostname = "debian"
 
+# Identifier included in every log line. Set a unique value per sensor when
+# running multiple honeypots so you can tell their log streams apart.
+sensor_name = "mimic"
+
 # Global cap on concurrent sessions.
 max_sessions = 256
 
