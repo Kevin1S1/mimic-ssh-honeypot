@@ -1,0 +1,18 @@
+# MIMIC honeypot — daily reset service (systemd, Docker-free deployment).
+#
+# Invoked by mimic-reset.timer once a day.  The script sleeps for a random
+# duration (0–3 h by default) then wipes quarantine data and restarts the
+# mimic.service unit so the honeypot begins each day with a clean slate.
+#
+# Install alongside mimic-reset.timer — see that file for instructions.
+
+[Unit]
+Description=MIMIC honeypot daily reset
+Documentation=https://github.com/Kevin1S1/mimic-ssh-honeypot
+After=mimic.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mimic/daily-reset.sh
+Environment=MIMIC_RESET_MODE=systemd
+Environment=MIMIC_DATA_DIR=/var/lib/mimic

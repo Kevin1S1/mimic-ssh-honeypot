@@ -1,0 +1,22 @@
+# MIMIC honeypot — daily reset timer (systemd, Docker-free deployment).
+#
+# Fires once a day at midnight UTC.  The reset script itself adds a random
+# delay (0–3 hours by default) so the restart does not always happen at the
+# same wall-clock second — that would be a tell.
+#
+# Install:
+#   sudo install -Dm0644 deploy/mimic-reset.timer  /etc/systemd/system/mimic-reset.timer
+#   sudo install -Dm0644 deploy/mimic-reset.service /etc/systemd/system/mimic-reset.service
+#   sudo install -Dm0755 deploy/daily-reset.sh      /usr/local/lib/mimic/daily-reset.sh
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mimic-reset.timer
+
+[Unit]
+Description=MIMIC honeypot daily reset timer
+Documentation=https://github.com/Kevin1S1/mimic-ssh-honeypot
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
