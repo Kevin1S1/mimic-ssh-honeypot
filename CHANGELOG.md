@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Daily automatic reset: wipes quarantine data and restarts the honeypot once
+  per day at a random time within a configurable window (default 0–3 hours) so
+  the restart is not predictable. Supported in Docker (sidecar container) and
+  systemd (timer + oneshot service).
+
 ## [0.1.0] - 2026-07-02
 
 Initial release.

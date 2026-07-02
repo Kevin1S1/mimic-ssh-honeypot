@@ -54,6 +54,45 @@ services:
     networks:
       - honeypot-net
 
+  # Daily reset sidecar: picks a random time within a 3-hour window each day,
+  # wipes quarantine data, and restarts the honeypot container so it starts
+  # clean.  The random offset prevents restarts from always hitting the same
+  # second (which would be a tell if an attacker watches uptime).
+  mimic-reset:
+    image: docker:27-cli
+    container_name: mimic-reset
+    restart: unless-stopped
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - mimic-data:/data
+      - ./deploy/daily-reset.sh:/usr/local/bin/daily-reset.sh:ro
+
+    environment:
+      - MIMIC_RESET_MODE=docker
+      - MIMIC_RESET_WINDOW=10800
+      - MIMIC_CONTAINER=mimic
+      - MIMIC_DATA_DIR=/data
+
+    entrypoint: ["/bin/sh", "/usr/local/bin/daily-reset.sh"]
+
+    depends_on:
+      mimic:
+        condition: service_started
+
+    # The sidecar itself needs no network exposure.
+    network_mode: none
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+    # Minimal resources — the sidecar is sleeping >99.9% of the time.
+    mem_limit: 32m
+    cpus: 0.1
+
 volumes:
   mimic-data:
 

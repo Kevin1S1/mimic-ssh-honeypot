@@ -41,6 +41,15 @@ MIMIC is protected against resource exhaustion attacks:
 - **Line-editor bounds** cap the interactive input line (4096 bytes) and per-session command history (1000 entries), so the readline emulation cannot be driven into unbounded memory growth. One-shot `exec` commands are capped at the same 4096 bytes, so an oversized exec request cannot bloat the logs or parser.
 - **Per-session crash isolation**: each connection runs in its own task; a panic in one session cannot take down the listener.
 
+### 7. Daily Reset (Ephemeral State Hygiene)
+A deployment-level daily reset mechanism restarts the honeypot and wipes accumulated quarantine data once per day. This serves multiple security purposes:
+- **Limits quarantine disk growth** — captured SCP uploads are purged daily, bounding the on-disk footprint without operator intervention.
+- **Clears in-memory state** — VFS modifications, shell histories, and per-session artifacts from previous attackers are discarded, preventing one attacker's leftovers from confusing or alerting the next.
+- **Randomised timing** — the restart occurs at a random time within a configurable window (default: 0–3 hours), so the reset is not predictable from `uptime` output or connection-drop patterns. Fixed-schedule restarts are a honeypot fingerprinting vector.
+- **Host keys are preserved** — Ed25519 and RSA keys survive the reset so the SSH fingerprint stays stable (a rotating fingerprint is a classic honeypot tell).
+
+In Docker deployments, this is handled by a lightweight sidecar container. For systemd, a timer + one-shot service unit pair is provided. See the README's [Daily Reset](README.md#daily-reset) section for configuration.
+
 ---
 
 ## Threat Model
@@ -79,8 +88,9 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
 | T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; listener survives | Bounded to one session |
-| T10 | Honeypot fingerprinting | Banner/KEX/timing/`/proc`/missing-feature probes | Debian 12 OpenSSH-shaped handshake, persistent host key, readline emulation, response jitter, recon-command coverage | Ongoing — anti-detection is an evolving discipline; TCP/IP-stack fingerprinting (TTL, window sizes) is host-kernel territory, addressed by host `sysctl`/firewall tuning, not the application |
-| T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); logs are structured JSON the operator controls | Operator data-handling duty |
+| T10 | Honeypot fingerprinting | Banner/KEX/timing/`/proc`/missing-feature probes | Debian 12 OpenSSH-shaped handshake, persistent host key, readline emulation, response jitter, recon-command coverage, randomised daily restart (not at fixed time) | Ongoing — anti-detection is an evolving discipline; TCP/IP-stack fingerprinting (TTL, window sizes) is host-kernel territory, addressed by host `sysctl`/firewall tuning, not the application |
+| T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); logs are structured JSON the operator controls; quarantine purged daily | Operator data-handling duty |
+| T12 | Accumulated state / forensic contamination | Previous attacker's files, history, or VFS artifacts visible to next attacker | Daily process restart clears all in-memory state; quarantine wiped on disk; random restart time prevents uptime-based detection | Bounded to one daily cycle |
 
 ### Security invariants (must always hold)
 1. **No `unsafe`** anywhere (`#![forbid(unsafe_code)]`).
@@ -89,6 +99,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 4. **Every attacker-controlled allocation is bounded** (connections, sessions, VFS nodes and content bytes, env, command length, history, upload size, per-command output).
 5. **Real disk writes are confined** to host keys and the content-addressed, non-executable quarantine store.
 6. **One session cannot affect another** or the listener (task isolation + RAII connection slots).
+7. **Ephemeral state does not persist across daily resets** — quarantine data, VFS modifications, and session artifacts are wiped daily; only host keys survive to maintain fingerprint stability.
 
 Any change that would weaken one of these invariants must be rejected — security takes priority over realism or features.
 

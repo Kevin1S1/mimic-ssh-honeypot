@@ -129,6 +129,8 @@ docker compose logs -f
 
 Host port `22` is mapped to the container's `2222`. A named volume at `/data` persists host keys and the quarantine store across container restarts.
 
+The compose stack includes a **daily reset sidecar** that automatically restarts the honeypot and wipes quarantine data once per day at a random time (see [Daily Reset](#daily-reset) below).
+
 > **Tip:** If something is already running on port 22, stop it first:
 > `sudo systemctl stop ssh && sudo systemctl disable ssh`
 
@@ -274,6 +276,48 @@ The unit runs under a transient unprivileged user (`DynamicUser=yes`) with a ful
 
 ---
 
+## Daily Reset
+
+MIMIC includes an automatic daily reset that wipes quarantine data and restarts the honeypot so each day begins with a clean slate. The restart time is **randomised** within a configurable window (default: 0–3 hours after midnight UTC) so attackers cannot predict exactly when the service bounces.
+
+### Docker
+
+The `docker-compose.yml` includes a `mimic-reset` sidecar container that handles this automatically — no extra setup needed. Tune it with environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MIMIC_RESET_WINDOW` | `10800` | Max random delay in seconds (10800 = 3 h) |
+| `MIMIC_CONTAINER` | `mimic` | Name of the honeypot container to restart |
+| `MIMIC_DATA_DIR` | `/data` | Path to the data volume (quarantine is wiped under this) |
+
+```yaml
+# Example: narrow the window to 1 hour
+environment:
+  - MIMIC_RESET_WINDOW=3600
+```
+
+### Systemd
+
+Install the timer and one-shot service alongside the main unit:
+
+```bash
+sudo install -Dm0755 deploy/daily-reset.sh      /usr/local/lib/mimic/daily-reset.sh
+sudo install -Dm0644 deploy/mimic-reset.service /etc/systemd/system/mimic-reset.service
+sudo install -Dm0644 deploy/mimic-reset.timer   /etc/systemd/system/mimic-reset.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now mimic-reset.timer
+```
+
+The timer fires at midnight UTC; the script then sleeps for a random duration within the window before performing the reset.
+
+### What gets wiped
+
+- **Quarantine store** (`quarantine/`) — captured SCP uploads are deleted.
+- **In-memory state** — the process restart clears all VFS modifications, shell histories, and session state.
+- **Host keys are preserved** — the SSH fingerprint stays stable across resets (a changing fingerprint is a honeypot tell).
+
+---
+
 ## Project Structure
 
 ```
@@ -312,7 +356,10 @@ mimic-ssh-honeypot/
 │   └── output_truncation.rs Verifies the per-command output cap holds under load
 ├── deploy/
 │   ├── mimic.toml           Example / reference configuration
-│   └── mimic.service        Systemd unit
+│   ├── mimic.service        Systemd unit (honeypot service)
+│   ├── mimic-reset.service  Systemd unit (daily reset one-shot)
+│   ├── mimic-reset.timer    Systemd timer (fires the daily reset)
+│   └── daily-reset.sh       Reset script (wipe + restart with random jitter)
 ├── Dockerfile               Multi-stage: rust:1.88 → distroless/cc-debian12:nonroot
 ├── docker-compose.yml       Production-ready compose stack
 └── .dockerignore
