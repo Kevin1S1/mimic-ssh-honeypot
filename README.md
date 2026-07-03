@@ -215,7 +215,7 @@ All events are JSON lines on stdout. Pipe to `jq` or ship to your SIEM.
 {"fields":{"event":"download","sensor_name":"mimic","session_id":42,"peer":"…","tool":"wget","url":"http://evil.sh/payload","dest":"/tmp/payload"}}
 
 // SCP upload captured
-{"fields":{"event":"upload","sensor_name":"mimic","session_id":42,"peer":"…","filename":"bot.elf","target_path":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_path":"quarantine/a3f…","truncated":false}}
+{"fields":{"event":"upload","sensor_name":"mimic","session_id":42,"peer":"…","name":"bot.elf","dest":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_path":"quarantine/a3f…","truncated":false}}
 
 // Session ended
 {"fields":{"event":"connection_closed","sensor_name":"mimic","session_id":42,"peer":"…"}}
