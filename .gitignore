@@ -23,3 +23,6 @@ Thumbs.db
 # Agent artifacts
 CLAUDE.md
 .agents/
+
+# Local blog drafts — not part of the published project
+/mimic-technical-deepdive.md
