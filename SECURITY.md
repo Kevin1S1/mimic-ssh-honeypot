@@ -28,6 +28,7 @@ The only time the honeypot touches the real disk based on attacker input is duri
 - Control bytes (including NUL) are stripped to prevent log/VFS injection.
 - Files are deduplicated and saved by their SHA-256 hash, so the attacker-supplied name never influences the stored path on disk.
 - The upload size is strictly capped to prevent disk exhaustion.
+- A per-session cap on cumulative real-disk quarantine writes (`max_upload_bytes` × 32) bounds disk growth from a flood of many distinct small files within one session — content-addressed dedup alone only bounds *repeated* payloads. Files past the cap still land safely in the in-memory VFS (which has its own independent bounds); only the real-disk copy is skipped.
 Even if thousands of malware samples are uploaded, they are safely written as inert blobs into the `quarantine` folder and cannot overwrite system files.
 
 ### 6. Denial of Service (DoS) Resilience
@@ -83,8 +84,8 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T2 | Real filesystem read/write | `cat`, `rm`, `cp`, path traversal | All ops act on the in-memory `Vfs`; real FS decoupled | None by design |
 | T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; fuzz/robustness tests on the line editor | Unknown bug in a dependency |
 | T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping` to attacker host | Network commands are faked; no real socket opened | None by design |
-| T5 | Disk exhaustion | SCP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec | Bounded by `max_upload_bytes` × distinct hashes |
-| T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output | VFS ≤ 10k nodes and ≤ 64 MiB content bytes; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session |
+| T5 | Disk exhaustion | SCP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec, per-session quarantine disk-write cap (`max_upload_bytes` × 32) | Bounded per session; capped total across sessions only by the daily reset |
+| T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output | VFS ≤ 10k nodes and ≤ 64 MiB content bytes; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch; per-session quarantine disk-write cap bounds real-disk growth from many distinct small uploads | Bounded per session |
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
 | T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; listener survives | Bounded to one session |
