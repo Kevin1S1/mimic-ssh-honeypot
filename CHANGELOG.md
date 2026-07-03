@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sensor_name` config key: an identifier included in every JSON log line so
   operators running multiple sensors can distinguish their streams (closes #3).
 
+### Security
+- Bounded per-session real-disk quarantine writes (`max_upload_bytes` × 32)
+  so a flood of many distinct SCP-uploaded files can no longer grow the
+  quarantine store without limit for the duration of a session; the
+  in-memory VFS mirror (already bounded) is unaffected.
+
 ## [0.1.0] - 2026-07-02
 
 Initial release.

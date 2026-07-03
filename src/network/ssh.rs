@@ -105,6 +105,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
             shell: None,
             scp: None,
+            quarantine_bytes: 0,
             _guard: guard,
         };
 
@@ -195,10 +196,21 @@ struct MimicHandler {
     shell: Option<Shell>,
     /// Active SCP upload sink, when the channel is running `scp -t`.
     scp: Option<ScpSink>,
+    /// Cumulative bytes this session has written to the real-disk quarantine
+    /// store. Bounds disk growth from a flood of distinct small uploads (the
+    /// content-addressed dedup only bounds *repeated* payloads).
+    quarantine_bytes: u64,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
 }
+
+/// Per-session ceiling on real-disk quarantine writes, as a multiple of
+/// `max_upload_bytes`. Bounds one session's disk footprint to a fixed multiple
+/// of its largest single allowed upload, closing the gap where many distinct
+/// small files could otherwise grow the quarantine store without limit for the
+/// duration of a session.
+const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
 
 impl MimicHandler {
     /// Apply the configured authentication policy to one attempt.
@@ -296,16 +308,31 @@ impl MimicHandler {
         let recursive = self.scp.as_ref().map(|s| s.recursive()).unwrap_or(false);
         let dest_path = self.write_to_vfs(&target, recursive, &file);
 
-        // Write to the quarantine store (real I/O is permitted in this layer).
-        let stored_path = match write_quarantine(&quarantine_dir, &sha256, &file.data) {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::warn!(
-                    event = "quarantine_error",
-                    session_id,
-                    error = %err,
-                );
-                String::new()
+        // Write to the quarantine store (real I/O is permitted in this layer),
+        // unless this session has already hit its cumulative disk-write cap.
+        // The VFS mirror above is unaffected — it has its own independent
+        // node/byte caps — so the attacker's session still looks consistent.
+        let cap = self
+            .config
+            .max_upload_bytes
+            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
+        let stored_path = if self.quarantine_bytes.saturating_add(file.data.len() as u64) > cap {
+            tracing::warn!(event = "quarantine_session_cap", session_id);
+            String::new()
+        } else {
+            match write_quarantine(&quarantine_dir, &sha256, &file.data) {
+                Ok(p) => {
+                    self.quarantine_bytes += file.data.len() as u64;
+                    p
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        event = "quarantine_error",
+                        session_id,
+                        error = %err,
+                    );
+                    String::new()
+                }
             }
         };
 
@@ -664,4 +691,81 @@ fn format_columns(items: &[String]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::limiter::ConnectionRegistry;
+    use crate::network::scp::CompletedFile;
+
+    /// Build a `MimicHandler` wired to a real (temp-dir) quarantine store, with
+    /// no real network I/O involved, so `store_upload` can be exercised
+    /// directly.
+    fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> MimicHandler {
+        let config = Arc::new(Config {
+            quarantine_dir,
+            max_upload_bytes,
+            ..Config::default()
+        });
+        let registry = ConnectionRegistry::new(10, 10);
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let guard = registry.try_acquire(peer.ip()).expect("slot available");
+        MimicHandler {
+            config,
+            session_id: 1,
+            peer,
+            auth_attempts: 0,
+            username: "root".to_string(),
+            editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
+            shell: None,
+            scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
+            quarantine_bytes: 0,
+            _guard: guard,
+        }
+    }
+
+    #[test]
+    fn quarantine_disk_writes_are_capped_per_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "mimic-quarantine-cap-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let max_upload_bytes = 1024u64;
+        let mut handler = test_handler(dir.clone(), max_upload_bytes);
+        let cap = max_upload_bytes * QUARANTINE_SESSION_MULTIPLIER;
+
+        // Upload well past the cap worth of distinct (non-deduplicating) files.
+        let file_size: usize = 1000;
+        let num_files = (cap / file_size as u64) + 5;
+        for i in 0..num_files {
+            handler.store_upload(CompletedFile {
+                name: format!("f{i}"),
+                rel_dir: String::new(),
+                mode: 0o644,
+                data: vec![i as u8; file_size], // distinct content per file
+                size: file_size as u64,
+                truncated: false,
+            });
+        }
+
+        let total_on_disk: u64 = std::fs::read_dir(&dir)
+            .expect("quarantine dir created")
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().expect("metadata").len())
+            .sum();
+        assert!(
+            total_on_disk <= cap,
+            "quarantine disk usage {total_on_disk} exceeded session cap {cap}"
+        );
+        assert!(
+            handler.quarantine_bytes <= cap,
+            "tracked quarantine_bytes {} exceeded cap {cap}",
+            handler.quarantine_bytes
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
