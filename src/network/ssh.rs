@@ -413,32 +413,43 @@ fn abs_path(cwd: &str, path: &str) -> String {
 }
 
 /// Write `data` to `<dir>/<sha256>` (deduplicating by content hash), creating
-/// `dir` if needed. Returns the stored file's path. Files are written
-/// non-executable and owner-read/write only (`0600`) so a captured payload can
-/// never be run from the quarantine store.
+/// `dir` if needed. Returns the stored file's path. Files are created
+/// non-executable and owner-read/write only (`0600`) at creation time so a
+/// captured payload can never be run from the quarantine store and is never
+/// briefly world/group-readable between the write and a chmod.
 fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io::Result<String> {
+    use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(sha256);
-    if !path.exists() {
-        std::fs::write(&path, data)?;
-        restrict_permissions(&path)?;
+    // Content-addressed store: identical payloads dedupe. `create_new` also
+    // closes the exists()-then-write TOCTOU — if a concurrent session already
+    // stored the same bytes, `AlreadyExists` is success, not an error.
+    match create_restricted(&path) {
+        Ok(mut file) => file.write_all(data)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
     }
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Set owner-only read/write permissions (`0600`) on `path`. No-op on
-/// platforms without Unix permission bits.
-fn restrict_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+/// Create `path` for writing with owner-only (`0600`) permissions set at
+/// creation time on Unix, failing if it already exists.
+#[cfg(unix)]
+fn create_restricted(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_restricted(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 impl Handler for MimicHandler {
