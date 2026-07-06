@@ -496,6 +496,82 @@ impl Handler for MimicHandler {
         Ok(true)
     }
 
+    /// A real Debian sshd always answers `pty-req` with success. russh's
+    /// default `Handler` impl leaves the request unanswered (neither success
+    /// nor failure), which is a cheap, passive tell for anything that checks
+    /// the reply — most interactive `ssh` clients send this before `shell`.
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    /// Mirrors Debian's default `sshd_config` (`AcceptEnv LANG LC_*`): only
+    /// locale variables are actually accepted, everything else is refused —
+    /// same as a real server, and again explicitly replied to rather than
+    /// left hanging.
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        _variable_value: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if variable_name == "LANG" || variable_name.starts_with("LC_") {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
+    /// Terminal resizes have no effect on non-interactive output here, but a
+    /// real server still acknowledges the request.
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    /// No subsystem (SFTP included) is emulated; report failure explicitly,
+    /// the same way a real sshd does for an unsupported subsystem, instead of
+    /// silently dropping the request.
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        _name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    /// Agent forwarding is not emulated.
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(false)
+    }
+
     async fn shell_request(
         &mut self,
         channel: ChannelId,

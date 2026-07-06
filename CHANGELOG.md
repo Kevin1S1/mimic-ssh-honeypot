@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   membership, but running `sudo` itself returned "command not found" — an
   inconsistency an attacker could notice. `sudo` is now implemented.
 
+### Fixed
+- `pty-req`, `env`, `window-change`, subsystem, and agent-forwarding channel
+  requests were left unanswered (russh's default `Handler` impl neither
+  succeeds nor fails them), unlike a real sshd which always replies. Most
+  interactive `ssh` clients send `pty-req` before `shell` and tolerate the
+  missing reply, but it's a cheap, passive fingerprinting signal for anything
+  that checks it. Now replied to explicitly: `pty-req`/`window-change` always
+  succeed; `env` succeeds only for `LANG`/`LC_*` (matching Debian's default
+  `AcceptEnv`); subsystem and agent-forwarding requests fail cleanly, since
+  neither is emulated.
+
 ### Security
 - Bounded per-session real-disk quarantine writes (`max_upload_bytes` × 32)
   so a flood of many distinct SCP-uploaded files can no longer grow the
