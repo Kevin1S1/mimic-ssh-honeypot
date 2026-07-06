@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OpenOptions` at file-creation time) instead of being chmod'd after a
   world/group-readable `std::fs::write`, closing a brief window where a
   newly generated private key was readable by other local users.
+- Quarantined SCP uploads are now created `0600` atomically at file-creation
+  time (same `OpenOptions` approach as host keys) instead of being chmod'd
+  after a world/group-readable write, removing the brief window where a
+  captured sample was readable by other local users. The `create_new` write
+  also closes the previous exists()-then-write race between concurrent
+  sessions storing the same content-addressed payload.
 
 ## [0.1.0] - 2026-07-02
 
