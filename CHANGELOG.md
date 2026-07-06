@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a flood of many distinct SCP-uploaded files can no longer grow the
   quarantine store without limit for the duration of a session; the
   in-memory VFS mirror (already bounded) is unaffected.
+- Host keys are now created with `0600` permissions atomically (via
+  `OpenOptions` at file-creation time) instead of being chmod'd after a
+  world/group-readable `std::fs::write`, closing a brief window where a
+  newly generated private key was readable by other local users.
 
 ## [0.1.0] - 2026-07-02
 

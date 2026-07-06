@@ -52,20 +52,30 @@ fn ensure_key(path: &Path, algorithm: Algorithm) -> Result<PrivateKey> {
     let pem = key
         .to_openssh(LineEnding::LF)
         .map_err(|e| anyhow::anyhow!("encoding host key: {e}"))?;
-    std::fs::write(path, pem.as_bytes())
+    write_key_file(path, pem.as_bytes())
         .with_context(|| format!("writing host key {}", path.display()))?;
-    set_key_permissions(path);
     Ok(key)
 }
 
+/// Create and write the key file with `0600` permissions set at creation time
+/// on Unix, so there is no window where the private key is world/group
+/// readable between the write and a subsequent chmod.
 #[cfg(unix)]
-fn set_key_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)
 }
 
 #[cfg(not(unix))]
-fn set_key_permissions(_path: &Path) {}
+fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
 
 #[cfg(test)]
 mod tests {
