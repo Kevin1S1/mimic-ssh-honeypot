@@ -131,6 +131,105 @@ pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.hostname))
 }
 
+/// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
+pub fn nproc(_shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok("1\n")
+}
+
+/// `lscpu` — describes the same single-core Xeon presented by `/proc/cpuinfo`.
+pub fn lscpu(_shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok(
+        "Architecture:             x86_64\n\
+         CPU op-mode(s):           32-bit, 64-bit\n\
+         Byte Order:               Little Endian\n\
+         CPU(s):                   1\n\
+         On-line CPU(s) list:      0\n\
+         Vendor ID:                GenuineIntel\n\
+         Model name:               Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n\
+         CPU family:               6\n\
+         Model:                    85\n\
+         Thread(s) per core:       1\n\
+         Core(s) per socket:       1\n\
+         Socket(s):                1\n\
+         Stepping:                 7\n\
+         BogoMIPS:                 5000.00\n\
+         Hypervisor vendor:        KVM\n\
+         Virtualization type:      full\n",
+    )
+}
+
+/// `sudo [-u USER] [-l] COMMAND [ARG]...`
+///
+/// The honeypot never gates this on a real password: the attacker's session
+/// credentials were already accepted at login, and `id` already reports
+/// membership in the `sudo` group, so denying here would be an inconsistent
+/// tell for no forensic benefit. Elevation only lasts for the wrapped
+/// command; the caller's uid/gid are restored afterward.
+pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.peek() {
+        match arg.as_str() {
+            "-l" | "--list" => {
+                return CommandResult::ok(format!(
+                    "Matching Defaults entries for {user} on {host}:\n    env_reset, mail_badpass, secure_path=/usr/local/sbin\\:/usr/local/bin\\:/usr/sbin\\:/usr/bin\\:/sbin\\:/bin\n\nUser {user} may run the following commands on {host}:\n    (ALL : ALL) ALL\n",
+                    user = shell.username,
+                    host = shell.hostname,
+                ));
+            }
+            "-u" => {
+                iter.next();
+                iter.next(); // consume the target username
+            }
+            other if other.starts_with('-') => {
+                iter.next();
+            }
+            _ => break,
+        }
+    }
+    let rest: Vec<String> = iter.cloned().collect();
+    if rest.is_empty() {
+        return CommandResult::err(
+            "usage: sudo -h | -K | -k | -V\n\
+             usage: sudo -v [-ABkNnS] [-g group] [-h host] [-p prompt] [-u user]\n\
+             usage: sudo -l [-ABkNnS] [-g group] [-h host] [-p prompt] [-U user] [-u user] [command]\n\
+             usage: sudo [-ABbEHknPS] [-r role] [-t type] [-C fd] [-D directory] [-g group] [-h host] [-p prompt] [-T timeout] [-u user] [VAR=value] [-i | -s] [<command>]\n",
+            1,
+        );
+    }
+    let (uid, gid) = (shell.uid, shell.gid);
+    shell.uid = 0;
+    shell.gid = 0;
+    let result = super::dispatch(shell, &rest);
+    shell.uid = uid;
+    shell.gid = gid;
+    result
+}
+
+/// `su [-] [USER]`
+///
+/// Switches the session's effective identity, as a fresh login shell for
+/// `USER` (root if omitted). Like `sudo`, this never fails on a real password
+/// check for the same reason.
+///
+/// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
+/// identity; add transient (non-persistent) elevation if that distinction
+/// ever matters for captured sessions.
+pub fn su(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut target: Option<&str> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-c" | "--command" | "-s" | "--shell" | "-g" | "--group" => {
+                iter.next(); // takes a value; accepted, ignored
+            }
+            other if other.starts_with('-') => {} // "-", "-l", "--login", ...: accepted, no-op
+            other => target = Some(other),
+        }
+    }
+    shell.switch_user(target.unwrap_or("root"));
+    CommandResult::empty()
+}
+
 /// `echo [-ne] [STRING]...`
 pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut no_newline = false;
@@ -602,6 +701,53 @@ pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
+/// `pkill [-SIGNAL] NAME`
+///
+/// Matches process names (substring) in the same fake table `ps`/`kill` use,
+/// applying the same ownership rule as `kill`. Tab-completion has always
+/// offered `pkill`; this closes the gap where it fell through to "command not
+/// found".
+pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
+    let names: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+
+    if names.is_empty() {
+        return CommandResult::err(
+            "pkill: no matching criteria specified\nTry `pkill --help' for more information.\n",
+            2,
+        );
+    }
+
+    let table = session_table(shell);
+    let mut out = String::new();
+    let mut matched_any = false;
+    let mut denied = false;
+    for name in &names {
+        for p in table.iter().filter(|p| p.cmd.contains(name)) {
+            if shell.uid != 0 && p.user != shell.username {
+                out.push_str(&format!(
+                    "pkill: killing pid {} failed: Operation not permitted\n",
+                    p.pid
+                ));
+                denied = true;
+            } else {
+                matched_any = true;
+            }
+        }
+    }
+
+    if denied {
+        CommandResult::err(out, 1)
+    } else if matched_any {
+        CommandResult::empty()
+    } else {
+        CommandResult::err("", 1)
+    }
+}
+
 /// `free [-h|-m|-g]`
 pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human");
@@ -976,5 +1122,54 @@ mod tests {
         let mut shell = Shell::new("attacker", "debian");
         assert_eq!(run(&mut shell, "crontab -l"), "no crontab for attacker\n");
         assert_eq!(shell.last_status, 1);
+    }
+
+    #[test]
+    fn nproc_and_lscpu_match_cpuinfo() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(run(&mut shell, "nproc"), "1\n");
+        assert!(run(&mut shell, "lscpu").contains("Xeon(R) Platinum 8259CL"));
+    }
+
+    #[test]
+    fn sudo_elevates_for_one_command_then_restores() {
+        let mut shell = Shell::new("attacker", "debian");
+        assert_eq!(shell.uid, 1000);
+        // A privileged apt subcommand is denied without sudo...
+        assert!(run(&mut shell, "apt update").contains("Permission denied"));
+        // ...but succeeds prefixed with sudo, and uid is restored afterward.
+        assert!(run(&mut shell, "sudo apt update").contains("Reading package lists"));
+        assert_eq!(shell.uid, 1000);
+    }
+
+    #[test]
+    fn sudo_list_and_bare_usage() {
+        let mut shell = Shell::new("attacker", "debian");
+        assert!(run(&mut shell, "sudo -l").contains("(ALL : ALL) ALL"));
+        assert!(run(&mut shell, "sudo").contains("usage: sudo"));
+    }
+
+    #[test]
+    fn su_switches_identity_and_home() {
+        let mut shell = Shell::new("attacker", "debian");
+        assert_eq!(run(&mut shell, "su"), "");
+        assert_eq!(shell.username, "root");
+        assert_eq!(shell.uid, 0);
+        assert_eq!(shell.cwd_path(), "/root");
+        // `su attacker` (or any other name) switches back to a normal account.
+        assert_eq!(run(&mut shell, "su someoneelse"), "");
+        assert_eq!(shell.uid, 1000);
+        assert_eq!(shell.cwd_path(), "/home/someoneelse");
+    }
+
+    #[test]
+    fn pkill_matches_by_name_and_respects_ownership() {
+        let mut root = Shell::new("root", "debian");
+        assert_eq!(run(&mut root, "pkill bash"), "");
+        let mut user = Shell::new("attacker", "debian");
+        // The fake table's system processes are owned by root; a non-root
+        // session may not "kill" them.
+        assert!(run(&mut user, "pkill sshd").contains("Operation not permitted"));
+        assert!(run(&mut user, "pkill no-such-process").is_empty());
     }
 }

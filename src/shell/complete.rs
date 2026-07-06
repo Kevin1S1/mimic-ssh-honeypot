@@ -12,10 +12,10 @@ use crate::vfs::Vfs;
 /// completion. Kept in sync with the command registry.
 pub const COMMANDS: &[&str] = &[
     "apt", "apt-get", "cat", "cd", "chmod", "clear", "cp", "crontab", "curl", "df", "dpkg", "echo",
-    "env", "exit", "export", "false", "free", "history", "hostname", "id", "ip", "kill", "last",
-    "logout", "ls", "mkdir", "mount", "mv", "netstat", "pkill", "ping", "printenv", "ps", "pwd",
-    "rm", "rmdir", "ss", "top", "touch", "true", "uname", "unset", "uptime", "w", "wget", "whoami",
-    "which",
+    "env", "exit", "export", "false", "find", "free", "grep", "history", "hostname", "id", "ip",
+    "kill", "last", "logout", "ls", "lscpu", "mkdir", "mount", "mv", "netstat", "nproc", "pkill",
+    "ping", "printenv", "ps", "pwd", "rm", "rmdir", "ss", "su", "sudo", "tar", "top", "touch",
+    "true", "uname", "unset", "uptime", "w", "wget", "whoami", "which",
 ];
 
 /// The outcome of a completion request.

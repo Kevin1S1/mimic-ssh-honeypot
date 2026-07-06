@@ -207,6 +207,27 @@ impl Shell {
         out
     }
 
+    /// Switch this session's effective identity to `user` (`su`), as if a
+    /// fresh login shell for that account. Mirrors [`Shell::new`]'s
+    /// root/non-root split so `su`, `su root`, and `su <name>` all land the
+    /// attacker in a believable home directory with a matching environment.
+    pub fn switch_user(&mut self, user: &str) {
+        let user = if user.is_empty() { "root" } else { user };
+        let (uid, gid, home_path) = if user == "root" {
+            (0, 0, "/root".to_string())
+        } else {
+            (1000, 1000, format!("/home/{user}"))
+        };
+        let home = ensure_home(&mut self.vfs, &home_path, uid, gid);
+        self.env = Env::login(user, &home_path, &self.hostname);
+        self.username = user.to_string();
+        self.uid = uid;
+        self.gid = gid;
+        self.cwd = home;
+        self.home = home;
+        self.prev_cwd = home;
+    }
+
     /// Run one command line: expand variables, tokenize, dispatch to the
     /// command registry, and record the resulting `$?`. Empty lines are no-ops.
     pub fn execute(&mut self, line: &str) -> Output {

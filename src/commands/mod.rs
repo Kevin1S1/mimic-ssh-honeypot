@@ -103,6 +103,8 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "cd" => CommandHandler::Mut(fs::cd),
         "pwd" => CommandHandler::Read(fs::pwd),
         "cat" => CommandHandler::Read(fs::cat),
+        "grep" => CommandHandler::Read(fs::grep),
+        "find" => CommandHandler::Read(fs::find),
 
         // Filesystem mutations (operate on the per-session VFS only).
         "touch" => CommandHandler::Mut(fs::touch),
@@ -112,12 +114,17 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "cp" => CommandHandler::Mut(fs::cp),
         "mv" => CommandHandler::Mut(fs::mv),
         "chmod" => CommandHandler::Mut(fs::chmod),
+        "tar" => CommandHandler::Mut(fs::tar),
 
         // System / identity commands.
         "whoami" => CommandHandler::Read(system::whoami),
         "id" => CommandHandler::Read(system::id),
         "uname" => CommandHandler::Read(system::uname),
         "hostname" => CommandHandler::Read(system::hostname),
+        "nproc" => CommandHandler::Read(system::nproc),
+        "lscpu" => CommandHandler::Read(system::lscpu),
+        "sudo" => CommandHandler::Mut(system::sudo),
+        "su" => CommandHandler::Mut(system::su),
         "echo" => CommandHandler::Read(system::echo),
         "env" | "printenv" => CommandHandler::Read(system::env),
         "export" => CommandHandler::Mut(system::export),
@@ -128,6 +135,7 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "ps" => CommandHandler::Read(system::ps),
         "top" => CommandHandler::Read(system::top),
         "kill" => CommandHandler::Read(system::kill),
+        "pkill" => CommandHandler::Read(system::pkill),
         "free" => CommandHandler::Read(system::free),
         "uptime" => CommandHandler::Read(system::uptime),
 
