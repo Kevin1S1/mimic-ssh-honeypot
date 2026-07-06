@@ -363,6 +363,451 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
+/// Flags shared by `grep`'s file/directory search helpers.
+#[derive(Default, Clone, Copy)]
+struct GrepFlags {
+    ignore_case: bool,
+    invert: bool,
+    line_numbers: bool,
+    count_only: bool,
+    show_filename: bool,
+}
+
+/// `grep [OPTION]... PATTERN [FILE]...`
+///
+/// A literal (non-regex) substring search — `-i` case-insensitive, `-v`
+/// invert, `-n` line numbers, `-c` count only, `-r`/`-R` recurse into
+/// directories.
+///
+/// ponytail: literal substring match only, not real BRE/ERE regex; upgrade if
+/// attacker tooling depends on regex features.
+pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut flags = GrepFlags::default();
+    let mut recursive = false;
+    let mut pattern: Option<&str> = None;
+    let mut paths: Vec<&str> = Vec::new();
+
+    for arg in args {
+        if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
+            for ch in arg[1..].chars() {
+                match ch {
+                    'i' => flags.ignore_case = true,
+                    'v' => flags.invert = true,
+                    'n' => flags.line_numbers = true,
+                    'c' => flags.count_only = true,
+                    'r' | 'R' => recursive = true,
+                    other => {
+                        return CommandResult::err(
+                            format!(
+                                "grep: invalid option -- '{other}'\nUsage: grep [OPTION]... PATTERNS [FILE]...\n"
+                            ),
+                            2,
+                        );
+                    }
+                }
+            }
+        } else if pattern.is_none() {
+            pattern = Some(arg);
+        } else {
+            paths.push(arg);
+        }
+    }
+
+    let Some(pattern) = pattern else {
+        return CommandResult::err("Usage: grep [OPTION]... PATTERNS [FILE]...\n", 2);
+    };
+    if paths.is_empty() {
+        // No file operand: real grep reads stdin, which is empty here.
+        return CommandResult::err("", 1);
+    }
+
+    let needle = if flags.ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+    flags.show_filename = paths.len() > 1 || recursive;
+
+    let mut out = String::new();
+    let mut any_match = false;
+    for path in &paths {
+        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
+            out.push_str(&format!("grep: {path}: No such file or directory\n"));
+            continue;
+        };
+        if shell.vfs.node(id).meta.is_dir() {
+            if recursive {
+                grep_dir(
+                    &shell.vfs,
+                    id,
+                    path,
+                    &needle,
+                    flags,
+                    &mut out,
+                    &mut any_match,
+                );
+            } else {
+                out.push_str(&format!("grep: {path}: Is a directory\n"));
+            }
+        } else {
+            grep_file(
+                &shell.vfs,
+                id,
+                path,
+                &needle,
+                flags,
+                &mut out,
+                &mut any_match,
+            );
+        }
+    }
+
+    if any_match {
+        CommandResult::ok(out)
+    } else {
+        CommandResult::err(out, 1)
+    }
+}
+
+/// Search a single file's contents for `needle`, appending matching lines.
+fn grep_file(
+    vfs: &Vfs,
+    id: NodeId,
+    path: &str,
+    needle: &str,
+    flags: GrepFlags,
+    out: &mut String,
+    any_match: &mut bool,
+) {
+    let NodeKind::File { contents } = &vfs.node(id).kind else {
+        return;
+    };
+    let text = String::from_utf8_lossy(contents);
+    let mut count = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        let hay = if flags.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        };
+        if hay.contains(needle) != flags.invert {
+            count += 1;
+            *any_match = true;
+            if !flags.count_only {
+                if flags.show_filename {
+                    out.push_str(path);
+                    out.push(':');
+                }
+                if flags.line_numbers {
+                    out.push_str(&(i + 1).to_string());
+                    out.push(':');
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    if flags.count_only {
+        if flags.show_filename {
+            out.push_str(path);
+            out.push(':');
+        }
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
+}
+
+/// Recurse into a directory for `grep -r`, always showing filenames.
+fn grep_dir(
+    vfs: &Vfs,
+    dir: NodeId,
+    path: &str,
+    needle: &str,
+    flags: GrepFlags,
+    out: &mut String,
+    any_match: &mut bool,
+) {
+    let Some(entries) = vfs.entries(dir) else {
+        return;
+    };
+    let flags = GrepFlags {
+        show_filename: true,
+        ..flags
+    };
+    for (name, id) in entries {
+        let child_path = format!("{}/{}", path.trim_end_matches('/'), name);
+        if vfs.node(id).meta.is_dir() {
+            grep_dir(vfs, id, &child_path, needle, flags, out, any_match);
+        } else {
+            grep_file(vfs, id, &child_path, needle, flags, out, any_match);
+        }
+    }
+}
+
+/// `find [PATH] [-name PATTERN] [-type f|d]`
+///
+/// Recursively lists VFS paths under `PATH` (default `.`), optionally
+/// filtered by a glob `-name` pattern (`*`/`?` wildcards) and/or `-type`.
+///
+/// ponytail: a small wildcard matcher, not the full GNU find expression
+/// language (`-perm`, `-mtime`, boolean operators, ...); other predicates are
+/// accepted and ignored rather than rejected outright.
+pub fn find(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut start_path = ".";
+    let mut name_pattern: Option<&str> = None;
+    let mut type_filter: Option<char> = None;
+    let mut first_operand = true;
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-name" | "-iname" => name_pattern = iter.next().map(String::as_str),
+            "-type" => type_filter = iter.next().and_then(|s| s.chars().next()),
+            "-maxdepth" | "-mindepth" => {
+                iter.next(); // accepted, ignored
+            }
+            other if first_operand && !other.starts_with('-') => {
+                start_path = other;
+                first_operand = false;
+            }
+            _ => {} // other predicates/flags (-print, -perm, ...): ignored
+        }
+    }
+
+    let Some(root) = shell.vfs.resolve(shell.cwd, start_path) else {
+        return CommandResult::err(
+            format!("find: '{start_path}': No such file or directory\n"),
+            1,
+        );
+    };
+
+    let mut out = String::new();
+    find_walk(
+        &shell.vfs,
+        root,
+        start_path,
+        name_pattern,
+        type_filter,
+        &mut out,
+    );
+    CommandResult::ok(out)
+}
+
+/// Depth-first walk collecting paths that match the `-name`/`-type` filters.
+fn find_walk(
+    vfs: &Vfs,
+    id: NodeId,
+    path: &str,
+    name: Option<&str>,
+    type_filter: Option<char>,
+    out: &mut String,
+) {
+    let node = vfs.node(id);
+    let is_dir = node.meta.is_dir();
+    let base = if node.name.is_empty() {
+        path
+    } else {
+        node.name.as_str()
+    };
+    let type_ok = match type_filter {
+        Some('d') => is_dir,
+        Some('f') => !is_dir,
+        _ => true,
+    };
+    let name_ok = name.map(|p| glob_match(p, base)).unwrap_or(true);
+    if type_ok && name_ok {
+        out.push_str(path);
+        out.push('\n');
+    }
+
+    if is_dir {
+        if let Some(entries) = vfs.entries(id) {
+            for (child_name, child_id) in entries {
+                let child_path = format!("{}/{}", path.trim_end_matches('/'), child_name);
+                find_walk(vfs, child_id, &child_path, name, type_filter, out);
+            }
+        }
+    }
+}
+
+/// Minimal glob matcher supporting `*` and `?` wildcards (no character
+/// classes) — enough for typical `find -name` usage.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn helper(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => helper(&p[1..], t) || (!t.is_empty() && helper(p, &t[1..])),
+            (Some(b'?'), Some(_)) => helper(&p[1..], &t[1..]),
+            (Some(pc), Some(tc)) if pc == tc => helper(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    helper(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Apply a run of `tar` flag characters (from either a `-xyz` argument or
+/// GNU tar's dashless historical form), returning the first unrecognised
+/// character, if any.
+fn apply_tar_flags(
+    chars: &str,
+    create: &mut bool,
+    extract: &mut bool,
+    list: &mut bool,
+    verbose: &mut bool,
+    expect_file: &mut bool,
+) -> Option<char> {
+    for ch in chars.chars() {
+        match ch {
+            'c' => *create = true,
+            'x' => *extract = true,
+            't' => *list = true,
+            'v' => *verbose = true,
+            'f' => *expect_file = true,
+            'z' | 'j' | 'J' | 'p' | 'k' | 'm' => {} // compression/misc flags, no-op
+            other => return Some(other),
+        }
+    }
+    None
+}
+
+/// `tar [OPTION]... [-f ARCHIVE] [FILE]...`
+///
+/// Only creation (`-c`) is emulated meaningfully: it writes a small non-empty
+/// placeholder archive into the VFS. Extraction (`-x`) and listing (`-t`)
+/// always report a corrupt/empty archive — which is honest, since every file
+/// an attacker can get onto this honeypot (faked `wget`/`curl` downloads, the
+/// VFS mirror of an SCP upload) is either a zero-byte placeholder or has no
+/// real archive structure. A real host fails identically on a 0-byte or
+/// garbage "archive".
+///
+/// ponytail: no real (de)compression; upgrade only if genuinely round-tripping
+/// a created archive's contents is needed.
+pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut create = false;
+    let mut extract = false;
+    let mut list = false;
+    let mut verbose = false;
+    let mut archive: Option<&str> = None;
+    let mut members: Vec<&str> = Vec::new();
+    let mut expect_file = false;
+    let mut first = true;
+
+    for arg in args {
+        if expect_file {
+            archive = Some(arg);
+            expect_file = false;
+            first = false;
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("--file=") {
+            archive = Some(rest);
+        } else if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
+            if let Some(bad) = apply_tar_flags(
+                &arg[1..],
+                &mut create,
+                &mut extract,
+                &mut list,
+                &mut verbose,
+                &mut expect_file,
+            ) {
+                return CommandResult::err(
+                    format!(
+                        "tar: invalid option -- '{bad}'\nTry 'tar --help' or 'tar --usage' for more information.\n"
+                    ),
+                    2,
+                );
+            }
+        } else if first && !arg.is_empty() && arg.bytes().all(|b| b"cxtvzjJpkfm".contains(&b)) {
+            // Old-style bundled flags without a leading dash (GNU tar's
+            // historical BSD compatibility), e.g. `tar czf archive.tar.gz file`.
+            apply_tar_flags(
+                arg,
+                &mut create,
+                &mut extract,
+                &mut list,
+                &mut verbose,
+                &mut expect_file,
+            );
+        } else {
+            members.push(arg);
+        }
+        first = false;
+    }
+
+    let Some(archive_path) = archive.or_else(|| members.first().copied()) else {
+        return CommandResult::err(
+            "tar: refusing to read archive contents from terminal (missing -f option?)\ntar: Error is not recoverable: exiting now\n",
+            2,
+        );
+    };
+    if archive.is_none() && !members.is_empty() {
+        members.remove(0);
+    }
+
+    if create {
+        let Some((parent, name)) = resolve_parent(shell, archive_path) else {
+            return CommandResult::err(
+                format!("tar: {archive_path}: Cannot open: Not a directory\n"),
+                2,
+            );
+        };
+        let (uid, gid) = (shell.uid, shell.gid);
+        shell.vfs.add_file(
+            parent,
+            &name,
+            &b"MIMIC-FAKE-TAR-ARCHIVE\n"[..],
+            0o644,
+            uid,
+            gid,
+        );
+        let mut out = String::new();
+        if verbose {
+            for m in &members {
+                out.push_str(m);
+                out.push('\n');
+            }
+        }
+        return CommandResult::ok(out);
+    }
+
+    if extract || list {
+        let Some(id) = shell.vfs.resolve(shell.cwd, archive_path) else {
+            return CommandResult::err(
+                format!(
+                    "tar: {archive_path}: Cannot open: No such file or directory\ntar: Error is not recoverable: exiting now\n"
+                ),
+                2,
+            );
+        };
+        match &shell.vfs.node(id).kind {
+            NodeKind::Directory { .. } => {
+                return CommandResult::err(
+                    format!(
+                        "tar: {archive_path}: Cannot open: Is a directory\ntar: Error is not recoverable: exiting now\n"
+                    ),
+                    2,
+                );
+            }
+            NodeKind::File { contents } if contents.is_empty() => {
+                return CommandResult::err(
+                    "gzip: stdin: unexpected end of file\ntar: Child returned status 1\ntar: Error is not recoverable: exiting now\n",
+                    2,
+                );
+            }
+            _ => {}
+        }
+        return CommandResult::err(
+            "tar: This does not look like a tar archive\ntar: Exiting with failure status due to previous errors\n",
+            2,
+        );
+    }
+
+    CommandResult::err(
+        "tar: You must specify one of the '-Acdtrux', '--delete' or '--test-label' options\nTry 'tar --help' or 'tar --usage' for more information.\n",
+        2,
+    )
+}
+
 // --- Mutating file operations ---------------------------------------------
 //
 // Every operand resolves through the VFS only; the helpers below never touch a
@@ -1086,5 +1531,50 @@ mod tests {
         assert_eq!(run(&mut shell, "chmod u+x /tmp/f"), "");
         assert!(run(&mut shell, "ls -l /tmp/f").contains("-rwx------"));
         assert!(run(&mut shell, "chmod 9z9 /tmp/f").contains("invalid mode"));
+    }
+
+    #[test]
+    fn grep_finds_and_filters_lines() {
+        let mut shell = Shell::new("root", "debian");
+        assert!(run(&mut shell, "grep root /etc/passwd").contains("root:x:0:0"));
+        // Case-insensitive.
+        assert!(run(&mut shell, "grep -i ROOT /etc/passwd").contains("root:x:0:0"));
+        // No match: empty output, non-zero exit captured via execute().
+        let out = shell.execute("grep nope-at-all /etc/passwd");
+        assert_eq!(out.text, "");
+        // Missing file.
+        assert!(run(&mut shell, "grep root /nope").contains("No such file or directory"));
+    }
+
+    #[test]
+    fn find_walks_and_filters_by_name_and_type() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir -p /tmp/d/sub");
+        run(&mut shell, "touch /tmp/d/a.txt");
+        run(&mut shell, "touch /tmp/d/sub/b.txt");
+        let out = run(&mut shell, "find /tmp/d -name *.txt");
+        assert!(out.contains("/tmp/d/a.txt"));
+        assert!(out.contains("/tmp/d/sub/b.txt"));
+        let dirs_only = run(&mut shell, "find /tmp/d -type d");
+        assert!(dirs_only.contains("/tmp/d/sub"));
+        assert!(!dirs_only.contains("a.txt"));
+    }
+
+    #[test]
+    fn tar_create_writes_placeholder_and_extract_reports_corrupt() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "touch /tmp/a");
+        assert_eq!(run(&mut shell, "tar czf /tmp/out.tar.gz /tmp/a"), "");
+        assert!(run(&mut shell, "ls /tmp").contains("out.tar.gz"));
+        // Extracting our own fake (non-gzip) archive reports a corrupt archive.
+        assert!(
+            run(&mut shell, "tar xzf /tmp/out.tar.gz").contains("does not look like a tar archive")
+        );
+        // Extracting a genuinely empty file reports the gzip EOF error real
+        // tools give on a 0-byte "download".
+        run(&mut shell, "touch /tmp/empty.tar.gz");
+        assert!(run(&mut shell, "tar xzf /tmp/empty.tar.gz").contains("unexpected end of file"));
+        // Missing archive.
+        assert!(run(&mut shell, "tar xzf /tmp/nope.tar.gz").contains("No such file or directory"));
     }
 }

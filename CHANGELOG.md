@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systemd (timer + oneshot service).
 - `sensor_name` config key: an identifier included in every JSON log line so
   operators running multiple sensors can distinguish their streams (closes #3).
+- New emulated commands: `sudo` (transient elevation), `su` (persistent
+  identity switch), `nproc`/`lscpu` (matching the existing fake `/proc/cpuinfo`),
+  `tar` (create writes a placeholder archive; extract/list on a fake
+  0-byte/garbage "download" reports the same corrupt-archive errors a real
+  host would), and `pkill` (tab-completion already offered it; it previously
+  fell through to "command not found"). `grep` and `find` — previously
+  documented as "(stub)" in the README but not actually wired into the
+  command dispatch table at all — now do real (if simplified) substring
+  search and path traversal.
+
+### Fixed
+- `dpkg`/`apt` listed `sudo` as installed and `id` reported `sudo` group
+  membership, but running `sudo` itself returned "command not found" — an
+  inconsistency an attacker could notice. `sudo` is now implemented.
 
 ### Security
 - Bounded per-session real-disk quarantine writes (`max_upload_bytes` × 32)
