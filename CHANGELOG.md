@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-07
+
 ### Added
 - Daily automatic reset: wipes quarantine data and restarts the honeypot once
   per day at a random time within a configurable window (default 0–3 hours) so
@@ -92,5 +94,6 @@ Initial release.
 - CI: clippy (`-D warnings`), full test suite, cargo-deny supply-chain
   audit with weekly scheduled run.
 
-[Unreleased]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/releases/tag/v0.1.0
