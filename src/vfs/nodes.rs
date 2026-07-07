@@ -57,6 +57,23 @@ impl Metadata {
     pub fn is_symlink(&self) -> bool {
         self.mode & S_IFMT == S_IFLNK
     }
+
+    /// Whether a session with `uid`/`gid` may read this node's contents,
+    /// per standard Unix semantics: root (`uid == 0`) always can; the owner
+    /// needs the owner-read bit, group members need the group-read bit, and
+    /// everyone else needs the other-read bit.
+    pub fn readable_by(&self, uid: u32, gid: u32) -> bool {
+        if uid == 0 {
+            return true;
+        }
+        if uid == self.uid {
+            self.mode & 0o400 != 0
+        } else if gid == self.gid {
+            self.mode & 0o040 != 0
+        } else {
+            self.mode & 0o004 != 0
+        }
+    }
 }
 
 /// The payload of a node, discriminated by kind.

@@ -341,7 +341,13 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
             status = 1;
             continue;
         };
-        match &shell.vfs.node(id).kind {
+        let node = shell.vfs.node(id);
+        if !node.meta.readable_by(shell.uid, shell.gid) {
+            out.push_str(&format!("cat: {arg}: Permission denied\n"));
+            status = 1;
+            continue;
+        }
+        match &node.kind {
             NodeKind::Directory { .. } => {
                 out.push_str(&format!("cat: {arg}: Is a directory\n"));
                 status = 1;
@@ -443,12 +449,16 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
                     path,
                     &needle,
                     flags,
+                    shell.uid,
+                    shell.gid,
                     &mut out,
                     &mut any_match,
                 );
             } else {
                 out.push_str(&format!("grep: {path}: Is a directory\n"));
             }
+        } else if !shell.vfs.node(id).meta.readable_by(shell.uid, shell.gid) {
+            out.push_str(&format!("grep: {path}: Permission denied\n"));
         } else {
             grep_file(
                 &shell.vfs,
@@ -517,13 +527,18 @@ fn grep_file(
     }
 }
 
-/// Recurse into a directory for `grep -r`, always showing filenames.
+/// Recurse into a directory for `grep -r`, always showing filenames. Files
+/// unreadable by `uid`/`gid` are silently skipped, matching real `grep -r`
+/// behaviour (it reports a permission error per file but does not abort).
+#[allow(clippy::too_many_arguments)]
 fn grep_dir(
     vfs: &Vfs,
     dir: NodeId,
     path: &str,
     needle: &str,
     flags: GrepFlags,
+    uid: u32,
+    gid: u32,
     out: &mut String,
     any_match: &mut bool,
 ) {
@@ -537,9 +552,21 @@ fn grep_dir(
     for (name, id) in entries {
         let child_path = format!("{}/{}", path.trim_end_matches('/'), name);
         if vfs.node(id).meta.is_dir() {
-            grep_dir(vfs, id, &child_path, needle, flags, out, any_match);
-        } else {
+            grep_dir(
+                vfs,
+                id,
+                &child_path,
+                needle,
+                flags,
+                uid,
+                gid,
+                out,
+                any_match,
+            );
+        } else if vfs.node(id).meta.readable_by(uid, gid) {
             grep_file(vfs, id, &child_path, needle, flags, out, any_match);
+        } else {
+            out.push_str(&format!("grep: {child_path}: Permission denied\n"));
         }
     }
 }
@@ -1475,6 +1502,28 @@ mod tests {
         assert!(run(&mut shell, "cat /etc/hostname").contains("debian"));
         assert!(run(&mut shell, "cat /nope").contains("No such file or directory"));
         assert!(run(&mut shell, "cat /etc").contains("Is a directory"));
+    }
+
+    #[test]
+    fn cat_enforces_read_permissions() {
+        // /etc/shadow is 0640, owned by root:42 — an unprivileged uid/gid
+        // 1000 session must be denied, matching real Debian.
+        let mut unprivileged = Shell::new("user", "debian");
+        assert!(run(&mut unprivileged, "cat /etc/shadow").contains("Permission denied"));
+
+        // Root always bypasses permission checks.
+        let mut root = Shell::new("root", "debian");
+        assert!(run(&mut root, "cat /etc/shadow").contains("root:!:"));
+    }
+
+    #[test]
+    fn grep_enforces_read_permissions() {
+        let mut unprivileged = Shell::new("user", "debian");
+        assert!(run(&mut unprivileged, "grep root /etc/shadow").contains("Permission denied"));
+        assert!(run(&mut unprivileged, "grep -r root /etc").contains("Permission denied"));
+
+        let mut root = Shell::new("root", "debian");
+        assert!(run(&mut root, "grep root /etc/shadow").contains("root:!:"));
     }
 
     #[test]

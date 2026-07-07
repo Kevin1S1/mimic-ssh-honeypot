@@ -49,11 +49,16 @@ www-data:x:33:\n\
 ssh:x:114:\n\
 user:x:1000:\n";
 
-/// `/etc/shadow` — passwords shown as locked/hashed placeholders.
+/// `/etc/shadow` — passwords shown as locked/hashed placeholders. The `user`
+/// row carries a random-looking (but inert, non-identifying) SHA-512 crypt
+/// string rather than an obvious "placeholder"/"honeypot" marker: real
+/// permission checks now gate this file (owner/root only), but the content
+/// itself must not be a self-outing tell for anyone who does get past that
+/// (e.g. via a future privilege-escalation emulation gap).
 const SHADOW: &str = "root:!:19000:0:99999:7:::\n\
 daemon:*:19000:0:99999:7:::\n\
 sshd:!:19000:0:99999:7:::\n\
-user:$6$rounds=656000$Yl9p1.salt$8N.placeholderhashvalueforhoneypotuseonlyx0123456789abcdefXYZ:19000:0:99999:7:::\n";
+user:$6$rounds=656000$D1G7H204ckii$Abjn5s.euB1Z/rC2tdRk8fQxF5ucdtUgVpg.H.tPzMNktyVxhqoAclDrdXCw29WpcY68HNAlSzrJwXX1kX/PvS:19000:0:99999:7:::\n";
 
 /// `.bashrc` skeleton shipped by Debian's `bash` package.
 const BASHRC: &str = "# ~/.bashrc: executed by bash(1) for non-login shells.\n\
@@ -333,8 +338,19 @@ mod tests {
         let shadow = read(&fs, "/etc/shadow");
         assert!(shadow.contains("root:!:"), "root must be locked");
         assert!(
-            shadow.contains("placeholderhash"),
-            "user hash must be an obvious placeholder, not a real hash"
+            shadow.contains("$6$"),
+            "user row must look like a real SHA-512 crypt hash"
         );
+        // The hash content itself must not be a self-identifying tell: no
+        // English words like "placeholder"/"honeypot"/"fake"/"dummy" that
+        // would instantly out this as a decoy to anyone who reads it (e.g.
+        // via `cat /etc/shadow` if a future bug bypasses permission checks).
+        let lower = shadow.to_lowercase();
+        for tell in ["placeholder", "honeypot", "fake", "dummy", "mimic"] {
+            assert!(
+                !lower.contains(tell),
+                "shadow content must not contain the identifying word {tell:?}"
+            );
+        }
     }
 }

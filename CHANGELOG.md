@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured sample was readable by other local users. The `create_new` write
   also closes the previous exists()-then-write race between concurrent
   sessions storing the same content-addressed payload.
+- `cat` and `grep` now enforce Unix read permissions (owner/group/other bits,
+  root bypass) against the emulated VFS, matching real Debian instead of
+  ignoring file modes entirely. Previously any unprivileged session could
+  `cat`/`grep` a `0640` root-owned file like `/etc/shadow` — both an
+  unrealistic tell (real Debian denies it) and, combined with the fake
+  password hash literally containing the word "honeypot", an instant
+  self-identifying giveaway. The fake `/etc/shadow` hash is also now a
+  random-looking, non-identifying string.
 
 ## [0.1.0] - 2026-07-02
 
