@@ -63,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password hash literally containing the word "honeypot", an instant
   self-identifying giveaway. The fake `/etc/shadow` hash is also now a
   random-looking, non-identifying string.
+- `tar -c` no longer writes a plaintext `MIMIC-FAKE-TAR-ARCHIVE` marker into
+  its placeholder archive; an attacker who created and then `cat`ed the
+  archive would see the product name directly. It now writes non-identifying
+  binary-looking bytes (a gzip magic header followed by random data), and
+  extract/list behavior on it is unchanged (still reports a corrupt archive).
 
 ## [0.1.0] - 2026-07-02
 

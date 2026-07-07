@@ -697,6 +697,18 @@ fn apply_tar_flags(
     None
 }
 
+/// Non-empty, non-identifying placeholder bytes written by `tar -c`. Starts
+/// with the real gzip magic (`1f 8b 08 00`) so the file "looks" like a gzip
+/// stream at a glance, followed by random bytes — never a plaintext marker
+/// string, since an attacker who creates and then `cat`s the archive would
+/// otherwise read it directly (unlike the honest corrupt-archive errors
+/// `tar`'s own extract/list paths already give).
+const FAKE_ARCHIVE_BYTES: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x56, 0xc7, 0xb6, 0xee, 0x0d, 0xa0,
+    0xf8, 0x4b, 0xaf, 0x0c, 0xab, 0xea, 0xd2, 0x59, 0x3d, 0x8f, 0xc1, 0x3d, 0x59, 0x5f, 0x67, 0x2c,
+    0x22, 0x44,
+];
+
 /// `tar [OPTION]... [-f ARCHIVE] [FILE]...`
 ///
 /// Only creation (`-c`) is emulated meaningfully: it writes a small non-empty
@@ -779,14 +791,9 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
             );
         };
         let (uid, gid) = (shell.uid, shell.gid);
-        shell.vfs.add_file(
-            parent,
-            &name,
-            &b"MIMIC-FAKE-TAR-ARCHIVE\n"[..],
-            0o644,
-            uid,
-            gid,
-        );
+        shell
+            .vfs
+            .add_file(parent, &name, FAKE_ARCHIVE_BYTES, 0o644, uid, gid);
         let mut out = String::new();
         if verbose {
             for m in &members {
@@ -1625,5 +1632,22 @@ mod tests {
         assert!(run(&mut shell, "tar xzf /tmp/empty.tar.gz").contains("unexpected end of file"));
         // Missing archive.
         assert!(run(&mut shell, "tar xzf /tmp/nope.tar.gz").contains("No such file or directory"));
+    }
+
+    #[test]
+    fn tar_archive_content_is_not_self_identifying() {
+        // The created archive must look like inert binary data, never a
+        // plaintext product-name marker an attacker could `cat` and read.
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "touch /tmp/a");
+        run(&mut shell, "tar czf /tmp/out.tar.gz /tmp/a");
+        let content = run(&mut shell, "cat /tmp/out.tar.gz");
+        let lower = content.to_lowercase();
+        for tell in ["mimic", "honeypot", "fake", "placeholder"] {
+            assert!(
+                !lower.contains(tell),
+                "tar archive content must not contain the identifying word {tell:?}"
+            );
+        }
     }
 }
