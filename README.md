@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org/)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](#security-architecture)
 
-A medium-to-high interaction SSH honeypot written in Rust. MIMIC presents attackers with a fully convincing Debian 12 shell — realistic prompt, MOTD, filesystem, and ~40 emulated commands — while the entire session runs as a **pure in-memory state machine**. No shell process is ever spawned. No real filesystem is ever touched. The Rust compiler statically enforces this through `#![forbid(unsafe_code)]` and strict module-visibility boundaries.
+A medium-to-high interaction SSH honeypot written in Rust. MIMIC presents attackers with a fully convincing Debian 12 shell — realistic prompt, MOTD, filesystem, and ~50 emulated commands — while the entire session runs as a **pure in-memory state machine**. No shell process is ever spawned. No real filesystem is ever touched. The Rust compiler statically enforces this through `#![forbid(unsafe_code)]` and strict module-visibility boundaries.
 
 Every attacker action — authentication attempts, commands, `wget`/`curl` downloads, and SCP uploads — is captured as a structured JSON event, ready for SIEM ingestion or offline analysis.
 
@@ -43,7 +43,7 @@ MIMIC is split into five strictly isolated layers. Only the Network layer is all
 │  4. Virtual Filesystem (VFS)             │  In-memory inode tree, path
 │     src/vfs/                             │  resolution, symlinks, /proc
 ├──────────────────────────────────────────┤
-│  5. Command Registry                     │  ~40 emulated commands — each is
+│  5. Command Registry                     │  ~50 emulated commands — each is
 │     src/commands/                        │  a pure Rust function, no OS calls
 └──────────────────────────────────────────┘
          ║                      ║
@@ -92,13 +92,13 @@ Home directories for non-root attackers are created automatically under `/home/<
 |---|---|
 | **Navigation** | `ls` (`-a`/`-A`/`-l`/`-h`/`-1`), `cd` (`~`/`-`/`..`), `pwd` |
 | **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`, dashless bundled flags) |
-| **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`) |
-| **Identity** | `whoami`, `id`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `hostname`, `nproc`, `lscpu` |
+| **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
+| **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |
 | **Privilege** | `sudo` (transient elevation for one command), `su` (persistent identity switch) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
 | **Processes** | `ps` (`aux`/`-ef`), `top`, `kill`, `pkill`, `free`, `uptime` |
 | **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip` |
-| **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`) |
+| **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
 | **Shell built-ins** | `exit`, `logout`, `true`, `false`, `cd`, `export`, `unset` |
 

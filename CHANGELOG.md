@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- More emulated commands, for closer parity with a real Debian shell and the
+  recon scripts attackers commonly run: `head`/`tail` (`-n`/`-c`/`-N`, per-file
+  `==>` headers), `wc` (`-l`/`-w`/`-c`), `groups`, `arch`, `tty`, `date`
+  (`+FORMAT` strftime, real UTC clock), `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/
+  `-c`, Debian 12 "bookworm"), and `dmesg`. `dmesg` mirrors Debian's
+  `kernel.dmesg_restrict=1` default: it returns the fabricated kernel ring
+  buffer only to root and "Operation not permitted" otherwise. All new commands
+  remain pure functions over the in-memory VFS and shell state — no real
+  process, filesystem, or clock-setting access — and the escape-vector test
+  still enforces that boundary.
+
 ## [0.2.0] - 2026-07-07
 
 ### Added

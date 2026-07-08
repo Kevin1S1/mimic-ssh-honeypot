@@ -954,8 +954,278 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// `groups [USER]...` — the group memberships mirrored from `id`.
+pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
+    let line = if shell.uid == 0 {
+        "root".to_string()
+    } else {
+        format!("{} sudo", shell.username)
+    };
+    CommandResult::ok(format!("{line}\n"))
+}
+
+/// `arch` — machine hardware name, matching `uname -m`.
+pub fn arch(_shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok(format!("{MACHINE}\n"))
+}
+
+/// `tty` — the pseudo-terminal this session runs on (matches `ps`/`w`).
+pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok("/dev/pts/0\n")
+}
+
+/// `lsb_release [-a|-s|-i|-d|-r|-c]` — Debian 12 (bookworm) release info.
+///
+/// A near-universal fingerprinting step in automated recon; the values match
+/// the `/etc/os-release` snapshot the VFS presents.
+pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
+    let (mut want_i, mut want_d, mut want_r, mut want_c) = (false, false, false, false);
+    let mut short = false;
+    let mut all = false;
+
+    for arg in args {
+        if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
+            for ch in arg[1..].chars() {
+                match ch {
+                    'a' => all = true,
+                    's' => short = true,
+                    'i' => want_i = true,
+                    'd' => want_d = true,
+                    'r' => want_r = true,
+                    'c' => want_c = true,
+                    _ => {} // -v etc.: accepted, ignored
+                }
+            }
+        }
+    }
+
+    // Bare invocation or -a lists every field.
+    let full = all || !(want_i || want_d || want_r || want_c);
+    if full {
+        want_i = true;
+        want_d = true;
+        want_r = true;
+        want_c = true;
+    }
+
+    let mut out = String::new();
+    if full && !short {
+        out.push_str("No LSB modules are available.\n");
+    }
+    let mut push = |label: &str, value: &str| {
+        if short {
+            out.push_str(value);
+            out.push('\n');
+        } else {
+            out.push_str(&format!("{label}:\t{value}\n"));
+        }
+    };
+    if want_i {
+        push("Distributor ID", "Debian");
+    }
+    if want_d {
+        push("Description", "Debian GNU/Linux 12 (bookworm)");
+    }
+    if want_r {
+        push("Release", "12");
+    }
+    if want_c {
+        push("Codename", "bookworm");
+    }
+    CommandResult::ok(out)
+}
+
+/// A static kernel ring buffer for `dmesg`, shown only to root.
+const DMESG_BUFFER: &str = "\
+[    0.000000] Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n\
+[    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz-6.1.0-21-amd64 root=UUID=8f3a2b1c-4d5e-6f70-8192-a3b4c5d6e7f8 ro console=tty0 console=ttyS0,115200\n\
+[    0.000000] BIOS-provided physical RAM map:\n\
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable\n\
+[    0.000000] KVM: setup async PF for cpu 0\n\
+[    0.008000] Hypervisor detected: KVM\n\
+[    0.020000] CPU0: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz (family: 0x6, model: 0x55, stepping: 0x7)\n\
+[    0.130000] Memory: 4019216K/4194304K available\n\
+[    0.410000] pci 0000:00:00.0: [8086:1237] type 00 class 0x060000\n\
+[    0.512000] virtio_blk virtio1: [vda] 83886080 512-byte logical blocks (42.9 GB/40.0 GiB)\n\
+[    0.640000] ata1.00: ATA-8: QEMU HARDDISK, 2.5+, max UDMA/100\n\
+[    0.900000] EXT4-fs (sda1): mounted filesystem with ordered data mode. Quota mode: none.\n\
+[    1.220000] systemd[1]: systemd 252.22-1~deb12u1 running in system mode\n\
+[    1.480000] systemd[1]: Detected virtualization kvm.\n\
+[    1.481000] systemd[1]: Detected architecture x86-64.\n\
+[    2.310000] e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex\n\
+[    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
+
+/// `dmesg` — the kernel ring buffer.
+///
+/// Debian 12 ships `kernel.dmesg_restrict=1`, so an unprivileged user gets a
+/// permission error; only root sees the (fabricated) buffer.
+pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
+    if shell.uid != 0 {
+        return CommandResult::err(
+            "dmesg: read kernel buffer failed: Operation not permitted\n",
+            1,
+        );
+    }
+    CommandResult::ok(DMESG_BUFFER)
+}
+
+/// Current wall-clock time in unix seconds.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A broken-down UTC timestamp.
+struct Tm {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    min: u32,
+    sec: u32,
+    /// Days since Sunday, `0..=6`.
+    wday: u32,
+    /// Days since Jan 1, `0..=365`.
+    yday: u32,
+}
+
+/// Convert unix seconds to broken-down UTC using Howard Hinnant's civil-date
+/// algorithm (valid across the full `i64` range, no external crate).
+fn gmtime(secs: i64) -> Tm {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hour = (rem / 3600) as u32;
+    let min = ((rem % 3600) / 60) as u32;
+    let sec = (rem % 60) as u32;
+    // 1970-01-01 was a Thursday (index 4 with Sunday = 0).
+    let wday = ((days.rem_euclid(7) + 4) % 7) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    const CUM: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut yday = CUM[(month - 1) as usize] + (day - 1);
+    if leap && month > 2 {
+        yday += 1;
+    }
+
+    Tm {
+        year,
+        month,
+        day,
+        hour,
+        min,
+        sec,
+        wday,
+        yday,
+    }
+}
+
+const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WDAY_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const MON: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const MON_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// Render a `date` `+FORMAT` string against a broken-down time. Supports the
+/// specifiers that appear in real-world recon (`%Y %m %d %H %M %S %s %a %A %b
+/// %B %e %j %y %p %F %T %Z %n %t %%`); unknown specifiers pass through verbatim.
+fn strftime(tm: &Tm, epoch: i64, fmt: &str) -> String {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&tm.year.to_string()),
+            Some('y') => out.push_str(&format!("{:02}", tm.year.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{:02}", tm.month)),
+            Some('d') => out.push_str(&format!("{:02}", tm.day)),
+            Some('e') => out.push_str(&format!("{:2}", tm.day)),
+            Some('H') => out.push_str(&format!("{:02}", tm.hour)),
+            Some('M') => out.push_str(&format!("{:02}", tm.min)),
+            Some('S') => out.push_str(&format!("{:02}", tm.sec)),
+            Some('s') => out.push_str(&epoch.to_string()),
+            Some('j') => out.push_str(&format!("{:03}", tm.yday + 1)),
+            Some('a') => out.push_str(WDAY[tm.wday as usize]),
+            Some('A') => out.push_str(WDAY_FULL[tm.wday as usize]),
+            Some('b') | Some('h') => out.push_str(MON[(tm.month - 1) as usize]),
+            Some('B') => out.push_str(MON_FULL[(tm.month - 1) as usize]),
+            Some('p') => out.push_str(if tm.hour < 12 { "AM" } else { "PM" }),
+            Some('Z') => out.push_str("UTC"),
+            Some('F') => out.push_str(&format!("{}-{:02}-{:02}", tm.year, tm.month, tm.day)),
+            Some('T') => out.push_str(&format!("{:02}:{:02}:{:02}", tm.hour, tm.min, tm.sec)),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// `date [-u] [+FORMAT]` — the current UTC time.
+///
+/// The emulated host runs in UTC, so the `-u` flag is a no-op. Setting the
+/// clock (`date MMDDhhmm...`) would require root and is accepted as a no-op
+/// that echoes the current time back.
+///
+/// ponytail: read-only clock (uses the real host time, which is realistic for a
+/// live box); does not honour a `date STRING` set operand beyond echoing.
+pub fn date(_shell: &Shell, args: &[String]) -> CommandResult {
+    let epoch = now_unix();
+    let tm = gmtime(epoch);
+    let fmt = args.iter().find_map(|a| a.strip_prefix('+'));
+    let out = match fmt {
+        Some(f) => strftime(&tm, epoch, f),
+        // Default C-locale form: `Wed Jul  8 12:34:56 UTC 2026`.
+        None => strftime(&tm, epoch, "%a %b %e %H:%M:%S %Z %Y"),
+    };
+    CommandResult::ok(format!("{out}\n"))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{gmtime, strftime, WDAY};
     use crate::shell::Shell;
 
     fn run(shell: &mut Shell, line: &str) -> String {
@@ -1171,5 +1441,62 @@ mod tests {
         // session may not "kill" them.
         assert!(run(&mut user, "pkill sshd").contains("Operation not permitted"));
         assert!(run(&mut user, "pkill no-such-process").is_empty());
+    }
+
+    #[test]
+    fn groups_arch_and_tty_reflect_identity() {
+        let mut root = Shell::new("root", "debian");
+        assert_eq!(run(&mut root, "groups"), "root\n");
+        assert_eq!(run(&mut root, "arch"), "x86_64\n");
+        assert_eq!(run(&mut root, "tty"), "/dev/pts/0\n");
+        let mut user = Shell::new("attacker", "debian");
+        assert_eq!(run(&mut user, "groups"), "attacker sudo\n");
+    }
+
+    #[test]
+    fn lsb_release_all_and_short_forms() {
+        let mut shell = Shell::new("root", "debian");
+        let all = run(&mut shell, "lsb_release -a");
+        assert!(all.contains("Distributor ID:\tDebian"));
+        assert!(all.contains("Description:\tDebian GNU/Linux 12 (bookworm)"));
+        assert!(all.contains("Codename:\tbookworm"));
+        // Short selectors print just the value.
+        assert_eq!(run(&mut shell, "lsb_release -cs"), "bookworm\n");
+        assert_eq!(run(&mut shell, "lsb_release -rs"), "12\n");
+    }
+
+    #[test]
+    fn dmesg_is_root_only() {
+        let mut root = Shell::new("root", "debian");
+        assert!(run(&mut root, "dmesg").contains("Hypervisor detected: KVM"));
+        let mut user = Shell::new("attacker", "debian");
+        assert!(run(&mut user, "dmesg").contains("Operation not permitted"));
+        assert_eq!(user.last_status, 1);
+    }
+
+    #[test]
+    fn date_default_and_format_specifiers() {
+        let mut shell = Shell::new("root", "debian");
+        // Default form: `Wdy Mon DD HH:MM:SS UTC YYYY`.
+        let default = run(&mut shell, "date");
+        assert!(default.contains("UTC"));
+        assert!(default.ends_with('\n'));
+        // %F/%T/%s formats are self-consistent with gmtime.
+        let f = run(&mut shell, "date +%F");
+        assert_eq!(f.matches('-').count(), 2);
+        assert_eq!(run(&mut shell, "date +%%"), "%\n");
+    }
+
+    #[test]
+    fn gmtime_matches_known_epoch() {
+        // 1_714_694_400 = 2024-05-03 00:00:00 UTC (a Friday).
+        let tm = gmtime(1_714_694_400);
+        assert_eq!((tm.year, tm.month, tm.day), (2024, 5, 3));
+        assert_eq!((tm.hour, tm.min, tm.sec), (0, 0, 0));
+        assert_eq!(WDAY[tm.wday as usize], "Fri");
+        assert_eq!(
+            strftime(&tm, 1_714_694_400, "%a %b %e %H:%M:%S %Z %Y"),
+            "Fri May  3 00:00:00 UTC 2024"
+        );
     }
 }

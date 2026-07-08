@@ -103,6 +103,9 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "cd" => CommandHandler::Mut(fs::cd),
         "pwd" => CommandHandler::Read(fs::pwd),
         "cat" => CommandHandler::Read(fs::cat),
+        "head" => CommandHandler::Read(fs::head),
+        "tail" => CommandHandler::Read(fs::tail),
+        "wc" => CommandHandler::Read(fs::wc),
         "grep" => CommandHandler::Read(fs::grep),
         "find" => CommandHandler::Read(fs::find),
 
@@ -123,6 +126,11 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "hostname" => CommandHandler::Read(system::hostname),
         "nproc" => CommandHandler::Read(system::nproc),
         "lscpu" => CommandHandler::Read(system::lscpu),
+        "arch" => CommandHandler::Read(system::arch),
+        "groups" => CommandHandler::Read(system::groups),
+        "tty" => CommandHandler::Read(system::tty),
+        "lsb_release" => CommandHandler::Read(system::lsb_release),
+        "date" => CommandHandler::Read(system::date),
         "sudo" => CommandHandler::Mut(system::sudo),
         "su" => CommandHandler::Mut(system::su),
         "echo" => CommandHandler::Read(system::echo),
@@ -147,6 +155,7 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "df" => CommandHandler::Read(system::df),
         "mount" => CommandHandler::Read(system::mount),
         "crontab" => CommandHandler::Read(system::crontab),
+        "dmesg" => CommandHandler::Read(system::dmesg),
 
         // Network tools (no real network is ever touched).
         "wget" => CommandHandler::Mut(net::wget),
