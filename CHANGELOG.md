@@ -42,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dpkg`/`apt` listed `sudo` as installed and `id` reported `sudo` group
   membership, but running `sudo` itself returned "command not found" — an
   inconsistency an attacker could notice. `sudo` is now implemented.
-
-### Fixed
 - `pty-req`, `env`, `window-change`, subsystem, and agent-forwarding channel
   requests were left unanswered (russh's default `Handler` impl neither
   succeeds nor fails them), unlike a real sshd which always replies. Most

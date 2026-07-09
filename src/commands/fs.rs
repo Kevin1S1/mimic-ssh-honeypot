@@ -1,4 +1,4 @@
-//! Filesystem read commands: `ls`, `cd`, `pwd`, `cat`.
+//! Filesystem operations: `ls`, `cd`, `pwd`, `cat`, `touch`, `mkdir`, `rm`, `cp`, `mv`, `chmod`, `tar`, `grep`, `find`, `head`, `tail`, `wc`, `rmdir`.
 //!
 //! All operate exclusively on the in-memory [`Vfs`]; no real path is touched.
 
