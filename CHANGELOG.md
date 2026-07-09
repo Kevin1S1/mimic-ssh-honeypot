@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `su` (and `su USER`) now shows a realistic `Password:` prompt with echo
+  suppressed when run by a non-root user, instead of switching identity
+  instantly. The typed secret is captured as an `auth_attempt` event (method
+  `su`) before the switch. Root still switches without a prompt, like real
+  `su`. This removes the "instant, password-less root" honeypot tell.
 - Default `auth.mode` (when no config file, or a config file without an
   `[auth]` section, is used) is now `accept_all` instead of `accept_after`.
   Zero-config runs previously rejected the first `accept_after` (default 2)
@@ -16,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grants a shell immediately for maximum interaction.
 
 ### Security
+- `ls` now enforces directory read permissions: an unprivileged user listing a
+  directory it cannot read (e.g. `ls /root`, mode `0700`) gets
+  `ls: cannot open directory '...': Permission denied` instead of a full
+  listing, closing a honeypot tell that let attackers read protected paths.
 - Fixed a fingerprint where a rejected password immediately dropped the
   connection with `Permission denied (publickey)` instead of re-prompting. On
   rejection the server now keeps offering the `password` method, so clients

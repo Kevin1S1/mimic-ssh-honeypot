@@ -75,6 +75,17 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
             continue;
         }
 
+        // Listing a directory's entries requires read permission on it, just
+        // like real `ls` — otherwise a non-root user reading e.g. /root would
+        // be an obvious honeypot tell.
+        if !node.meta.readable_by(shell.uid, shell.gid) {
+            out.push_str(&format!(
+                "ls: cannot open directory '{path}': Permission denied\n"
+            ));
+            status = 2;
+            continue;
+        }
+
         if multiple {
             if idx > 0 {
                 out.push('\n');
@@ -1749,6 +1760,23 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         let out = run(&mut shell, "ls /nope");
         assert!(out.contains("cannot access '/nope': No such file or directory"));
+    }
+
+    #[test]
+    fn ls_enforces_directory_read_permissions() {
+        // /root is 0700, owned by root. An unprivileged user cannot list it.
+        let mut user = Shell::new("attacker", "debian");
+        let out = user.execute("ls -la /root");
+        assert!(
+            out.text
+                .contains("ls: cannot open directory '/root': Permission denied"),
+            "unprivileged ls of /root must be denied, got: {out:?}",
+            out = out.text
+        );
+        assert!(!user.execute("ls -la /root").text.contains(".bashrc"));
+        // Root can still list it.
+        let mut root = Shell::new("root", "debian");
+        assert!(root.execute("ls -la /root").text.contains(".bashrc"));
     }
 
     #[test]

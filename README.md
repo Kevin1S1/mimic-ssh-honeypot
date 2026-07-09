@@ -94,7 +94,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`, dashless bundled flags) |
 | **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
 | **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |
-| **Privilege** | `sudo` (transient elevation for one command), `su` (persistent identity switch) |
+| **Privilege** | `sudo` (transient elevation for one command), `su` (identity switch; prompts a non-root user for a password) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
 | **Processes** | `ps` (`aux`/`-ef`), `top`, `kill`, `pkill`, `free`, `uptime` |
 | **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip` |
@@ -102,7 +102,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
 | **Shell built-ins** | `exit`, `logout`, `true`, `false`, `cd`, `export`, `unset` |
 
-`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP uploads are captured to a SHA-256-named quarantine store on the real filesystem. Neither `sudo` nor `su` ever fail on a real credential check — the attacker's session already authenticated at login, so refusing privilege escalation here would be an inconsistent tell with no forensic upside.
+`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box.
 
 
 ### SSH Banner

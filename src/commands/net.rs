@@ -452,6 +452,7 @@ mod tests {
                 assert_eq!(tool, "wget");
                 assert_eq!(url, "http://evil.example/payload.sh");
             }
+            other => panic!("expected a Download capture, got {other:?}"),
         }
         // File materialises in cwd.
         assert!(run(&mut shell, "ls").contains("payload.sh"));
