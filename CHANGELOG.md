@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Fixed a fingerprint where a rejected password immediately dropped the
+  connection with `Permission denied (publickey)` instead of re-prompting. On
+  rejection the server now keeps offering the `password` method, so clients
+  re-prompt like a real sshd (up to `MaxAuthTries`). This also restores
+  `accept_after`, which could never see a second attempt on one connection
+  while the method was being withdrawn after the first failure.
+
 ### Added
 - More emulated commands, for closer parity with a real Debian shell and the
   recon scripts attackers commonly run: `head`/`tail` (`-n`/`-c`/`-N`, per-file

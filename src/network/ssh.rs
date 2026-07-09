@@ -474,8 +474,17 @@ impl Handler for MimicHandler {
             Ok(Auth::Accept)
         } else {
             jitter().await;
+            // Keep offering the password method so the client re-prompts.
+            // With `proceed_with_methods: None`, russh removes `password` from
+            // the offered set on rejection, leaving only `publickey` — the
+            // client then aborts after one wrong password with
+            // "Permission denied (publickey)", an obvious honeypot tell. Real
+            // sshd re-prompts (up to MaxAuthTries), which is also required for
+            // `accept_after` to ever see a second attempt on one connection.
+            let mut proceed_with_methods = MethodSet::empty();
+            proceed_with_methods.push(MethodKind::Password);
             Ok(Auth::Reject {
-                proceed_with_methods: None,
+                proceed_with_methods: Some(proceed_with_methods),
                 partial_success: false,
             })
         }
