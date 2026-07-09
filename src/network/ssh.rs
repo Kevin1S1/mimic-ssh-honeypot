@@ -106,6 +106,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             shell: None,
             scp: None,
             quarantine_bytes: 0,
+            password_buf: None,
             _guard: guard,
         };
 
@@ -200,6 +201,10 @@ struct MimicHandler {
     /// store. Bounds disk growth from a flood of distinct small uploads (the
     /// content-addressed dedup only bounds *repeated* payloads).
     quarantine_bytes: u64,
+    /// When `Some`, the shell is waiting on a password line (e.g. after `su`):
+    /// input bytes are collected here with echo suppressed until Enter, then
+    /// handed to [`Shell::resume`].
+    password_buf: Option<Vec<u8>>,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
@@ -282,6 +287,11 @@ impl MimicHandler {
             match capture {
                 Capture::Download { tool, url, dest } => {
                     event::download(session_id, peer, &tool, &url, &dest);
+                }
+                Capture::SuAuth { target, password } => {
+                    // A guessed password entered at an `su` prompt: log it as an
+                    // authentication attempt (accepted, matching the switch).
+                    event::auth_attempt(session_id, peer, &target, "su", Some(&password), true);
                 }
             }
         }
@@ -653,6 +663,9 @@ impl Handler for MimicHandler {
         }
 
         let result = self.shell().execute(&cmd);
+        // A one-shot `exec` has no interactive stdin, so drop any prompt a
+        // command left pending (e.g. `su` awaiting a password).
+        self.shell().pending = None;
         self.drain_captures();
         jitter().await;
         if !result.text.is_empty() {
@@ -683,6 +696,60 @@ impl Handler for MimicHandler {
         }
 
         for &byte in data {
+            // A command (e.g. `su`) is waiting for a password line: collect
+            // bytes with echo suppressed until Enter, then resume the shell.
+            if self.password_buf.is_some() {
+                match byte {
+                    b'\r' | b'\n' => {
+                        let password = String::from_utf8_lossy(self.password_buf.as_ref().unwrap())
+                            .into_owned();
+                        self.password_buf = None;
+                        session.data(channel, b"\r\n".to_vec())?;
+
+                        let output = self.shell().resume(&password);
+                        self.drain_captures();
+                        jitter().await;
+
+                        if !output.text.is_empty() {
+                            session.data(channel, crlf(&output.text))?;
+                        }
+                        if output.exit {
+                            session.eof(channel)?;
+                            session.close(channel)?;
+                            return Ok(());
+                        }
+                        let prompt = self.shell().prompt();
+                        self.editor.set_prompt(&prompt);
+                        session.data(channel, self.editor.render().to_vec())?;
+                    }
+                    0x03 => {
+                        // Ctrl-C aborts the prompt, like a real terminal.
+                        self.password_buf = None;
+                        self.shell().pending = None;
+                        session.data(channel, b"\r\n".to_vec())?;
+                        let prompt = self.shell().prompt();
+                        self.editor.set_prompt(&prompt);
+                        session.data(channel, self.editor.render().to_vec())?;
+                    }
+                    0x08 | 0x7f => {
+                        // Backspace: edit the buffer without echoing.
+                        if let Some(buf) = self.password_buf.as_mut() {
+                            buf.pop();
+                        }
+                    }
+                    0x20..=0x7e => {
+                        // Printable byte: buffer it (bounded), no echo.
+                        if let Some(buf) = self.password_buf.as_mut() {
+                            if buf.len() < MAX_COMMAND_LEN {
+                                buf.push(byte);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             match self.editor.input(byte) {
                 Reaction::Ignore => {}
                 Reaction::Write(bytes) => {
@@ -722,6 +789,13 @@ impl Handler for MimicHandler {
                         session.eof(channel)?;
                         session.close(channel)?;
                         return Ok(());
+                    }
+                    // A command left an interactive prompt pending (e.g. `su`
+                    // asking for a password): switch to no-echo collection
+                    // instead of drawing a new shell prompt.
+                    if self.shell().pending.is_some() {
+                        self.password_buf = Some(Vec::new());
+                        continue;
                     }
                     let prompt = self.shell().prompt();
                     self.editor.set_prompt(&prompt);
@@ -817,6 +891,7 @@ mod tests {
             shell: None,
             scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
             quarantine_bytes: 0,
+            password_buf: None,
             _guard: guard,
         }
     }

@@ -9,7 +9,7 @@
 
 use super::CommandResult;
 use crate::shell::complete::COMMANDS;
-use crate::shell::Shell;
+use crate::shell::{Pending, Shell};
 
 /// Emulated kernel release (`uname -r`).
 const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
@@ -208,8 +208,12 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
 /// `su [-] [USER]`
 ///
 /// Switches the session's effective identity, as a fresh login shell for
-/// `USER` (root if omitted). Like `sudo`, this never fails on a real password
-/// check for the same reason.
+/// `USER` (root if omitted). Root may switch to any account with no password,
+/// exactly like real `su`; a non-root user is prompted for the target's
+/// password first. The honeypot does not gate the switch on a correct password
+/// (the attacker already authenticated over SSH, and denying here yields no
+/// forensic benefit) — but the attempted password *is* captured, and the
+/// realistic `Password:` prompt removes the "instant, password-less root" tell.
 ///
 /// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
 /// identity; add transient (non-persistent) elevation if that distinction
@@ -226,8 +230,19 @@ pub fn su(shell: &mut Shell, args: &[String]) -> CommandResult {
             other => target = Some(other),
         }
     }
-    shell.switch_user(target.unwrap_or("root"));
-    CommandResult::empty()
+    let target = target.unwrap_or("root").to_string();
+
+    // Root switches identity without a password, like real `su`.
+    if shell.uid == 0 {
+        shell.switch_user(&target);
+        return CommandResult::empty();
+    }
+
+    // A non-root user must be prompted for the target's password. Defer the
+    // switch: the network layer collects the password line (echo suppressed)
+    // and calls `Shell::resume`, which captures it and performs the switch.
+    shell.pending = Some(Pending::SuPassword { target });
+    CommandResult::ok("Password: ")
 }
 
 /// `echo [-ne] [STRING]...`
@@ -1422,12 +1437,28 @@ mod tests {
     #[test]
     fn su_switches_identity_and_home() {
         let mut shell = Shell::new("attacker", "debian");
-        assert_eq!(run(&mut shell, "su"), "");
+        // A non-root user is prompted for a password before the switch; the
+        // shell defers, exposing a pending prompt the network layer drives.
+        assert_eq!(run(&mut shell, "su"), "Password: ");
+        assert!(shell.pending.is_some());
+        assert_eq!(shell.uid, 1000, "identity is unchanged until a password");
+        // Answering the prompt performs the switch and captures the attempt.
+        assert_eq!(shell.resume("hunter2").text, "");
+        assert!(shell.pending.is_none());
         assert_eq!(shell.username, "root");
         assert_eq!(shell.uid, 0);
         assert_eq!(shell.cwd_path(), "/root");
-        // `su attacker` (or any other name) switches back to a normal account.
+        assert!(
+            matches!(
+                shell.captures.first(),
+                Some(crate::shell::Capture::SuAuth { target, password })
+                    if target == "root" && password == "hunter2"
+            ),
+            "the attempted password is captured as forensic data"
+        );
+        // Root switches to any account without a password prompt.
         assert_eq!(run(&mut shell, "su someoneelse"), "");
+        assert!(shell.pending.is_none());
         assert_eq!(shell.uid, 1000);
         assert_eq!(shell.cwd_path(), "/home/someoneelse");
     }

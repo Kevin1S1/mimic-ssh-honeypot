@@ -37,6 +37,27 @@ pub enum Capture {
         /// Where the body was written (a VFS path, or `-` for stdout).
         dest: String,
     },
+    /// A password entered at an `su` prompt. The attempted secret is captured
+    /// as forensic data (a guessed root/target password) before the switch.
+    SuAuth {
+        /// The account the client tried to become.
+        target: String,
+        /// The password the client typed at the prompt.
+        password: String,
+    },
+}
+
+/// A follow-up line of input a command is waiting for. While a shell has a
+/// pending prompt, the network layer collects the next line (with echo
+/// suppressed) and feeds it back via [`Shell::resume`], rather than treating it
+/// as a new command.
+#[derive(Debug, Clone)]
+pub enum Pending {
+    /// `su [USER]` is waiting for the target's password before switching.
+    SuPassword {
+        /// The account to become once a password is supplied.
+        target: String,
+    },
 }
 
 /// Per-session shell.
@@ -69,6 +90,9 @@ pub struct Shell {
     /// Captures (downloads, ...) produced by the last command, awaiting logging
     /// by the network layer. Cleared at the start of every command line.
     pub captures: Vec<Capture>,
+    /// An interactive prompt a command is waiting on (e.g. `su` reading a
+    /// password). `None` between commands.
+    pub pending: Option<Pending>,
 }
 
 impl Shell {
@@ -108,6 +132,7 @@ impl Shell {
             pid: 1337,
             history: Vec::new(),
             captures: Vec::new(),
+            pending: None,
         }
     }
 
@@ -226,6 +251,33 @@ impl Shell {
         self.cwd = home;
         self.home = home;
         self.prev_cwd = home;
+    }
+
+    /// Complete a [`Pending`] interactive prompt with the line the client just
+    /// entered (e.g. the password for `su`). Clears the pending state and
+    /// returns the resulting output.
+    pub fn resume(&mut self, input: &str) -> Output {
+        match self.pending.take() {
+            Some(Pending::SuPassword { target }) => {
+                // Capture the attempted password as forensic data, then switch.
+                // The honeypot keeps the attacker engaged rather than gating on
+                // a real credential (same rationale as `sudo`/`su`), but a
+                // realistic `Password:` prompt still has to appear first.
+                self.captures.push(Capture::SuAuth {
+                    target: target.clone(),
+                    password: input.to_string(),
+                });
+                self.switch_user(&target);
+                Output {
+                    text: String::new(),
+                    exit: false,
+                }
+            }
+            None => Output {
+                text: String::new(),
+                exit: false,
+            },
+        }
     }
 
     /// Run one command line: expand variables, tokenize, dispatch to the
