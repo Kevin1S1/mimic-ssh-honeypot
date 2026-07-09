@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Default `auth.mode` (when no config file, or a config file without an
+  `[auth]` section, is used) is now `accept_all` instead of `accept_after`.
+  Zero-config runs previously rejected the first `accept_after` (default 2)
+  attempts on every connection, which is both an unrealistic-looking default
+  and gives attackers fewer sessions to capture commands in; `accept_all`
+  grants a shell immediately for maximum interaction.
+
 ### Security
 - Fixed a fingerprint where a rejected password immediately dropped the
   connection with `Permission denied (publickey)` instead of re-prompting. On

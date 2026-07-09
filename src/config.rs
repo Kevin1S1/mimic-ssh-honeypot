@@ -112,7 +112,7 @@ impl Default for Config {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            mode: AuthMode::AcceptAfter,
+            mode: AuthMode::AcceptAll,
             accept_after: 2,
             credentials: Vec::new(),
         }
@@ -197,7 +197,7 @@ mod tests {
     fn defaults_are_valid_with_no_file() {
         let config = Config::load(None).expect("defaults must load");
         assert_eq!(config.port, 2222);
-        assert_eq!(config.auth.mode, AuthMode::AcceptAfter);
+        assert_eq!(config.auth.mode, AuthMode::AcceptAll);
         assert!(config.server_id.starts_with("SSH-2.0-"));
     }
 
