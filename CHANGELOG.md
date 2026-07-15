@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- SSH shell and one-shot command requests now receive the required protocol
+  success reply, preventing clients such as PuTTY from reporting that the
+  server refused to start a shell or command after authentication.
 - One-shot SSH `exec` requests now return the emulated command's real exit
   status instead of always reporting success.
 

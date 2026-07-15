@@ -629,6 +629,7 @@ impl Handler for MimicHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
         let banner = self.motd();
         session.data(channel, banner.into_bytes())?;
         // PAM prints the previous login right before handing off to the shell.
@@ -649,6 +650,7 @@ impl Handler for MimicHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
         let cmd = String::from_utf8_lossy(&data[..data.len().min(MAX_COMMAND_LEN)]);
         let cmd = cmd.trim().to_string();
         event::command(self.session_id, self.peer, &cmd);
