@@ -20,14 +20,14 @@ const MAX_SYMLINK_DEPTH: usize = 40;
 /// Hard ceiling on the number of nodes in the arena. Bounds memory so a hostile
 /// `mkdir -p`/copy storm cannot exhaust the host; inserts past the cap are
 /// silently dropped.
-const MAX_VFS_NODES: usize = 10_000;
+const MAX_VFS_NODES: usize = 2_000;
 
 /// Hard ceiling on total file-content bytes held in the arena. The node cap
 /// alone does not bound memory: an SCP upload (up to `max_upload_bytes`) can be
 /// amplified with `cp` up to the node cap. Uploads are preserved in full in the
 /// quarantine store, so capping the in-memory mirror loses no forensic data.
 /// Writes past the cap are silently dropped, like node-cap overflow.
-const MAX_VFS_BYTES: usize = 64 * 1024 * 1024;
+const MAX_VFS_BYTES: usize = 8 * 1024 * 1024;
 
 /// An in-memory filesystem tree.
 #[derive(Debug, Clone)]

@@ -162,14 +162,14 @@ hostname          = "debian"     # appears in the shell prompt and uname
 sensor_name       = "mimic"      # identifier in every log line (for multi-sensor setups)
 
 # Limits
-max_sessions      = 256          # global concurrent connection cap
-per_ip_connections = 10          # per-source-IP concurrent cap
+max_sessions      = 8            # global concurrent connection cap
+per_ip_connections = 4           # per-source-IP concurrent cap
 idle_timeout_secs = 300          # drop idle sessions after 5 minutes
 max_session_secs  = 1800         # absolute per-session lifetime cap
 
 # Capture
 quarantine_dir    = "/data/quarantine" # SCP uploads land here (SHA-256 named)
-max_upload_bytes  = 16777216     # truncate stored files at 16 MiB
+max_upload_bytes  = 8388608      # truncate stored files at 8 MiB
 host_key_dir      = "/data/host_keys"  # persisted Ed25519 + RSA keys
 
 [auth]

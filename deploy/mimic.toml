@@ -20,10 +20,10 @@ hostname = "debian"
 sensor_name = "mimic"
 
 # Global cap on concurrent sessions.
-max_sessions = 256
+max_sessions = 8
 
 # Cap on concurrent connections per source IP.
-per_ip_connections = 10
+per_ip_connections = 4
 
 # Idle timeout (seconds) before a session is dropped.
 idle_timeout_secs = 300
@@ -39,8 +39,8 @@ quarantine_dir = "/data/quarantine"
 
 # Maximum number of bytes stored per uploaded file. Larger uploads are still
 # fully consumed off the wire (to keep the SCP protocol in sync) but truncated
-# in the quarantine store. Default: 16 MiB.
-max_upload_bytes = 16777216
+# in the quarantine store. Default: 8 MiB.
+max_upload_bytes = 8388608
 
 # Directory where SSH host keys are persisted. Keys (Ed25519 + RSA) are
 # generated on first start and reused afterwards so the server fingerprint stays

@@ -19,6 +19,8 @@ use env::Env;
 pub struct Output {
     /// Text to write back to the client.
     pub text: String,
+    /// Process-style exit status.
+    pub status: i32,
     /// Whether the session should end (e.g. after `exit`).
     pub exit: bool,
 }
@@ -270,11 +272,13 @@ impl Shell {
                 self.switch_user(&target);
                 Output {
                     text: String::new(),
+                    status: 0,
                     exit: false,
                 }
             }
             None => Output {
                 text: String::new(),
+                status: 0,
                 exit: false,
             },
         }
@@ -288,6 +292,7 @@ impl Shell {
         if argv.is_empty() {
             return Output {
                 text: String::new(),
+                status: 0,
                 exit: false,
             };
         }
@@ -295,6 +300,7 @@ impl Shell {
         self.last_status = result.status;
         Output {
             text: result.output,
+            status: result.status,
             exit: result.exit,
         }
     }
@@ -356,6 +362,14 @@ mod tests {
     fn single_quotes_suppress_expansion() {
         let shell = Shell::new("root", "debian");
         assert_eq!(shell.parse_line("echo '$USER'"), vec!["echo", "$USER"]);
+    }
+
+    #[test]
+    fn execute_reports_command_status() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(shell.execute("true").status, 0);
+        assert_eq!(shell.execute("false").status, 1);
+        assert_eq!(shell.execute("missing-command").status, 127);
     }
 
     #[test]
