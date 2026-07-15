@@ -104,6 +104,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             username: String::new(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
             shell: None,
+            active_channel: None,
             scp: None,
             quarantine_bytes: 0,
             password_buf: None,
@@ -195,6 +196,9 @@ struct MimicHandler {
     editor: LineEditor,
     /// The emulated shell, created lazily once a session channel opens.
     shell: Option<Shell>,
+    /// Only one channel may use the connection-scoped shell/editor state at a
+    /// time. Sequential channels are allowed after the active one closes.
+    active_channel: Option<u32>,
     /// Active SCP upload sink, when the channel is running `scp -t`.
     scp: Option<ScpSink>,
     /// Cumulative bytes this session has written to the real-disk quarantine
@@ -218,6 +222,24 @@ struct MimicHandler {
 const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
 
 impl MimicHandler {
+    fn try_open_channel(&mut self, channel: u32) -> bool {
+        if self.active_channel.is_some() {
+            return false;
+        }
+        self.active_channel = Some(channel);
+        true
+    }
+
+    fn close_channel(&mut self, channel: u32) {
+        if self.active_channel == Some(channel) {
+            self.active_channel = None;
+            self.editor = LineEditor::new(MAX_COMMAND_LEN, 1000);
+            self.shell = None;
+            self.scp = None;
+            self.password_buf = None;
+        }
+    }
+
     /// Apply the configured authentication policy to one attempt.
     fn decide_auth(&self, user: &str, password: &str) -> bool {
         match self.config.auth.mode {
@@ -520,10 +542,10 @@ impl Handler for MimicHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        Ok(self.try_open_channel(channel.id().number()))
     }
 
     /// A real Debian sshd always answers `pty-req` with success. russh's
@@ -657,6 +679,7 @@ impl Handler for MimicHandler {
                     session.exit_status_request(channel, 1)?;
                     session.eof(channel)?;
                     session.close(channel)?;
+                    self.close_channel(channel.number());
                     return Ok(());
                 }
             }
@@ -671,9 +694,10 @@ impl Handler for MimicHandler {
         if !result.text.is_empty() {
             session.data(channel, crlf(&result.text))?;
         }
-        session.exit_status_request(channel, 0)?;
+        session.exit_status_request(channel, result.status as u32)?;
         session.eof(channel)?;
         session.close(channel)?;
+        self.close_channel(channel.number());
         Ok(())
     }
 
@@ -716,6 +740,7 @@ impl Handler for MimicHandler {
                         if output.exit {
                             session.eof(channel)?;
                             session.close(channel)?;
+                            self.close_channel(channel.number());
                             return Ok(());
                         }
                         let prompt = self.shell().prompt();
@@ -764,6 +789,7 @@ impl Handler for MimicHandler {
                 Reaction::Eof => {
                     session.eof(channel)?;
                     session.close(channel)?;
+                    self.close_channel(channel.number());
                     return Ok(());
                 }
                 Reaction::Submit { echo, line } => {
@@ -788,6 +814,7 @@ impl Handler for MimicHandler {
                     if result.exit {
                         session.eof(channel)?;
                         session.close(channel)?;
+                        self.close_channel(channel.number());
                         return Ok(());
                     }
                     // A command left an interactive prompt pending (e.g. `su`
@@ -817,7 +844,17 @@ impl Handler for MimicHandler {
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
             session.close(channel)?;
+            self.close_channel(channel.number());
         }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.close_channel(channel.number());
         Ok(())
     }
 }
@@ -889,6 +926,7 @@ mod tests {
             username: "root".to_string(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
             shell: None,
+            active_channel: None,
             scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
             quarantine_bytes: 0,
             password_buf: None,
@@ -938,5 +976,15 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_one_channel_is_active_at_a_time() {
+        let mut handler = test_handler(std::env::temp_dir(), 1024);
+        assert!(handler.try_open_channel(1));
+        assert!(!handler.try_open_channel(2));
+
+        handler.close_channel(1);
+        assert!(handler.try_open_channel(2));
     }
 }

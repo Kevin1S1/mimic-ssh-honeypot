@@ -32,8 +32,8 @@ LogRateLimitBurst=1000
 # never affected; only this one process dies.
 # Raise if you run very high connection concurrency; lower for tighter blast radius.
 MemoryAccounting=yes
-MemoryHigh=192M
-MemoryMax=256M
+MemoryHigh=768M
+MemoryMax=1G
 
 # Run as a transient, unprivileged user with a persistent state directory at
 # /var/lib/mimic (host keys + quarantine resolve here via WorkingDirectory).

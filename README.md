@@ -59,7 +59,7 @@ The emulation layers (3–5) have **zero access to the real OS**. Enforced by mo
 
 ### Connection limiting
 
-Limits are enforced at TCP **accept time** — before the SSH handshake — so a connection flood doesn't allocate any crypto state. Two caps are configurable: a global concurrent session cap (`max_sessions`) and a per-source-IP cap (`per_ip_connections`). Rejected connections are logged as `connection_rejected` events.
+Limits are enforced at TCP **accept time** — before the SSH handshake — so a connection flood doesn't allocate any crypto state. Two caps are configurable: a global concurrent session cap (`max_sessions`) and a per-source-IP cap (`per_ip_connections`). The shipped 32-session limit is simultaneous, not a daily traffic quota, and is paired with the deployment's 1 GiB memory ceiling. Raise both together if a larger host needs more concurrency. Rejected connections are logged as `connection_rejected` events.
 
 ### Host key persistence
 
@@ -162,14 +162,14 @@ hostname          = "debian"     # appears in the shell prompt and uname
 sensor_name       = "mimic"      # identifier in every log line (for multi-sensor setups)
 
 # Limits
-max_sessions      = 256          # global concurrent connection cap
-per_ip_connections = 10          # per-source-IP concurrent cap
+max_sessions      = 32           # global concurrent connection cap
+per_ip_connections = 4           # per-source-IP concurrent cap
 idle_timeout_secs = 300          # drop idle sessions after 5 minutes
 max_session_secs  = 1800         # absolute per-session lifetime cap
 
 # Capture
 quarantine_dir    = "/data/quarantine" # SCP uploads land here (SHA-256 named)
-max_upload_bytes  = 16777216     # truncate stored files at 16 MiB
+max_upload_bytes  = 8388608      # truncate stored files at 8 MiB
 host_key_dir      = "/data/host_keys"  # persisted Ed25519 + RSA keys
 
 [auth]

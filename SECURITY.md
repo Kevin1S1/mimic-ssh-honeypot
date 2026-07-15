@@ -34,9 +34,10 @@ Even if thousands of malware samples are uploaded, they are safely written as in
 ### 6. Denial of Service (DoS) Resilience
 MIMIC is protected against resource exhaustion attacks:
 - **Connection limits** shed TCP floods before SSH crypto is even negotiated.
-- **VFS limits** cap the filesystem tree to 10,000 nodes and 64 MiB of total file content, preventing RAM exhaustion from recursive `mkdir` loops or `cp`-amplifying an SCP upload (the quarantine store keeps the full upload, so no forensic data is lost).
+- **VFS limits** cap each filesystem tree to 2,000 nodes and 8 MiB of total file content, preventing RAM exhaustion from recursive `mkdir` loops or `cp`-amplifying an SCP upload (the quarantine store keeps the configured upload capture, so no forensic data is lost).
 - **Environment and Process limits** strictly cap string lengths, variable counts, and prevent memory leaks.
 - **Per-command output cap** (`MAX_COMMAND_OUTPUT_BYTES = 1 MiB`) truncates any single command's output at the dispatch layer, preventing memory amplification from `cat`/`find`/`grep` on large VFS content.
+- **One active channel per connection** prevents SSH channel floods from bypassing the connection limiter and keeps connection-scoped shell/SCP state isolated. A new channel may open after the active one closes.
 - **Idle timeouts** ensure dead connections are reaped aggressively.
 - **Absolute session lifetime cap** (`max_session_secs`) wraps every session, so a client cannot hold resources indefinitely with periodic keep-alive traffic.
 - **Line-editor bounds** cap the interactive input line (4096 bytes) and per-session command history (1000 entries), so the readline emulation cannot be driven into unbounded memory growth. One-shot `exec` commands are capped at the same 4096 bytes, so an oversized exec request cannot bloat the logs or parser.
@@ -85,7 +86,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; fuzz/robustness tests on the line editor | Unknown bug in a dependency |
 | T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping` to attacker host | Network commands are faked; no real socket opened | None by design |
 | T5 | Disk exhaustion | SCP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec, per-session quarantine disk-write cap (`max_upload_bytes` × 32) | Bounded per session; capped total across sessions only by the daily reset |
-| T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output | VFS ≤ 10k nodes and ≤ 64 MiB content bytes; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch; per-session quarantine disk-write cap bounds real-disk growth from many distinct small uploads | Bounded per session |
+| T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output, SSH channel flood | Shipped defaults cap connections at 32 globally/4 per IP under a 1 GiB process ceiling; each connection permits one active channel; VFS ≤ 2k nodes and ≤ 8 MiB content bytes; uploads ≤ 8 MiB; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session and by deployment memory controls |
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
 | T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; listener survives | Bounded to one session |
