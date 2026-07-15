@@ -20,7 +20,7 @@ hostname = "debian"
 sensor_name = "mimic"
 
 # Global cap on concurrent sessions.
-max_sessions = 8
+max_sessions = 32
 
 # Cap on concurrent connections per source IP.
 per_ip_connections = 4

@@ -97,7 +97,7 @@ impl Default for Config {
             server_id: "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3".to_string(),
             hostname: "debian".to_string(),
             sensor_name: "mimic".to_string(),
-            max_sessions: 8,
+            max_sessions: 32,
             per_ip_connections: 4,
             idle_timeout_secs: 300,
             max_session_secs: 1800,
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(config.port, 2200);
         assert_eq!(config.hostname, "web-prod-01");
         // Untouched keys keep their safe defaults.
-        assert_eq!(config.max_sessions, 8);
+        assert_eq!(config.max_sessions, 32);
         assert_eq!(config.per_ip_connections, 4);
         assert_eq!(config.max_upload_bytes, 8 * 1024 * 1024);
         let _ = std::fs::remove_file(&path);

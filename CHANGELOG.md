@@ -29,9 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still allowing sequential channels. This prevents channel floods from
   bypassing connection limits and stops shell, password, and SCP state from
   leaking between concurrent channels.
-- Reduced the shipped memory-related defaults to fit the 256 MiB deployment
-  ceiling under hostile concurrency: 8 global connections, 4 per source IP,
-  8 MiB uploads and VFS content, and 2,000 VFS nodes per session.
+- Rebalanced the shipped memory-related defaults for public traffic: 32 global
+  connections, 4 per source IP, 8 MiB uploads and VFS content, and 2,000 VFS
+  nodes per session under a 1 GiB deployment memory ceiling.
 - `ls` now enforces directory read permissions: an unprivileged user listing a
   directory it cannot read (e.g. `ls /root`, mode `0700`) gets
   `ls: cannot open directory '...': Permission denied` instead of a full
