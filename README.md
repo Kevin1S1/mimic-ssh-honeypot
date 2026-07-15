@@ -20,7 +20,7 @@ Most SSH honeypots either wrap a real shell (introducing real execution risk) or
 - **Real interactive shell feel.** A full readline-style line editor: arrow-key cursor movement, command history (↑/↓), `Ctrl-R` reverse search, kill/yank keys (`Ctrl-U`/`K`/`W`), `Ctrl-A`/`E`/`L`, and Tab completion of commands and filesystem paths. A shell that can't do these is an easy tell.
 - **Calibrated response timing.** Small randomised jitter on command and authentication responses, so perfectly uniform latency — a passive honeypot signal — is avoided.
 - **Stable host key fingerprint.** Ed25519 + RSA keys are generated once and persisted across restarts. A rotating fingerprint is a classic honeypot tell; MIMIC avoids it.
-- **Structured forensic logging.** Every event is a JSON line on stdout. Pipe directly to your SIEM, Elastic stack, or `jq` for ad-hoc analysis.
+- **Structured forensic logging.** Every event is a JSON line on stdout, and optionally mirrored to a daily-rotated file for log shippers. Pipe directly to your SIEM, Elastic stack, or `jq` for ad-hoc analysis.
 - **Minimal footprint.** Single Rust binary, <50 MB RAM, distroless Docker image <20 MB, `cap_drop: ALL`, read-only root filesystem.
 
 ---
@@ -172,6 +172,12 @@ quarantine_dir    = "/data/quarantine" # SCP uploads land here (SHA-256 named)
 max_upload_bytes  = 8388608      # truncate stored files at 8 MiB
 host_key_dir      = "/data/host_keys"  # persisted Ed25519 + RSA keys
 
+[logging]
+# Optional log file output. Events always go to stdout; when `dir` is set they
+# are also written to a daily-rotated file there for log shippers / manual reads.
+dir            = "/data/logs"    # omit to keep stdout-only logging
+# retention_days = 30            # omit to keep logs forever; set to cap retention
+
 [auth]
 # accept_all   – every password succeeds immediately (maximum interaction)
 # reject_all   – capture creds only, never grant a shell
@@ -198,7 +204,25 @@ accept_after = 2
 
 ## Log Format
 
-All events are JSON lines on stdout. Pipe to `jq` or ship to your SIEM.
+All events are JSON lines on stdout — captured natively by Docker and journald. To read logs straight off disk (for a log shipper such as Filebeat/Logstash, or by hand), set a log directory and mimic will additionally write the same lines to a daily-rotated file:
+
+```toml
+[logging]
+dir            = "/data/logs"   # writes mimic.YYYY-MM-DD.jsonl here
+# retention_days = 30           # optional; omit to keep logs forever
+```
+
+- The file is named `mimic.<date>.jsonl` and rotates once per day; each day gets its own file, so a shipper can tail `${dir}/mimic.*.jsonl`.
+- **Logs are never deleted by default** — every rotated file is kept indefinitely. Set `retention_days = N` to keep only the most recent `N` daily files; older ones are pruned automatically on rotation.
+- Stdout logging stays on regardless, so `docker compose logs -f` / `journalctl -u mimic -f` keep working alongside the files.
+- In Docker, point `dir` at a path on the writable `/data` volume (the compose stack pre-creates `/data/logs`); the container's root filesystem is read-only.
+
+When no `dir` is configured, storage and rotation are delegated to whatever captures stdout:
+
+- **Docker Compose**: the `json-file` driver ([docker-compose.yml](docker-compose.yml)) rotates at 10 MB × 5 files. The underlying files live under Docker's internal storage (`/var/lib/docker/containers/<container-id>/<container-id>-json.log`) — treat that as an implementation detail and use `docker compose logs -f` / `docker logs mimic` instead of reading it directly.
+- **systemd**: captured by journald ([deploy/mimic.service](deploy/mimic.service)); view with `journalctl -u mimic -f`, retention governed by your journald config.
+
+Pipe to `jq` or ship to your SIEM.
 
 ```jsonc
 // New connection

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional file-based logging. Set `logging.dir` to have forensic events written
+  to a daily-rotated `mimic.YYYY-MM-DD.jsonl` file (in addition to stdout), ready
+  for a log shipper such as Filebeat/Logstash or manual inspection. Logs are
+  never deleted by default; set `logging.retention_days` to cap how many daily
+  files are kept. The compose stack pre-creates `/data/logs` for this.
+
 ### Fixed
 - SSH shell and one-shot command requests now receive the required protocol
   success reply, preventing clients such as PuTTY from reporting that the

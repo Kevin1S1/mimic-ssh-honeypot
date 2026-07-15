@@ -14,7 +14,10 @@ fn main() -> Result<()> {
     let config_path = std::env::args().nth(1).map(PathBuf::from);
     let config = Config::load(config_path.as_deref()).context("failed to load configuration")?;
 
-    mimic::logging::init();
+    // Kept alive for the whole process so the background log-file writer flushes
+    // on shutdown; dropping it early would silently stop file logging.
+    let _log_guard =
+        mimic::logging::init(&config.logging).context("failed to initialise logging")?;
     mimic::logging::event::init(&config.sensor_name);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
