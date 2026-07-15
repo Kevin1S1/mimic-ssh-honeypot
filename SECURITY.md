@@ -42,6 +42,7 @@ MIMIC is protected against resource exhaustion attacks:
 - **Absolute session lifetime cap** (`max_session_secs`) wraps every session, so a client cannot hold resources indefinitely with periodic keep-alive traffic.
 - **Line-editor bounds** cap the interactive input line (4096 bytes) and per-session command history (1000 entries), so the readline emulation cannot be driven into unbounded memory growth. One-shot `exec` commands are capped at the same 4096 bytes, so an oversized exec request cannot bloat the logs or parser.
 - **Per-session crash isolation**: each connection runs in its own task; a panic in one session cannot take down the listener.
+- **Bounded log file retention** — optional file logging (`logging.dir`) writes daily-rotated files outside operator control of attacker input; with `logging.retention_days` unset, files accumulate indefinitely, so operators running sustained high-volume sessions should set a retention cap (mirroring the quarantine store's daily reset) to bound disk growth.
 
 ### 7. Daily Reset (Ephemeral State Hygiene)
 A deployment-level daily reset mechanism restarts the honeypot and wipes accumulated quarantine data once per day. This serves multiple security purposes:

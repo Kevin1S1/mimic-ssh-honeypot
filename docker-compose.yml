@@ -10,7 +10,7 @@ services:
   # Init container: prepares volume permissions, then exits immediately.
   mimic-init:
     image: alpine
-    command: sh -c "mkdir -p /data/host_keys /data/quarantine && chown -R 65534:65534 /data"
+    command: sh -c "mkdir -p /data/host_keys /data/quarantine /data/logs && chown -R 65534:65534 /data"
     volumes:
       - mimic-data:/data
 

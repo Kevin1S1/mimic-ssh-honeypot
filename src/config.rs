@@ -51,6 +51,25 @@ pub struct Config {
     pub host_key_dir: PathBuf,
     /// Authentication policy.
     pub auth: AuthConfig,
+    /// Forensic log file output.
+    pub logging: LoggingConfig,
+}
+
+/// Controls optional file-based forensic logging.
+///
+/// JSON event lines are always written to stdout (captured by Docker/journald).
+/// When [`dir`](Self::dir) is set, the same lines are additionally written to a
+/// daily-rotated file under that directory so log shippers (Filebeat, Logstash,
+/// …) or an operator can read them straight off disk.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Directory to write rotated JSON log files into. When `None` (the
+    /// default), logging goes to stdout only and no files are written.
+    pub dir: Option<PathBuf>,
+    /// How many days of rotated log files to keep. When `None` (the default),
+    /// files are kept indefinitely and never deleted; set it to cap retention.
+    pub retention_days: Option<usize>,
 }
 
 /// Controls how authentication attempts are accepted or rejected.
@@ -105,6 +124,7 @@ impl Default for Config {
             max_upload_bytes: 8 * 1024 * 1024,
             host_key_dir: PathBuf::from("host_keys"),
             auth: AuthConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -166,6 +186,12 @@ impl Config {
             anyhow::ensure!(
                 !self.auth.credentials.is_empty(),
                 "auth.mode = \"credentials\" requires at least one credential pair"
+            );
+        }
+        if let Some(days) = self.logging.retention_days {
+            anyhow::ensure!(
+                (1..=3650).contains(&days),
+                "logging.retention_days must be between 1 and 3650"
             );
         }
         Ok(())
@@ -248,6 +274,13 @@ mod tests {
     #[test]
     fn rejects_per_ip_above_global_cap() {
         let path = temp_config("max_sessions = 10\nper_ip_connections = 50\n");
+        assert!(Config::load(Some(&path)).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_out_of_range_retention_days() {
+        let path = temp_config("[logging]\nretention_days = 0\n");
         assert!(Config::load(Some(&path)).is_err());
         let _ = std::fs::remove_file(&path);
     }

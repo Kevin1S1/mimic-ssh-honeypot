@@ -47,6 +47,19 @@ max_upload_bytes = 8388608
 # stable across restarts — a fingerprint that changes every boot is a tell.
 host_key_dir = "/data/host_keys"
 
+[logging]
+# Optional file output. Forensic events are ALWAYS written as JSON lines to
+# stdout (captured by Docker/journald). When `dir` is set, the same lines are
+# ALSO written to a daily-rotated file `mimic.YYYY-MM-DD.jsonl` in that
+# directory, ready to be tailed by a log shipper (Filebeat, Logstash, …) or
+# read by hand. Leave `dir` unset to keep stdout-only logging.
+dir = "/data/logs"
+
+# How many days of rotated log files to keep. Omit this (the default) to keep
+# every file forever and never delete logs. Set it to cap retention, e.g. 30
+# keeps the most recent 30 daily files and prunes older ones on rotation.
+# retention_days = 30
+
 [auth]
 # Acceptance strategy. One of:
 #   accept_all   — every password succeeds on the first try
