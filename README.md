@@ -216,6 +216,7 @@ dir            = "/data/logs"   # writes mimic.YYYY-MM-DD.jsonl here
 - **Logs are never deleted by default** — every rotated file is kept indefinitely. Set `retention_days = N` to keep only the most recent `N` daily files; older ones are pruned automatically on rotation.
 - Stdout logging stays on regardless, so `docker compose logs -f` / `journalctl -u mimic -f` keep working alongside the files.
 - In Docker, point `dir` at a path on the writable `/data` volume (the compose stack pre-creates `/data/logs`); the container's root filesystem is read-only.
+- The directory is set to `0700` on Unix at startup: captured passwords are stored in cleartext, so the log files must not be readable by other local users on the host. This matters most for bare-metal/systemd deployments that share the machine with other accounts.
 
 When no `dir` is configured, storage and rotation are delegated to whatever captures stdout:
 
@@ -322,6 +323,8 @@ The `docker-compose.yml` includes a `mimic-reset` sidecar container that handles
 environment:
   - MIMIC_RESET_WINDOW=3600
 ```
+
+> **Privilege tradeoff:** the sidecar needs the host's Docker socket to restart the honeypot container. The `:ro` flag makes the socket *file* read-only but does **not** restrict Docker API calls, so that container effectively has root on the host daemon. It is isolated (`network_mode: none`, no attacker input, separate container from the honeypot), but if you would rather not grant it, use the systemd timer below instead — it needs no Docker socket. See [SECURITY.md](SECURITY.md#7-daily-reset-ephemeral-state-hygiene).
 
 ### Systemd
 

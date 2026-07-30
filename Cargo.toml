@@ -18,7 +18,10 @@ path = "src/main.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Deliberately NOT `panic = "abort"`. SECURITY.md's per-session crash-isolation
+# invariant depends on unwinding: with abort there is nothing for `tokio::spawn`
+# to contain, so a panic in one session would take the listener and every other
+# session down with it. Worth the binary-size cost.
 strip = true
 
 [dependencies]

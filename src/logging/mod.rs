@@ -34,6 +34,25 @@ where
         .finish()
 }
 
+/// Restrict the log directory to owner-only (`0700`) on Unix.
+///
+/// Captured passwords are written to these files in cleartext by design, so the
+/// files must not be readable by other local users. `tracing-appender` creates
+/// each rotated file itself and exposes no hook for its mode (0644 under a
+/// normal umask), and `libc::umask` is off-limits under `#![forbid(unsafe_code)]`
+/// — but a 0644 file inside a 0700 directory is still unreachable for anyone
+/// else, so restricting the directory is what closes this.
+#[cfg(unix)]
+fn restrict_log_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_log_dir(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Initialise the global JSON logging subscriber.
 ///
 /// Events always go to stdout. When `config.dir` is set, they are also teed to
@@ -54,6 +73,8 @@ pub fn init(config: &LoggingConfig) -> Result<Option<WorkerGuard>> {
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating log directory {}", dir.display()))?;
+    restrict_log_dir(dir)
+        .with_context(|| format!("restricting log directory {}", dir.display()))?;
 
     let mut builder = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)

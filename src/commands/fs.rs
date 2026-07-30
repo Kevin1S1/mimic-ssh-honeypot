@@ -918,17 +918,44 @@ fn find_walk(
 
 /// Minimal glob matcher supporting `*` and `?` wildcards (no character
 /// classes) — enough for typical `find -name` usage.
+///
+/// Iterative single-backtrack algorithm rather than the natural recursive one.
+/// The recursive form branches on every `*` and is exponential on patterns like
+/// `*a*a*a*a*b`; since both the pattern and the filename come from the attacker
+/// (bounded only by the 4096-byte command line) and `find` runs synchronously
+/// inside the async handler, that would peg a worker thread with no timeout able
+/// to fire on it. Remembering just the most recent `*` keeps this linear in
+/// practice while matching the same language.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    fn helper(p: &[u8], t: &[u8]) -> bool {
-        match (p.first(), t.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => helper(&p[1..], t) || (!t.is_empty() && helper(p, &t[1..])),
-            (Some(b'?'), Some(_)) => helper(&p[1..], &t[1..]),
-            (Some(pc), Some(tc)) if pc == tc => helper(&p[1..], &t[1..]),
-            _ => false,
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0, 0);
+    // Position of the last `*` seen, and how much of `text` it had consumed.
+    let mut star: Option<usize> = None;
+    let mut resume = 0;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            resume = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Mismatch: let the last `*` swallow one more byte and retry.
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
         }
     }
-    helper(pattern.as_bytes(), text.as_bytes())
+
+    // Trailing `*`s may match the empty remainder.
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Apply a run of `tar` flag characters (from either a `-xyz` argument or
@@ -1597,7 +1624,14 @@ pub fn mv(shell: &mut Shell, args: &[String]) -> CommandResult {
                 }
             }
         };
-        shell.vfs.rename(src_id, parent, &name);
+        if !shell.vfs.rename(src_id, parent, &name) {
+            // The destination sits inside the source's own subtree. Real `mv`
+            // refuses this rather than corrupting the tree.
+            out.push_str(&format!(
+                "mv: cannot move '{src}' to a subdirectory of itself, '{dest}/{name}'\n"
+            ));
+            status = 1;
+        }
     }
     finish(out, status)
 }
@@ -1944,6 +1978,43 @@ mod tests {
         let dirs_only = run(&mut shell, "find /tmp/d -type d");
         assert!(dirs_only.contains("/tmp/d/sub"));
         assert!(!dirs_only.contains("a.txt"));
+    }
+
+    #[test]
+    fn glob_match_semantics_and_pathological_pattern() {
+        use super::glob_match;
+
+        assert!(glob_match("*.txt", "a.txt"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("**b", "ab"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(!glob_match("*.txt", "a.txtx"));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+
+        // The recursive matcher this replaced was exponential here: a pattern of
+        // many `*a` groups against a run of `a`s that never satisfies the final
+        // literal. If this ever regresses, the test hangs rather than fails.
+        let pattern = "*a".repeat(24) + "b";
+        let text = "a".repeat(2048);
+        assert!(!glob_match(&pattern, &text));
+    }
+
+    #[test]
+    fn mv_refuses_move_into_own_subdirectory() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir -p /tmp/a/b");
+        let out = run(&mut shell, "mv /tmp/a /tmp/a/b");
+        assert!(
+            out.contains("cannot move '/tmp/a' to a subdirectory of itself"),
+            "unexpected output: {out}"
+        );
+
+        // The tree survived: /tmp/a is still where it was, and rendering paths
+        // through it terminates (a cycle here would hang the whole process).
+        assert!(run(&mut shell, "ls /tmp").contains('a'));
+        run(&mut shell, "cd /tmp/a/b");
+        assert_eq!(run(&mut shell, "pwd"), "/tmp/a/b\n");
     }
 
     #[test]

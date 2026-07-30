@@ -18,6 +18,7 @@ When an attacker connects and types a command, they are not interacting with a r
 All emulated commands (`ls`, `cat`, `rm`, `touch`, etc.) operate purely on the `Vfs` struct (`src/vfs/mod.rs`), which is a collection of `BTreeMap` and `Vec` objects in RAM.
 - An attacker running `rm -rf /` will only delete the fake structs in their session's memory.
 - There are no symlink traversal vulnerabilities to the real host because the real host's filesystem is completely decoupled from the VFS.
+- The node arena is kept **acyclic**: `Vfs::rename` refuses to move a directory into itself or into its own subtree (`mv a a/b`), exactly as real `mv` does. A cycle would make every tree walk — path rendering, `find`, `grep -r`, `chmod -R` — run forever, which is a whole-process failure rather than a per-session one. `path_of` is additionally bounded by the arena size as defence-in-depth.
 
 ### 4. Fake Networking (`wget`, `curl`, `ping`)
 When an attacker attempts to download a malicious payload via `wget` or `curl`, the honeypot fakes the download progress, generates a fake IP resolution, and drops a 0-byte placeholder into the in-memory VFS. It never actually opens a network socket to fetch the file, preventing the honeypot from being used in DDoS amplification attacks or as an open proxy.
@@ -41,8 +42,9 @@ MIMIC is protected against resource exhaustion attacks:
 - **Idle timeouts** ensure dead connections are reaped aggressively.
 - **Absolute session lifetime cap** (`max_session_secs`) wraps every session, so a client cannot hold resources indefinitely with periodic keep-alive traffic.
 - **Line-editor bounds** cap the interactive input line (4096 bytes) and per-session command history (1000 entries), so the readline emulation cannot be driven into unbounded memory growth. One-shot `exec` commands are capped at the same 4096 bytes, so an oversized exec request cannot bloat the logs or parser.
-- **Per-session crash isolation**: each connection runs in its own task; a panic in one session cannot take down the listener.
+- **Per-session crash isolation**: each connection runs in its own task; a panic in one session cannot take down the listener. This depends on unwinding, so the release profile deliberately does **not** set `panic = "abort"` — under abort there would be nothing for `tokio::spawn` to contain and any panic would kill every session at once. Note that a stack overflow aborts regardless of panic strategy, which is why recursion depth and the acyclic-arena invariant are enforced separately.
 - **Bounded log file retention** — optional file logging (`logging.dir`) writes daily-rotated files outside operator control of attacker input; with `logging.retention_days` unset, files accumulate indefinitely, so operators running sustained high-volume sessions should set a retention cap (mirroring the quarantine store's daily reset) to bound disk growth.
+- **Owner-only log directory** — captured credentials are written to the log files in cleartext by design, so `logging.dir` is set to `0700` on Unix at startup. `tracing-appender` creates each rotated file itself and offers no hook for its mode (0644 under a normal umask), but a 0644 file inside a 0700 directory is unreachable for other local users. This matters on bare-metal/systemd deployments that share the host with other accounts; in the Docker deployment the directory already lives on a dedicated volume owned by uid 65534.
 
 ### 7. Daily Reset (Ephemeral State Hygiene)
 A deployment-level daily reset mechanism restarts the honeypot and wipes accumulated quarantine data once per day. This serves multiple security purposes:
@@ -52,6 +54,8 @@ A deployment-level daily reset mechanism restarts the honeypot and wipes accumul
 - **Host keys are preserved** — Ed25519 and RSA keys survive the reset so the SSH fingerprint stays stable (a rotating fingerprint is a classic honeypot tell).
 
 In Docker deployments, this is handled by a lightweight sidecar container. For systemd, a timer + one-shot service unit pair is provided. See the README's [Daily Reset](README.md#daily-reset) section for configuration.
+
+**Privilege note — read this before using the Docker sidecar.** To restart the honeypot container, `mimic-reset` is given the host's Docker socket (`/var/run/docker.sock`). The `:ro` mount flag makes the *socket file* read-only; it does **not** restrict Docker API calls, so any process in that container has root-equivalent control of the host daemon. This is a deliberate tradeoff, bounded by three things: the sidecar is `network_mode: none`, it never processes attacker input (it only sleeps, deletes files under `/data/quarantine`, and issues one `docker restart`), and it is a separate container from the attacker-facing one. Operators who are not comfortable with that should use the **systemd timer path** (`deploy/mimic-reset.timer` + `deploy/mimic-reset.service`), which needs no Docker socket, or drop the sidecar and drive the reset from the host's own cron/systemd. Unlike the "operator misconfiguration" case below, this one ships as a default, so it is called out here rather than left to the deployer.
 
 ---
 
@@ -90,10 +94,11 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output, SSH channel flood | Shipped defaults cap connections at 32 globally/4 per IP under a 1 GiB process ceiling; each connection permits one active channel; VFS ≤ 2k nodes and ≤ 8 MiB content bytes; uploads ≤ 8 MiB; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session and by deployment memory controls |
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
-| T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; listener survives | Bounded to one session |
+| T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; release builds unwind (no `panic = "abort"`) so a panicking session is contained and the listener survives | Bounded to one session; a stack overflow still aborts the process, so unbounded recursion is prevented separately (acyclic arena, depth caps) |
 | T10 | Honeypot fingerprinting | Banner/KEX/timing/`/proc`/missing-feature probes | Debian 12 OpenSSH-shaped handshake, persistent host key, readline emulation, response jitter, recon-command coverage, randomised daily restart (not at fixed time), explicit `SSH_MSG_CHANNEL_SUCCESS`/`FAILURE` replies to `pty-req`/`env`/`window-change`/subsystem/agent requests (matching real sshd instead of leaving them unanswered) | Ongoing — anti-detection is an evolving discipline; TCP/IP-stack fingerprinting (TTL, window sizes) is host-kernel territory, addressed by host `sysctl`/firewall tuning, not the application |
-| T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); logs are structured JSON the operator controls; quarantine purged daily | Operator data-handling duty |
+| T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); log directory (`logging.dir`) restricted to `0700` since captured passwords are stored cleartext; quarantine purged daily | Operator data-handling duty |
 | T12 | Accumulated state / forensic contamination | Previous attacker's files, history, or VFS artifacts visible to next attacker | Daily process restart clears all in-memory state; quarantine wiped on disk; random restart time prevents uptime-based detection | Bounded to one daily cycle |
+| T13 | Whole-process hang or abort from an emulated command | Cyclic VFS move (`mv a a/b`), pathological `find -name` glob | `Vfs::rename` keeps the arena acyclic and `path_of` is arena-bounded; `glob_match` is an iterative single-backtrack matcher instead of exponential recursion | Bounded — no unbounded walk or match remains on an attacker-reachable path |
 
 ### Security invariants (must always hold)
 1. **No `unsafe`** anywhere (`#![forbid(unsafe_code)]`).
@@ -101,8 +106,9 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 3. **No real filesystem or network access** in `src/shell`, `src/vfs`, `src/commands` (test-enforced).
 4. **Every attacker-controlled allocation is bounded** (connections, sessions, VFS nodes and content bytes, env, command length, history, upload size, per-command output).
 5. **Real disk writes are confined** to host keys and the content-addressed, non-executable quarantine store.
-6. **One session cannot affect another** or the listener (task isolation + RAII connection slots).
-7. **Ephemeral state does not persist across daily resets** — quarantine data, VFS modifications, and session artifacts are wiped daily; only host keys survive to maintain fingerprint stability.
+6. **One session cannot affect another** or the listener (task isolation + RAII connection slots + unwinding release builds).
+7. **The VFS arena stays acyclic and every walk over it terminates** — no emulated command may construct state that makes path rendering or a recursive walk run forever.
+8. **Ephemeral state does not persist across daily resets** — quarantine data, VFS modifications, and session artifacts are wiped daily; only host keys survive to maintain fingerprint stability.
 
 Any change that would weaken one of these invariants must be rejected — security takes priority over realism or features.
 
