@@ -35,6 +35,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grants a shell immediately for maximum interaction.
 
 ### Security
+- Fixed a whole-process denial of service: `mv` could move a directory into its
+  own subtree (`mv a a/b`), making the virtual filesystem cyclic. Path rendering
+  then looped forever while growing memory, and `find`/`grep -r`/`chmod -R`
+  recursed until the stack overflowed and aborted the daemon — killing every
+  session, not just the offending one. The move is now refused with the same
+  error real `mv` gives, and path rendering is bounded regardless.
+- Release builds no longer set `panic = "abort"`. The documented per-session
+  crash-isolation guarantee depends on unwinding; under abort a panic in any one
+  session would have taken the listener and all other sessions down with it.
+- Replaced the `find -name` glob matcher with an iterative single-backtrack
+  implementation. The recursive one was exponential on patterns such as
+  `*a*a*a*a*b`, letting a single `find` peg a worker thread indefinitely — with
+  no timeout able to fire on it, since the command runs synchronously.
+- The log directory (`logging.dir`) is now created `0700` on Unix. Captured
+  passwords are written there in cleartext, and the rotated files were being
+  created world-readable.
+- Documented that the Docker daily-reset sidecar is granted the host's Docker
+  socket, that `:ro` does not restrict Docker API calls, and that the systemd
+  timer is the lower-privilege alternative.
 - Limited each SSH connection to one active session channel at a time, while
   still allowing sequential channels. This prevents channel floods from
   bypassing connection limits and stops shell, password, and SCP state from

@@ -143,7 +143,14 @@ impl Vfs {
     pub fn path_of(&self, id: NodeId) -> String {
         let mut parts = Vec::new();
         let mut current = id;
-        while let Some(parent) = self.nodes[current].parent {
+        // A parent chain in a tree can never be longer than the arena itself.
+        // The bound is defence-in-depth: [`Vfs::rename`] already refuses the
+        // moves that could make the chain cyclic, and without it a cycle here
+        // would loop forever while growing `parts` without bound.
+        for _ in 0..self.nodes.len() {
+            let Some(parent) = self.nodes[current].parent else {
+                break;
+            };
             parts.push(self.nodes[current].name.clone());
             current = parent;
         }
@@ -298,11 +305,40 @@ impl Vfs {
         }
     }
 
+    /// Whether `id` is `other` itself or one of its ancestors.
+    ///
+    /// **Security invariant:** the arena must stay acyclic. Callers use this to
+    /// refuse a move that would place a node inside its own subtree; see
+    /// [`Vfs::rename`].
+    pub fn is_ancestor_of(&self, id: NodeId, other: NodeId) -> bool {
+        let mut current = Some(other);
+        // Bounded like `path_of`: a well-formed chain is shorter than the arena.
+        for _ in 0..self.nodes.len() {
+            match current {
+                Some(c) if c == id => return true,
+                Some(c) => current = self.nodes[c].parent,
+                None => return false,
+            }
+        }
+        // Only reachable if the arena is already cyclic; treat it as a hit so
+        // the caller refuses the move rather than compounding the damage.
+        true
+    }
+
     /// Move/rename `id` to be the child `new_name` of `new_parent`. Any node
     /// already at the destination name is detached first. Returns `false` if
-    /// `new_parent` is not a directory.
+    /// `new_parent` is not a directory, or if the move would place `id` inside
+    /// its own subtree.
     pub fn rename(&mut self, id: NodeId, new_parent: NodeId, new_name: &str) -> bool {
         if !matches!(self.nodes[new_parent].kind, NodeKind::Directory { .. }) {
+            return false;
+        }
+        // Moving a directory into itself (or into one of its own descendants)
+        // would make the arena cyclic: `id.parent` would point at a node that is
+        // only reachable through `id`. Every tree walker — `path_of`, `find`,
+        // `grep -r`, `chmod -R` — would then run forever, taking down the whole
+        // process rather than one session. Real `mv` refuses this too.
+        if self.is_ancestor_of(id, new_parent) {
             return false;
         }
         // Detach from the old parent.
@@ -512,6 +548,40 @@ mod tests {
         assert!(fs.child(tmp, "a").is_none());
         assert_eq!(fs.resolve(fs.root(), "/tmp/d/b"), Some(a));
         assert_eq!(fs.path_of(a), "/tmp/d/b");
+    }
+
+    #[test]
+    fn rename_refuses_move_into_own_subtree() {
+        let mut fs = fixture();
+        let tmp = fs.resolve(fs.root(), "/tmp").unwrap();
+        let d = fs.child(tmp, "d").unwrap();
+
+        // Moving /tmp into /tmp/d would make the arena cyclic (tmp.parent == d
+        // while d is only reachable through tmp), which turns every tree walk
+        // into an infinite loop. The move must be refused outright.
+        assert!(!fs.rename(tmp, d, "tmp"), "cyclic move must be refused");
+        // A node is its own ancestor, so `mv x x` is refused too.
+        assert!(!fs.rename(tmp, tmp, "tmp"));
+
+        // The tree is untouched: /tmp is still a child of the root.
+        assert_eq!(fs.child(fs.root(), "tmp"), Some(tmp));
+        assert_eq!(fs.path_of(d), "/tmp/d");
+
+        // A move that does not create a cycle still works.
+        let a = fs.child(tmp, "a").unwrap();
+        assert!(fs.rename(a, d, "a"));
+        assert_eq!(fs.path_of(a), "/tmp/d/a");
+    }
+
+    #[test]
+    fn path_of_terminates_for_every_node() {
+        // `path_of` is bounded by the arena size, so even a hypothetical cyclic
+        // chain returns instead of looping forever while growing a Vec.
+        let fs = fixture();
+        for id in 0..fs.nodes.len() {
+            let path = fs.path_of(id);
+            assert!(path.starts_with('/'));
+        }
     }
 
     #[test]
