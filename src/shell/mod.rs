@@ -91,6 +91,9 @@ pub struct Shell {
     pub last_status: i32,
     /// Fake shell PID (for `$$`).
     pub pid: u32,
+    /// Current command-nesting depth (`sudo`, `sh -c`, ...), bounded by the
+    /// command registry so a deeply nested line cannot overflow the stack.
+    pub nesting: u32,
     /// Submitted command lines this session, exposed by the `history` builtin.
     /// Bounded to keep per-session memory predictable.
     pub history: Vec<String>,
@@ -137,6 +140,7 @@ impl Shell {
             gid,
             last_status: 0,
             pid: 1337,
+            nesting: 0,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,

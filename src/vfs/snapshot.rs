@@ -7,6 +7,72 @@
 
 use super::Vfs;
 
+/// Binaries in `/usr/bin` — one per non-builtin command the registry serves,
+/// so `ls /usr/bin`, `which`, Tab completion, and dispatch all agree.
+const USR_BIN: &[&str] = &[
+    "apt",
+    "apt-get",
+    "arch",
+    "bash",
+    "cat",
+    "chmod",
+    "clear",
+    "cp",
+    "crontab",
+    "curl",
+    "date",
+    "df",
+    "dmesg",
+    "dpkg",
+    "echo",
+    "env",
+    "false",
+    "find",
+    "free",
+    "grep",
+    "groups",
+    "head",
+    "hostname",
+    "id",
+    "kill",
+    "last",
+    "ls",
+    "lsb_release",
+    "lscpu",
+    "mkdir",
+    "mount",
+    "mv",
+    "netstat",
+    "nproc",
+    "ping",
+    "pkill",
+    "printenv",
+    "ps",
+    "pwd",
+    "rm",
+    "rmdir",
+    "scp",
+    "sh",
+    "su",
+    "sudo",
+    "tail",
+    "tar",
+    "top",
+    "touch",
+    "true",
+    "tty",
+    "uname",
+    "uptime",
+    "w",
+    "wc",
+    "wget",
+    "which",
+    "whoami",
+];
+
+/// Binaries in `/usr/sbin`, matching the paths `which` reports for them.
+const USR_SBIN: &[&str] = &["ip", "ss"];
+
 /// File contents for `/etc/os-release` on Debian 12.
 const OS_RELEASE: &str = "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n\
 NAME=\"Debian GNU/Linux\"\n\
@@ -186,20 +252,23 @@ pub fn build(hostname: &str) -> Vfs {
 
     // /usr subtree.
     let usr_bin = fs.mkdir(usr, "bin", 0o755, 0, 0);
-    fs.mkdir(usr, "sbin", 0o755, 0, 0);
+    let usr_sbin = fs.mkdir(usr, "sbin", 0o755, 0, 0);
     fs.mkdir(usr, "lib", 0o755, 0, 0);
     fs.mkdir(usr, "lib64", 0o755, 0, 0);
     fs.mkdir(usr, "local", 0o755, 0, 0);
     fs.mkdir(usr, "share", 0o755, 0, 0);
     fs.mkdir(usr, "include", 0o755, 0, 0);
     fs.mkdir(usr, "games", 0o755, 0, 0);
-    // A handful of "binaries" so `ls /usr/bin` and `which` look plausible.
-    for bin in [
-        "bash", "sh", "ls", "cat", "cp", "mv", "rm", "mkdir", "touch", "echo", "grep", "sed",
-        "awk", "ps", "top", "kill", "wget", "curl", "ssh", "scp", "sudo", "su", "id", "whoami",
-        "uname", "apt", "apt-get", "dpkg", "python3", "perl", "vi", "nano", "tar", "gzip",
-    ] {
+    // The "binaries" behind the emulated commands. This list is exactly what
+    // the command registry can run: a name here that the shell then reports as
+    // `command not found` (or a command missing from `ls /usr/bin`) is a
+    // one-line honeypot check. `binaries_match_the_command_registry` fails the
+    // build if the two drift apart.
+    for bin in USR_BIN {
         fs.add_file(usr_bin, bin, &b""[..], 0o755, 0, 0);
+    }
+    for bin in USR_SBIN {
+        fs.add_file(usr_sbin, bin, &b""[..], 0o755, 0, 0);
     }
 
     // /etc files.
@@ -289,6 +358,33 @@ mod tests {
             NodeKind::File { contents } => String::from_utf8_lossy(contents).into_owned(),
             _ => panic!("{path} is not a regular file"),
         }
+    }
+
+    /// `ls /usr/bin` may only show binaries the shell can actually run, and
+    /// every runnable command must be there: `-bash: python3: command not
+    /// found` for a file the attacker just saw listed identifies the honeypot
+    /// in two commands.
+    #[test]
+    fn binaries_match_the_command_registry() {
+        use std::collections::BTreeSet;
+
+        let listed: BTreeSet<&str> = USR_BIN.iter().chain(USR_SBIN).copied().collect();
+        let runnable: BTreeSet<&str> = crate::shell::complete::COMMANDS
+            .iter()
+            .copied()
+            .filter(|name| !crate::commands::system::BUILTINS.contains(name))
+            .collect();
+
+        assert_eq!(
+            listed.difference(&runnable).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "listed under /usr/bin or /usr/sbin but not runnable"
+        );
+        assert_eq!(
+            runnable.difference(&listed).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "runnable but missing from /usr/bin and /usr/sbin"
+        );
     }
 
     #[test]

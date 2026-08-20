@@ -92,8 +92,23 @@ impl CommandHandler {
     }
 }
 
+/// How deep commands that run other commands (`sudo`, `sh -c`) may nest before
+/// the shell refuses. Every level is a real stack frame, and a stack overflow
+/// aborts the whole process rather than one session.
+const MAX_NESTED_COMMANDS: u32 = 16;
+
 /// Look up `argv[0]` and run the matching command.
 pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
+    if shell.nesting >= MAX_NESTED_COMMANDS {
+        return CommandResult::err("-bash: fork: retry: Resource temporarily unavailable\n", 1);
+    }
+    shell.nesting += 1;
+    let result = dispatch_inner(shell, argv);
+    shell.nesting -= 1;
+    result
+}
+
+fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
     let cmd = argv[0].as_str();
     let args = &argv[1..];
 
@@ -133,6 +148,8 @@ pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "date" => CommandHandler::Read(system::date),
         "sudo" => CommandHandler::Mut(system::sudo),
         "su" => CommandHandler::Mut(system::su),
+        "bash" | "sh" => CommandHandler::Mut(system::shell_cmd),
+        "scp" => CommandHandler::Mut(system::scp),
         "echo" => CommandHandler::Read(system::echo),
         "env" | "printenv" => CommandHandler::Read(system::env),
         "export" => CommandHandler::Mut(system::export),
