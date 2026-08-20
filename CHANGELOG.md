@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one-command honeypot check (`env | grep SSH_`). The values describe the real
   connection (the client's own address and the socket it dialled) and survive
   `su`, since they belong to the connection rather than the logged-in identity.
+- Fixed the absolute session lifetime cap (`max_session_secs`) never ending a
+  session. The cap fired on schedule and logged `session_timeout`, but the
+  session kept serving commands until the idle timeout, so a client sending
+  traffic just inside `idle_timeout_secs` could hold a session — and the per-IP
+  connection slot it occupies — indefinitely, and enough such connections could
+  fill the global session cap and lock out real attacker traffic. The cap now
+  disconnects the session, and its clock starts when the connection is accepted.
 
 ## [0.3.0] - 2026-07-30
 
