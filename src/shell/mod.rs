@@ -86,6 +86,13 @@ pub struct Shell {
     pub last_status: i32,
     /// Fake shell PID (for `$$`).
     pub pid: u32,
+    /// Standard input for the running command: the previous pipeline stage's
+    /// output, or `None` outside a pipeline.
+    pub stdin: Option<String>,
+    /// Whether the running command's output goes to the terminal. False for a
+    /// stage whose output is piped onward — commands that format differently
+    /// off a terminal (`ls`) check this.
+    pub stdout_is_tty: bool,
     /// Submitted command lines this session, exposed by the `history` builtin.
     /// Bounded to keep per-session memory predictable.
     pub history: Vec<String>,
@@ -132,6 +139,8 @@ impl Shell {
             gid,
             last_status: 0,
             pid: 1337,
+            stdin: None,
+            stdout_is_tty: true,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,
@@ -284,6 +293,36 @@ impl Shell {
         }
     }
 
+    /// Run one segment as a pipeline: each stage's output becomes the next
+    /// stage's stdin, and only the last stage's output reaches the client.
+    /// Returns `None` if the segment held no command at all.
+    ///
+    /// Filters (`cat`, `grep`, `head`, `tail`, `wc`) read [`Shell::stdin`] when
+    /// they get no file operand, exactly as they read real stdin. A stage that
+    /// ignores stdin — `ls`, say — behaves as it would in a real pipeline: the
+    /// upstream output is simply discarded.
+    fn run_pipeline(&mut self, segment: &str) -> Option<commands::CommandResult> {
+        let stages = parser::split_pipeline(segment);
+        let last_stage = stages.len() - 1;
+        let mut piped: Option<String> = None;
+        let mut last: Option<commands::CommandResult> = None;
+
+        for (i, stage) in stages.iter().enumerate() {
+            let argv = self.parse_line(stage);
+            if argv.is_empty() {
+                continue;
+            }
+            self.stdin = piped.take();
+            self.stdout_is_tty = i == last_stage;
+            let result = commands::dispatch(self, &argv);
+            self.stdin = None;
+            self.stdout_is_tty = true;
+            piped = Some(result.output.clone());
+            last = Some(result);
+        }
+        last
+    }
+
     /// Run one command line: split it on `;`, `&&`, and `||`, then for each
     /// segment expand variables, tokenize, dispatch to the command registry,
     /// and record the resulting `$?`. Empty lines are no-ops.
@@ -316,11 +355,9 @@ impl Shell {
                 continue;
             }
 
-            let argv = self.parse_line(segment.text);
-            if argv.is_empty() {
+            let Some(result) = self.run_pipeline(segment.text) else {
                 continue;
-            }
-            let result = commands::dispatch(self, &argv);
+            };
             ran = true;
             status = result.status;
             self.last_status = status;
@@ -460,6 +497,53 @@ mod tests {
         // And one that arrives via a variable stays data too.
         shell.execute("export EVIL='x; echo pwned'");
         assert_eq!(shell.execute("echo $EVIL").text, "x; echo pwned\n");
+    }
+
+    #[test]
+    fn pipelines_feed_stdin_to_the_next_stage() {
+        let mut shell = Shell::new("root", "debian");
+
+        // Only the last stage's output reaches the client.
+        assert_eq!(
+            shell.execute("cat /etc/passwd | grep sshd").text,
+            "sshd:x:100:65534::/run/sshd:/usr/sbin/nologin\n"
+        );
+        assert_eq!(shell.execute("cat /etc/passwd | wc -l").text, "15\n");
+        assert_eq!(
+            shell.execute("cat /etc/passwd | head -n 1").text,
+            "root:x:0:0:root:/root:/bin/bash\n"
+        );
+        assert_eq!(
+            shell.execute("cat /etc/passwd | grep bash | wc -l").text,
+            "2\n"
+        );
+
+        // The pipeline's status is the last stage's.
+        shell.execute("cat /etc/passwd | grep nosuchuser");
+        assert_eq!(shell.last_status, 1);
+
+        // A stage that ignores stdin behaves as it would in a real pipeline.
+        assert_eq!(shell.execute("cat /etc/passwd | whoami").text, "root\n");
+
+        // ls drops its column layout when its output is a pipe, so downstream
+        // stages see one name per line.
+        assert_eq!(
+            shell.execute("ls /usr/bin | head -n 2").text,
+            "apt\napt-get\n"
+        );
+        assert!(shell.execute("ls /usr/bin").text.lines().count() == 1);
+
+        // A quoted pipe is data, and `||` is still a separator.
+        assert_eq!(shell.execute("echo 'a | b'").text, "a | b\n");
+        assert_eq!(shell.execute("false || echo fallback").text, "fallback\n");
+
+        // Chaining and piping compose.
+        assert_eq!(
+            shell
+                .execute("cd /tmp && cat /etc/passwd | grep -c bash")
+                .text,
+            "2\n"
+        );
     }
 
     #[test]
