@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a terminal, so `ls > f` writes one name per line; `> /dev/null` discards;
   and a target that cannot be opened reports bash's own text
   (`-bash: /nope/f: No such file or directory`, `Permission denied`,
-  `Is a directory`) without running the command.
+  `Is a directory`, `ambiguous redirect`) without running the command.
 - Pipes. `cat /etc/passwd | grep root | wc -l` now runs as a pipeline: each
   stage's output becomes the next stage's stdin and only the last stage's
   output is shown. `cat`, `grep`, `head`, `tail`, and `wc` read that input when

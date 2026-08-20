@@ -75,8 +75,11 @@ const DEV_NULL: &str = "/dev/null";
 /// to what is already there.
 #[derive(Debug, Clone)]
 struct Sink {
-    /// The expanded target path.
+    /// The expanded target path, for error messages.
     path: String,
+    /// The node the output lands in, fixed when the target was opened. `None`
+    /// is `/dev/null`.
+    node: Option<NodeId>,
     /// `>>`: keep the existing contents.
     append: bool,
 }
@@ -387,14 +390,17 @@ impl Shell {
                 parser::Target::File { path, append } => {
                     // The target word is expanded like any other, so
                     // `> $HOME/f` and `> "my file"` land where bash puts them.
-                    let path = self
-                        .parse_line(path)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| path.clone());
-                    self.open_redirect(&path, *append)?;
+                    // An unset or multi-word target is a redirect bash cannot
+                    // resolve to one file, and it says so.
+                    let mut words = self.parse_line(path);
+                    if words.len() != 1 {
+                        return Err(format!("-bash: {path}: ambiguous redirect\n"));
+                    }
+                    let path = words.remove(0);
+                    let node = self.open_redirect(&path, *append)?;
                     Some(Sink {
                         path,
+                        node,
                         append: *append,
                     })
                 }
@@ -417,10 +423,13 @@ impl Shell {
     }
 
     /// Create `path` if it is missing and truncate it unless `append`, the way
-    /// opening a redirect target does, without writing anything yet.
-    fn open_redirect(&mut self, path: &str, append: bool) -> Result<(), String> {
+    /// opening a redirect target does, without writing anything yet. Returns
+    /// the node the write will land in — `None` for `/dev/null` — so the write
+    /// goes where the open did even if the command moves the working directory
+    /// out from under the path, exactly as an already-open descriptor does.
+    fn open_redirect(&mut self, path: &str, append: bool) -> Result<Option<NodeId>, String> {
         if path == DEV_NULL {
-            return Ok(());
+            return Ok(None);
         }
         let (parent, name) = self
             .resolve_parent(path)
@@ -437,23 +446,22 @@ impl Shell {
             if !append && !self.vfs.write_file(existing, &[], false) {
                 return Err(format!("-bash: {path}: No space left on device\n"));
             }
-            return Ok(());
+            return Ok(Some(existing));
         }
 
         if !self.vfs.node(parent).meta.writable_by(self.uid, self.gid) {
             return Err(format!("-bash: {path}: Permission denied\n"));
         }
         let (uid, gid) = (self.uid, self.gid);
-        if self
+        let id = self
             .vfs
-            .add_file(parent, &name, Vec::new(), 0o644, uid, gid)
-            == parent
-        {
+            .add_file(parent, &name, Vec::new(), 0o644, uid, gid);
+        if id == parent {
             // The node cap refused the file; say so rather than reporting a
             // write that never happened.
             return Err(format!("-bash: {path}: No space left on device\n"));
         }
-        Ok(())
+        Ok(Some(id))
     }
 
     /// Send a command's output to whichever sink its stream was redirected to,
@@ -495,15 +503,13 @@ impl Shell {
         }
     }
 
-    /// Append `data` to an already-opened sink.
+    /// Write `data` into an already-opened sink. A sink with no node is
+    /// `/dev/null`, which swallows it.
     fn write_redirect(&mut self, sink: &Sink, data: &[u8]) -> Result<(), String> {
-        if sink.path == DEV_NULL {
+        let Some(node) = sink.node else {
             return Ok(());
-        }
-        let Some(id) = self.vfs.resolve(self.cwd, &sink.path) else {
-            return Err(format!("-bash: {}: No such file or directory\n", sink.path));
         };
-        if !self.vfs.write_file(id, data, sink.append) {
+        if !self.vfs.write_file(node, data, sink.append) {
             return Err(format!("-bash: {}: No space left on device\n", sink.path));
         }
         Ok(())
@@ -849,6 +855,19 @@ mod tests {
         let out = user.execute("echo x > /root/f");
         assert_eq!(out.text, "-bash: /root/f: Permission denied\n");
         assert_eq!(out.status, 1);
+
+        // A target that expands to no word, or to several, is ambiguous — it
+        // must not become a file literally named `$UNSET`.
+        assert_eq!(
+            shell.execute("echo x > $UNSET").text,
+            "-bash: $UNSET: ambiguous redirect\n"
+        );
+        shell.execute("export TWO='a b'");
+        assert_eq!(
+            shell.execute("echo x > $TWO").text,
+            "-bash: $TWO: ambiguous redirect\n"
+        );
+        assert!(!shell.execute("ls -a /").text.contains('$'));
     }
 
     #[test]
