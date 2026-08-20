@@ -74,6 +74,23 @@ impl Metadata {
             self.mode & 0o004 != 0
         }
     }
+
+    /// Whether a session with `uid`/`gid` may write this node, following the
+    /// same owner/group/other rule as [`Metadata::readable_by`] on the write
+    /// bits. Creating or truncating a file checks this on the file itself when
+    /// it exists, and on its parent directory when it does not.
+    pub fn writable_by(&self, uid: u32, gid: u32) -> bool {
+        if uid == 0 {
+            return true;
+        }
+        if uid == self.uid {
+            self.mode & 0o200 != 0
+        } else if gid == self.gid {
+            self.mode & 0o020 != 0
+        } else {
+            self.mode & 0o002 != 0
+        }
+    }
 }
 
 /// The payload of a node, discriminated by kind.

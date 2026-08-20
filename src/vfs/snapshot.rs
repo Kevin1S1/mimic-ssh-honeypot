@@ -236,7 +236,11 @@ pub fn build(hostname: &str) -> Vfs {
     let usr = fs.mkdir(root, "usr", 0o755, 0, 0);
     let tmp = fs.mkdir(root, "tmp", 0o1777, 0, 0);
     fs.mkdir(root, "boot", 0o755, 0, 0);
-    fs.mkdir(root, "dev", 0o755, 0, 0);
+    let dev = fs.mkdir(root, "dev", 0o755, 0, 0);
+    // ponytail: the VFS has no character-device kind, so /dev/null is a plain
+    // empty file — `ls -l` shows `-` where a real one shows `c`. Upgrade when
+    // the arena grows a device node kind.
+    fs.add_file(dev, "null", Vec::new(), 0o666, 0, 0);
     fs.mkdir(root, "opt", 0o755, 0, 0);
     fs.mkdir(root, "run", 0o755, 0, 0);
     fs.mkdir(root, "srv", 0o755, 0, 0);

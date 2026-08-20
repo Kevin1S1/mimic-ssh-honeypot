@@ -35,7 +35,7 @@ Even if thousands of malware samples are uploaded, they are safely written as in
 ### 6. Denial of Service (DoS) Resilience
 MIMIC is protected against resource exhaustion attacks:
 - **Connection limits** shed TCP floods before SSH crypto is even negotiated.
-- **VFS limits** cap each filesystem tree to 2,000 nodes and 8 MiB of total file content, preventing RAM exhaustion from recursive `mkdir` loops or `cp`-amplifying an SCP upload (the quarantine store keeps the configured upload capture, so no forensic data is lost).
+- **VFS limits** cap each filesystem tree to 2,000 nodes and 8 MiB of total file content, preventing RAM exhaustion from recursive `mkdir` loops or `cp`-amplifying an SCP upload (the quarantine store keeps the configured upload capture, so no forensic data is lost). Output redirection (`cmd > file`) writes through the same cap, and a refused write is reported to the client as `No space left on device` rather than being silently dropped.
 - **Environment and Process limits** strictly cap string lengths, variable counts, and prevent memory leaks.
 - **Per-command output cap** (`MAX_COMMAND_OUTPUT_BYTES = 1 MiB`) truncates any single command's output at the dispatch layer, preventing memory amplification from `cat`/`find`/`grep` on large VFS content. The same ceiling applies to a whole command line, so chaining (`cat big; cat big; …`) cannot multiply it by the number of segments the 4096-byte input limit allows.
 - **One active channel per connection** prevents SSH channel floods from bypassing the connection limiter and keeps connection-scoped shell/SCP state isolated. A new channel may open after the active one closes.

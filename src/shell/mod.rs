@@ -67,6 +67,30 @@ pub enum Pending {
 /// belong to the connection rather than to the logged-in identity.
 const CONNECTION_VARS: &[&str] = &["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"];
 
+/// The bit bucket. Writes to it are discarded instead of filling the VFS —
+/// `> /dev/null` is in most bot payloads, and a real one never grows.
+const DEV_NULL: &str = "/dev/null";
+
+/// An opened redirect target: where a stream's output goes, and whether it adds
+/// to what is already there.
+#[derive(Debug, Clone)]
+struct Sink {
+    /// The expanded target path.
+    path: String,
+    /// `>>`: keep the existing contents.
+    append: bool,
+}
+
+/// Which sink each of a stage's output streams was pointed at. `None` means the
+/// stream still reaches the client.
+#[derive(Debug, Default)]
+struct Sinks {
+    /// Target for `>`, `1>`, and the stdout half of `&>`.
+    stdout: Option<Sink>,
+    /// Target for `2>` and the stderr half of `&>`.
+    stderr: Option<Sink>,
+}
+
 /// Per-session shell.
 pub struct Shell {
     /// The in-memory Debian filesystem.
@@ -326,19 +350,178 @@ impl Shell {
         let mut last: Option<commands::CommandResult> = None;
 
         for (i, stage) in stages.iter().enumerate() {
-            let argv = self.parse_line(stage);
+            let (text, redirects) = match parser::split_redirects(stage) {
+                Ok(split) => split,
+                Err(message) => return Some(commands::CommandResult::err(message, 2)),
+            };
+            let sinks = match self.open_redirects(&redirects) {
+                Ok(sinks) => sinks,
+                // bash opens the targets before it runs the command, so a
+                // redirect that cannot be opened means nothing runs at all.
+                Err(message) => return Some(commands::CommandResult::err(message, 1)),
+            };
+
+            let argv = self.parse_line(&text);
             if argv.is_empty() {
                 continue;
             }
             self.stdin = piped.take();
-            self.stdout_is_tty = i == last_stage;
+            self.stdout_is_tty = i == last_stage && sinks.stdout.is_none();
             let result = commands::dispatch(self, &argv);
             self.stdin = None;
             self.stdout_is_tty = true;
+            let result = self.route_output(result, &sinks);
             piped = Some(result.output.clone());
             last = Some(result);
         }
         last
+    }
+
+    /// Create or truncate every redirect target, resolving which sink each
+    /// stream ends up pointing at. Returns the bash error text for the first
+    /// target that cannot be opened.
+    fn open_redirects(&mut self, redirects: &[parser::Redirect]) -> Result<Sinks, String> {
+        let mut sinks = Sinks::default();
+        for redirect in redirects {
+            let sink = match &redirect.target {
+                parser::Target::File { path, append } => {
+                    // The target word is expanded like any other, so
+                    // `> $HOME/f` and `> "my file"` land where bash puts them.
+                    let path = self
+                        .parse_line(path)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| path.clone());
+                    self.open_redirect(&path, *append)?;
+                    Some(Sink {
+                        path,
+                        append: *append,
+                    })
+                }
+                // `2>&1` points a stream at whatever the other one already
+                // reached, which is `None` when that one is still the terminal.
+                parser::Target::Dup(parser::Stream::Stdout) => sinks.stdout.clone(),
+                // The parser only builds `Dup` from descriptor 1 or 2.
+                parser::Target::Dup(_) => sinks.stderr.clone(),
+            };
+            match redirect.stream {
+                parser::Stream::Stdout => sinks.stdout = sink,
+                parser::Stream::Stderr => sinks.stderr = sink,
+                parser::Stream::Both => {
+                    sinks.stdout = sink.clone();
+                    sinks.stderr = sink;
+                }
+            }
+        }
+        Ok(sinks)
+    }
+
+    /// Create `path` if it is missing and truncate it unless `append`, the way
+    /// opening a redirect target does, without writing anything yet.
+    fn open_redirect(&mut self, path: &str, append: bool) -> Result<(), String> {
+        if path == DEV_NULL {
+            return Ok(());
+        }
+        let (parent, name) = self
+            .resolve_parent(path)
+            .ok_or_else(|| format!("-bash: {path}: No such file or directory\n"))?;
+
+        if let Some(existing) = self.vfs.child(parent, &name) {
+            let meta = &self.vfs.node(existing).meta;
+            if meta.is_dir() {
+                return Err(format!("-bash: {path}: Is a directory\n"));
+            }
+            if !meta.writable_by(self.uid, self.gid) {
+                return Err(format!("-bash: {path}: Permission denied\n"));
+            }
+            if !append && !self.vfs.write_file(existing, &[], false) {
+                return Err(format!("-bash: {path}: No space left on device\n"));
+            }
+            return Ok(());
+        }
+
+        if !self.vfs.node(parent).meta.writable_by(self.uid, self.gid) {
+            return Err(format!("-bash: {path}: Permission denied\n"));
+        }
+        let (uid, gid) = (self.uid, self.gid);
+        if self
+            .vfs
+            .add_file(parent, &name, Vec::new(), 0o644, uid, gid)
+            == parent
+        {
+            // The node cap refused the file; say so rather than reporting a
+            // write that never happened.
+            return Err(format!("-bash: {path}: No space left on device\n"));
+        }
+        Ok(())
+    }
+
+    /// Send a command's output to whichever sink its stream was redirected to,
+    /// returning what is left for the client.
+    fn route_output(
+        &mut self,
+        result: commands::CommandResult,
+        sinks: &Sinks,
+    ) -> commands::CommandResult {
+        // ponytail: a command produces one output string, not a stdout and a
+        // stderr, so its exit status stands in for which stream it wrote —
+        // right for the commands here, which only report on failure. Upgrade
+        // when a command needs to write to both at once.
+        let sink = if result.status == 0 {
+            sinks.stdout.as_ref()
+        } else {
+            sinks.stderr.as_ref()
+        };
+        let Some(sink) = sink else {
+            return result;
+        };
+        if result.output.is_empty() {
+            return commands::CommandResult {
+                output: String::new(),
+                ..result
+            };
+        }
+        match self.write_redirect(sink, result.output.as_bytes()) {
+            Ok(()) => commands::CommandResult {
+                output: String::new(),
+                ..result
+            },
+            // A refused write is reported to the client, like a full disk.
+            Err(message) => commands::CommandResult {
+                output: message,
+                status: 1,
+                ..result
+            },
+        }
+    }
+
+    /// Append `data` to an already-opened sink.
+    fn write_redirect(&mut self, sink: &Sink, data: &[u8]) -> Result<(), String> {
+        if sink.path == DEV_NULL {
+            return Ok(());
+        }
+        let Some(id) = self.vfs.resolve(self.cwd, &sink.path) else {
+            return Err(format!("-bash: {}: No such file or directory\n", sink.path));
+        };
+        if !self.vfs.write_file(id, data, sink.append) {
+            return Err(format!("-bash: {}: No space left on device\n", sink.path));
+        }
+        Ok(())
+    }
+
+    /// Resolve `path` to the `(parent_directory, final_name)` pair a redirect
+    /// creates its target in.
+    fn resolve_parent(&self, path: &str) -> Option<(NodeId, String)> {
+        let path = path.strip_suffix('/').unwrap_or(path);
+        let (dir, name) = Vfs::split_path(path);
+        if name.is_empty() || name == "." || name == ".." {
+            return None;
+        }
+        let parent = self.vfs.resolve(self.cwd, dir)?;
+        if !self.vfs.node(parent).meta.is_dir() {
+            return None;
+        }
+        Some((parent, name.to_string()))
     }
 
     /// Run one command line: split it on `;`, `&&`, and `||`, then for each
@@ -562,6 +745,140 @@ mod tests {
                 .text,
             "2\n"
         );
+    }
+
+    #[test]
+    fn redirection_writes_output_into_the_filesystem() {
+        let mut shell = Shell::new("root", "debian");
+
+        // `>` takes the output off the terminal and into a new file.
+        let out = shell.execute("echo hello > /tmp/f");
+        assert_eq!(out.text, "");
+        assert_eq!(out.status, 0);
+        assert_eq!(shell.execute("cat /tmp/f").text, "hello\n");
+
+        // `>>` appends, `>` truncates.
+        shell.execute("echo second >> /tmp/f");
+        assert_eq!(shell.execute("cat /tmp/f").text, "hello\nsecond\n");
+        shell.execute("echo third > /tmp/f");
+        assert_eq!(shell.execute("cat /tmp/f").text, "third\n");
+
+        // A redirected stage is not a terminal, so `ls` writes one name a line.
+        shell.execute("mkdir -p /tmp/d && touch /tmp/d/a /tmp/d/b");
+        shell.execute("ls /tmp/d > /tmp/names");
+        assert_eq!(shell.execute("cat /tmp/names").text, "a\nb\n");
+
+        // The target is expanded like any other word.
+        shell.execute("echo home > $HOME/f");
+        assert_eq!(shell.execute("cat /root/f").text, "home\n");
+
+        // A `>` arriving in a variable's value is data, not an operator.
+        shell.execute("export EVIL='x > /tmp/pwned'");
+        assert_eq!(shell.execute("echo $EVIL").text, "x > /tmp/pwned\n");
+        assert!(shell
+            .execute("cat /tmp/pwned")
+            .text
+            .contains("No such file or directory"));
+
+        // Redirection composes with chaining and pipes.
+        shell.execute("cat /etc/passwd | grep bash > /tmp/shells");
+        assert!(shell
+            .execute("wc -l /tmp/shells")
+            .text
+            .contains("2 /tmp/shells"));
+
+        // `> FILE` with no command still truncates the file.
+        shell.execute("> /tmp/f");
+        assert_eq!(shell.execute("cat /tmp/f").text, "");
+    }
+
+    #[test]
+    fn redirection_routes_errors_and_reports_refused_targets() {
+        let mut shell = Shell::new("root", "debian");
+
+        // A failing command's message is stderr: it stays on the terminal with
+        // a plain `>`, and the target is still created.
+        let out = shell.execute("ls /nope > /tmp/out");
+        assert!(out.text.contains("No such file or directory"));
+        assert_eq!(out.status, 2);
+        assert_eq!(shell.execute("cat /tmp/out").text, "");
+
+        // `2>` catches it, and `&>` catches whichever stream is written.
+        assert_eq!(shell.execute("ls /nope 2> /tmp/err").text, "");
+        assert!(shell
+            .execute("cat /tmp/err")
+            .text
+            .contains("No such file or directory"));
+        assert_eq!(shell.execute("ls /nope &> /tmp/both").text, "");
+        assert_eq!(shell.execute("echo ok &> /tmp/both").text, "");
+        assert_eq!(shell.execute("cat /tmp/both").text, "ok\n");
+
+        // `> f 2>&1` sends both to the same file; `2>&1` alone changes nothing.
+        assert_eq!(shell.execute("ls /nope > /tmp/all 2>&1").text, "");
+        assert!(shell
+            .execute("cat /tmp/all")
+            .text
+            .contains("No such file or directory"));
+        assert!(shell
+            .execute("ls /nope 2>&1")
+            .text
+            .contains("No such file or directory"));
+
+        // /dev/null discards without growing.
+        assert_eq!(shell.execute("echo noise > /dev/null").text, "");
+        assert_eq!(shell.execute("cat /dev/null").text, "");
+
+        // A missing directory, and a target that is a directory.
+        let out = shell.execute("echo x > /nope/f");
+        assert_eq!(out.text, "-bash: /nope/f: No such file or directory\n");
+        assert_eq!(out.status, 1);
+        assert_eq!(
+            shell.execute("echo x > /tmp").text,
+            "-bash: /tmp: Is a directory\n"
+        );
+
+        // The command does not run when its target cannot be opened.
+        assert!(shell.execute("mkdir /tmp/unreached > /nope/f").status == 1);
+        assert!(shell
+            .execute("ls /tmp/unreached")
+            .text
+            .contains("No such file or directory"));
+
+        // An unprivileged user cannot redirect into root's home.
+        let mut user = Shell::new("attacker", "debian");
+        let out = user.execute("echo x > /root/f");
+        assert_eq!(out.text, "-bash: /root/f: Permission denied\n");
+        assert_eq!(out.status, 1);
+    }
+
+    #[test]
+    fn a_redirect_refused_by_the_vfs_cap_is_reported() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("cd /tmp");
+
+        // Fill the arena to within less than one command's output of the byte
+        // cap, then redirect a full command's output into it: the write cannot
+        // land, and the client has to be told rather than shown a silent
+        // success — the trap `wget` fell into before it reported short writes.
+        let big = "A".repeat(7 * 1024 * 1024 + 512 * 1024);
+        {
+            let cwd = shell.cwd;
+            shell
+                .vfs
+                .add_file(cwd, "big", big.into_bytes(), 0o644, 0, 0);
+        }
+        assert!(
+            shell.execute("cat /tmp/big").text.len() > commands::MAX_COMMAND_OUTPUT_BYTES / 2,
+            "the fill file was itself refused, so the cap is never reached"
+        );
+
+        let out = shell.execute("cat /tmp/big > /tmp/copy");
+        assert!(
+            out.text.contains("No space left on device"),
+            "silently dropped the write: {:?}",
+            out.text
+        );
+        assert_ne!(out.status, 0);
     }
 
     #[test]

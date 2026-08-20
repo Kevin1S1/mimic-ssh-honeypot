@@ -102,7 +102,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
 | **Shell built-ins** | `exit`, `logout`, `true`, `false`, `cd`, `export`, `unset` |
-| **Line syntax** | `;`, `&&`, `||` chaining and `|` pipelines (quoting-aware), `$VAR`/`${VAR}`/`$?`/`$$` expansion, single/double quotes, backslash escapes |
+| **Line syntax** | `;`, `&&`, `||` chaining, `|` pipelines, and `>`/`>>`/`2>`/`&>`/`2>&1` output redirection (all quoting-aware), `$VAR`/`${VAR}`/`$?`/`$$` expansion, single/double quotes, backslash escapes |
 
 `wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box.
 
