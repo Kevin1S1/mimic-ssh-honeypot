@@ -22,6 +22,12 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
     let mut flags = LsFlags::default();
     let mut paths: Vec<&str> = Vec::new();
 
+    // GNU ls drops the column layout when stdout is not a terminal, so
+    // `ls | head -n 2` sees two names rather than one long line.
+    if !shell.stdout_is_tty {
+        flags.one = true;
+    }
+
     for arg in args {
         if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
             for ch in arg[1..].chars() {
@@ -338,9 +344,9 @@ pub fn pwd(shell: &Shell, _args: &[String]) -> CommandResult {
 /// `cat [FILE]...`
 pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
     if args.is_empty() {
-        // Real `cat` with no args reads stdin; over a non-interactive exec we
-        // just succeed silently.
-        return CommandResult::empty();
+        // Real `cat` with no args reads stdin: piped input if there is any,
+        // and over a non-interactive exec nothing at all.
+        return CommandResult::ok(shell.stdin.clone().unwrap_or_default());
     }
 
     let mut out = String::new();
@@ -448,8 +454,12 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
     }
 
     if files.is_empty() {
-        // Real head/tail read stdin, which is empty over a non-interactive exec.
-        return CommandResult::empty();
+        // Real head/tail read stdin: piped input if there is any, and nothing
+        // over a non-interactive exec.
+        let Some(input) = &shell.stdin else {
+            return CommandResult::empty();
+        };
+        return CommandResult::ok(select_slice(input.as_bytes(), count, by_bytes, from_end));
     }
 
     let show_headers = files.len() > 1;
@@ -556,7 +566,28 @@ pub fn wc(shell: &Shell, args: &[String]) -> CommandResult {
         show_c = true;
     }
     if files.is_empty() {
-        return CommandResult::empty();
+        // Counting stdin prints no filename, and a single count is unpadded —
+        // `wc -l` on a pipe gives "15", not GNU's column-aligned form.
+        let Some(input) = &shell.stdin else {
+            return CommandResult::empty();
+        };
+        let (lines, words, bytes) = (
+            input.bytes().filter(|&b| b == b'\n').count(),
+            input.split_whitespace().count(),
+            input.len(),
+        );
+        if [show_l, show_w, show_c].iter().filter(|on| **on).count() == 1 {
+            let single = if show_l {
+                lines
+            } else if show_w {
+                words
+            } else {
+                bytes
+            };
+            return CommandResult::ok(format!("{single}\n"));
+        }
+        let counts = format_wc(lines, words, bytes, show_l, show_w, show_c);
+        return CommandResult::ok(format!("{counts}\n"));
     }
 
     let mut out = String::new();
@@ -682,8 +713,24 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
         return CommandResult::err("Usage: grep [OPTION]... PATTERNS [FILE]...\n", 2);
     };
     if paths.is_empty() {
-        // No file operand: real grep reads stdin, which is empty here.
-        return CommandResult::err("", 1);
+        // No file operand: real grep reads stdin — piped input if there is any,
+        // and nothing over a non-interactive exec.
+        let Some(input) = &shell.stdin else {
+            return CommandResult::err("", 1);
+        };
+        let needle = if flags.ignore_case {
+            pattern.to_lowercase()
+        } else {
+            pattern.to_string()
+        };
+        let mut out = String::new();
+        let mut any_match = false;
+        grep_text(input, "", &needle, flags, &mut out, &mut any_match);
+        return if any_match {
+            CommandResult::ok(out)
+        } else {
+            CommandResult::err(out, 1)
+        };
     }
 
     let needle = if flags.ignore_case {
@@ -751,7 +798,26 @@ fn grep_file(
     let NodeKind::File { contents } = &vfs.node(id).kind else {
         return;
     };
-    let text = String::from_utf8_lossy(contents);
+    grep_text(
+        &String::from_utf8_lossy(contents),
+        path,
+        needle,
+        flags,
+        out,
+        any_match,
+    );
+}
+
+/// Search `text` for `needle`, appending matching lines. Shared by the file,
+/// recursive, and stdin (pipeline) paths.
+fn grep_text(
+    text: &str,
+    path: &str,
+    needle: &str,
+    flags: GrepFlags,
+    out: &mut String,
+    any_match: &mut bool,
+) {
     let mut count = 0usize;
     for (i, line) in text.lines().enumerate() {
         let hay = if flags.ignore_case {
