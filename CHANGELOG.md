@@ -16,6 +16,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content — the quarantine filename, and identical to `sha256` unless
   `truncated` is set.
 
+### Security
+- `wget`/`curl` no longer contradict themselves: the transfer announced a size
+  (`Length: 1394 … saved [1394/1394]`) but left a 0-byte file, so one `ls -l`
+  after a download exposed the emulation. The placeholder is now written at the
+  size the transfer reports — filled with pseudo-random bytes rather than a
+  block of zeros — and the reported figure comes from what actually landed in
+  the VFS, so it stays honest when the content cap trims the write. `curl -O`
+  also prints its progress table, and `curl -I` reports a matching
+  `Content-Length`, instead of both being silent/zero.
+- Sessions now export `SSH_CLIENT`, `SSH_CONNECTION`, and — for PTY sessions —
+  `SSH_TTY`, the way every real sshd does. A shell that sets none of them is a
+  one-command honeypot check (`env | grep SSH_`). The values describe the real
+  connection (the client's own address and the socket it dialled) and survive
+  `su`, since they belong to the connection rather than the logged-in identity.
+- Fixed the absolute session lifetime cap (`max_session_secs`) never ending a
+  session. The cap fired on schedule and logged `session_timeout`, but the
+  session kept serving commands until the idle timeout, so a client sending
+  traffic just inside `idle_timeout_secs` could hold a session — and the per-IP
+  connection slot it occupies — indefinitely, and enough such connections could
+  fill the global session cap and lock out real attacker traffic. The cap now
+  disconnects the session, and its clock starts when the connection is accepted.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

@@ -16,7 +16,7 @@ use crate::shell::{Capture, Shell};
 
 use anyhow::{Context, Result};
 use russh::server::{Auth, Config as ServerConfig, Handler, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
 use sha2::{Digest, Sha256};
 
 use std::net::SocketAddr;
@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::Instant;
 
 /// Maximum bytes accepted for a single command line, on both the interactive
 /// path (line editor buffer) and the one-shot `exec` path. Without the exec
@@ -96,10 +97,16 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         let session_id = session_counter.fetch_add(1, Ordering::Relaxed);
         event::connection_opened(session_id, peer);
 
+        let local = stream
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::new(config.listen_addr, config.port));
+
         let handler = MimicHandler {
             config: Arc::clone(&config),
             session_id,
             peer,
+            local,
+            pty: false,
             auth_attempts: 0,
             username: String::new(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
@@ -112,25 +119,36 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         };
 
         let server_config = Arc::clone(&server_config);
-        let max_session = Duration::from_secs(config.max_session_secs);
+        let deadline = Instant::now() + Duration::from_secs(config.max_session_secs);
         tokio::spawn(async move {
             match russh::server::run_stream(server_config, stream, handler).await {
                 Ok(session) => {
                     // Bound the absolute session lifetime, independent of the
                     // idle timeout, so no connection can be held open forever.
-                    match tokio::time::timeout(max_session, session).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            tracing::debug!(
-                                event = "session_error",
-                                session_id,
-                                error = %err,
-                            );
-                        }
-                        Err(_) => {
+                    // The cap has to ask the session to disconnect: a
+                    // `RunningSession` only wraps the session task's
+                    // `JoinHandle`, so dropping it (as a `timeout` would)
+                    // detaches that task and leaves the session — and the
+                    // connection slot its handler holds — running.
+                    let watchdog = tokio::spawn({
+                        let handle = session.handle();
+                        async move {
+                            tokio::time::sleep_until(deadline).await;
                             tracing::info!(event = "session_timeout", session_id);
+                            let _ = handle
+                                .disconnect(Disconnect::ByApplication, String::new(), String::new())
+                                .await;
                         }
+                    });
+
+                    if let Err(err) = session.await {
+                        tracing::debug!(
+                            event = "session_error",
+                            session_id,
+                            error = %err,
+                        );
                     }
+                    watchdog.abort();
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -189,6 +207,12 @@ struct MimicHandler {
     config: Arc<Config>,
     session_id: u64,
     peer: SocketAddr,
+    /// Local end of the accepted socket, reported to the session as
+    /// `SSH_CLIENT`/`SSH_CONNECTION` the way a real sshd does.
+    local: SocketAddr,
+    /// Whether the client asked for a PTY; a real sshd only sets `SSH_TTY` when
+    /// one was allocated.
+    pty: bool,
     auth_attempts: u32,
     username: String,
     /// Interactive readline-style editor (cursor, history, completion) for the
@@ -259,7 +283,29 @@ impl MimicHandler {
     /// username and configured hostname.
     fn shell(&mut self) -> &mut Shell {
         if self.shell.is_none() {
-            self.shell = Some(Shell::new(&self.username, &self.config.hostname));
+            let mut shell = Shell::new(&self.username, &self.config.hostname);
+            // Every real sshd exports the connection details into the session
+            // environment; a shell without them is a one-line honeypot tell.
+            // The values are the client's own address and the socket it dialled,
+            // so they stay consistent with anything the attacker can check.
+            let (peer_ip, peer_port) = (self.peer.ip(), self.peer.port());
+            shell.env.set(
+                "SSH_CLIENT",
+                &format!("{peer_ip} {peer_port} {}", self.local.port()),
+            );
+            shell.env.set(
+                "SSH_CONNECTION",
+                &format!(
+                    "{peer_ip} {peer_port} {} {}",
+                    self.local.ip(),
+                    self.local.port()
+                ),
+            );
+            if self.pty {
+                // Matches the `tty` command; unset for exec, like a real sshd.
+                shell.env.set("SSH_TTY", "/dev/pts/0");
+            }
+            self.shell = Some(shell);
         }
         self.shell.as_mut().expect("shell just initialised")
     }
@@ -566,6 +612,7 @@ impl Handler for MimicHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.pty = true;
         session.channel_success(channel)?;
         Ok(())
     }
@@ -927,6 +974,8 @@ mod tests {
             config,
             session_id: 1,
             peer,
+            local: "127.0.0.1:2222".parse().unwrap(),
+            pty: false,
             auth_attempts: 0,
             username: "root".to_string(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
@@ -992,5 +1041,94 @@ mod tests {
 
         handler.close_channel(1);
         assert!(handler.try_open_channel(2));
+    }
+
+    /// Minimal client that trusts whatever host key the honeypot presents.
+    struct TestClient;
+
+    impl russh::client::Handler for TestClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// `max_session_secs` must actually end the session, not just log that it
+    /// expired. The cap has to disconnect the session task explicitly: wrapping
+    /// the `RunningSession` in a `tokio::time::timeout` only drops its
+    /// `JoinHandle`, which detaches the session and leaves it serving commands
+    /// (and holding its connection slot) until the idle timeout.
+    #[tokio::test]
+    async fn session_cap_disconnects_a_live_session() {
+        const CAP_SECS: u64 = 1;
+
+        let dir =
+            std::env::temp_dir().join(format!("mimic-session-cap-test-{}", std::process::id()));
+        // Reserve a free port from the OS, then hand it to the listener.
+        let probe = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("probe bind");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+
+        let config = Config {
+            listen_addr: "127.0.0.1".parse().expect("loopback"),
+            port,
+            max_session_secs: CAP_SECS,
+            // Long enough that only the lifetime cap can end this session.
+            idle_timeout_secs: 600,
+            host_key_dir: dir.join("host_keys"),
+            quarantine_dir: dir.join("quarantine"),
+            ..Config::default()
+        };
+        tokio::spawn(async move {
+            let _ = serve(Arc::new(config)).await;
+        });
+
+        let client_config = Arc::new(russh::client::Config::default());
+        let mut handle = loop {
+            match russh::client::connect(
+                Arc::clone(&client_config),
+                ("127.0.0.1", port),
+                TestClient,
+            )
+            .await
+            {
+                Ok(handle) => break handle,
+                // The listener may not have bound yet.
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
+        assert!(handle
+            .authenticate_password("root", "hunter2")
+            .await
+            .expect("auth request")
+            .success());
+
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.request_shell(true).await.expect("shell request");
+
+        // Drain the shell output; the server — not the client — must close this.
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while channel.wait().await.is_some() {}
+        })
+        .await
+        .expect("session outlived max_session_secs");
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(CAP_SECS).saturating_sub(Duration::from_millis(200)),
+            "session ended after {:?}, before the {CAP_SECS}s cap — something other than the cap closed it",
+            started.elapsed()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
