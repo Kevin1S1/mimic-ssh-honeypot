@@ -62,6 +62,11 @@ pub enum Pending {
     },
 }
 
+/// Environment variables describing the SSH connection itself. The network
+/// layer seeds them; they survive `su`, as they do on a real box, because they
+/// belong to the connection rather than to the logged-in identity.
+const CONNECTION_VARS: &[&str] = &["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"];
+
 /// Per-session shell.
 pub struct Shell {
     /// The in-memory Debian filesystem.
@@ -246,7 +251,16 @@ impl Shell {
             (1000, 1000, format!("/home/{user}"))
         };
         let home = ensure_home(&mut self.vfs, &home_path, uid, gid);
+        // `su` inherits the connection environment from the caller's shell —
+        // only the login variables are rebuilt for the new identity.
+        let connection: Vec<(&str, String)> = CONNECTION_VARS
+            .iter()
+            .filter_map(|key| self.env.get(key).map(|value| (*key, value.to_string())))
+            .collect();
         self.env = Env::login(user, &home_path, &self.hostname);
+        for (key, value) in connection {
+            self.env.set(key, &value);
+        }
         self.username = user.to_string();
         self.uid = uid;
         self.gid = gid;
@@ -485,6 +499,25 @@ mod tests {
             out.text.len()
         );
         assert!(out.text.ends_with("... (output truncated)\n"));
+    }
+
+    #[test]
+    fn su_rebuilds_the_login_env_but_keeps_the_connection_vars() {
+        let mut shell = Shell::new("root", "debian");
+        shell
+            .env
+            .set("SSH_CONNECTION", "10.0.0.5 54321 10.0.0.9 22");
+        shell.env.set("SSH_TTY", "/dev/pts/0");
+
+        shell.switch_user("user");
+
+        assert_eq!(shell.env.get("USER"), Some("user"));
+        assert_eq!(shell.env.get("HOME"), Some("/home/user"));
+        assert_eq!(
+            shell.env.get("SSH_CONNECTION"),
+            Some("10.0.0.5 54321 10.0.0.9 22")
+        );
+        assert_eq!(shell.env.get("SSH_TTY"), Some("/dev/pts/0"));
     }
 
     #[test]
