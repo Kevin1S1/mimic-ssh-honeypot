@@ -302,25 +302,73 @@ impl Shell {
         }
     }
 
-    /// Run one command line: expand variables, tokenize, dispatch to the
-    /// command registry, and record the resulting `$?`. Empty lines are no-ops.
+    /// Run one command line: split it on `;`, `&&`, and `||`, then for each
+    /// segment expand variables, tokenize, dispatch to the command registry,
+    /// and record the resulting `$?`. Empty lines are no-ops.
     pub fn execute(&mut self, line: &str) -> Output {
         self.captures.clear();
-        let argv = self.parse_line(line);
-        if argv.is_empty() {
+
+        let mut text = String::new();
+        let mut status = 0;
+        let mut exit = false;
+        let mut ran = false;
+
+        for segment in parser::split_segments(line) {
+            if segment.text.trim().is_empty() {
+                if segment.run_if != parser::Separator::Always {
+                    // `&& cmd` with nothing in front of it, as bash sees it.
+                    return Output {
+                        text: "-bash: syntax error near unexpected token `&&'\n".to_string(),
+                        status: 2,
+                        exit: false,
+                    };
+                }
+                continue;
+            }
+            let should_run = match segment.run_if {
+                parser::Separator::Always => true,
+                parser::Separator::AndIf => status == 0,
+                parser::Separator::OrIf => status != 0,
+            };
+            if !should_run {
+                continue;
+            }
+
+            let argv = self.parse_line(segment.text);
+            if argv.is_empty() {
+                continue;
+            }
+            let result = commands::dispatch(self, &argv);
+            ran = true;
+            status = result.status;
+            self.last_status = status;
+            text.push_str(&result.output);
+            if result.exit {
+                exit = true;
+                break;
+            }
+            // The per-command cap bounds one command; a chained line has to be
+            // bounded as a whole, or `cat big; cat big; ...` multiplies it by
+            // the number of segments the line has room for.
+            if text.len() >= commands::MAX_COMMAND_OUTPUT_BYTES {
+                let mut cut = commands::MAX_COMMAND_OUTPUT_BYTES;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+                text.push_str("\n... (output truncated)\n");
+                break;
+            }
+        }
+
+        if !ran {
             return Output {
-                text: String::new(),
+                text,
                 status: 0,
-                exit: false,
+                exit,
             };
         }
-        let result = commands::dispatch(self, &argv);
-        self.last_status = result.status;
-        Output {
-            text: result.output,
-            status: result.status,
-            exit: result.exit,
-        }
+        Output { text, status, exit }
     }
 }
 
@@ -399,6 +447,62 @@ mod tests {
         );
         assert_eq!(shell.parse_line(r"echo a\ b"), vec!["echo", "a b"]);
         assert!(shell.parse_line("   ").is_empty());
+    }
+
+    #[test]
+    fn chained_commands_run_in_order_and_honour_status() {
+        let mut shell = Shell::new("root", "debian");
+
+        // `;` runs everything, in order.
+        let out = shell.execute("echo one; echo two; echo three");
+        assert_eq!(out.text, "one\ntwo\nthree\n");
+        assert_eq!(out.status, 0);
+
+        // `&&` stops at the first failure, `||` only runs after one.
+        assert_eq!(shell.execute("false && echo nope").text, "");
+        assert_eq!(shell.execute("false || echo yes").text, "yes\n");
+        assert_eq!(shell.execute("true && echo yes").text, "yes\n");
+        assert_eq!(shell.execute("true || echo nope").text, "");
+
+        // $? reflects the last command that actually ran.
+        assert_eq!(shell.execute("false && echo nope; echo $?").text, "1\n");
+
+        // State changes carry across segments within one line.
+        let out = shell.execute("cd /tmp; mkdir -p a/b; find /tmp -type d");
+        assert_eq!(out.text, "/tmp\n/tmp/a\n/tmp/a/b\n");
+
+        // A separator inside quotes is data, not an operator.
+        assert_eq!(shell.execute("echo 'a; b'").text, "a; b\n");
+        assert_eq!(shell.execute(r"echo a\;b").text, "a;b\n");
+
+        // And one that arrives via a variable stays data too.
+        shell.execute("export EVIL='x; echo pwned'");
+        assert_eq!(shell.execute("echo $EVIL").text, "x; echo pwned\n");
+    }
+
+    #[test]
+    fn a_chained_line_is_output_bounded_as_a_whole() {
+        let mut shell = Shell::new("root", "debian");
+        let big = "A".repeat(200_000);
+        shell.execute("cd /tmp");
+        {
+            let cwd = shell.cwd;
+            shell
+                .vfs
+                .add_file(cwd, "big", big.into_bytes(), 0o644, 0, 0);
+        }
+
+        let line = std::iter::repeat_n("cat /tmp/big", 40)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let out = shell.execute(&line);
+
+        assert!(
+            out.text.len() <= commands::MAX_COMMAND_OUTPUT_BYTES + 64,
+            "chained line produced {} bytes",
+            out.text.len()
+        );
+        assert!(out.text.ends_with("... (output truncated)\n"));
     }
 
     #[test]
