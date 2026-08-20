@@ -6,6 +6,8 @@
 //! byte stream and returns the acknowledgement bytes to send plus any completed
 //! files. The network layer performs the actual quarantine write and logging.
 
+use sha2::{Digest, Sha256};
+
 /// What an `scp` remote command is asking the server to do.
 pub enum ScpMode {
     /// `scp -t TARGET`: receive files into `TARGET` (the common upload path).
@@ -75,6 +77,10 @@ pub struct CompletedFile {
     pub data: Vec<u8>,
     /// Declared size from the control message.
     pub size: u64,
+    /// SHA-256 of the **whole** body as received, including any bytes past the
+    /// storage cap. This is the payload's real identity — the hash to look up
+    /// in an IOC feed — even when only a prefix was kept.
+    pub payload_sha256: String,
     /// Whether the stored data was truncated at the configured cap.
     pub truncated: bool,
 }
@@ -86,6 +92,8 @@ struct Incoming {
     size: u64,
     remaining: u64,
     data: Vec<u8>,
+    /// Fed every body byte, capped or not, so the payload keeps its true hash.
+    hasher: Sha256,
     truncated: bool,
 }
 
@@ -132,6 +140,7 @@ impl ScpSink {
         for &b in data {
             if let Some(file) = self.file.as_mut() {
                 if file.remaining > 0 {
+                    file.hasher.update([b]);
                     if (file.data.len() as u64) < self.max_bytes {
                         file.data.push(b);
                     } else {
@@ -148,6 +157,7 @@ impl ScpSink {
                     mode: f.mode,
                     data: f.data,
                     size: f.size,
+                    payload_sha256: super::ssh::hex(&f.hasher.finalize()),
                     truncated: f.truncated,
                 });
                 acks.push(0); // acknowledge the completed file
@@ -187,6 +197,7 @@ impl ScpSink {
                         size,
                         remaining: size,
                         data: Vec::new(),
+                        hasher: Sha256::new(),
                         truncated: false,
                     });
                 }
@@ -300,6 +311,22 @@ mod tests {
         assert_eq!(files[0].data.len(), 4);
         assert!(files[0].truncated);
         assert_eq!(files[0].size, 10);
+
+        // The hash must cover the whole payload, not the stored prefix —
+        // otherwise a truncated capture is unmatchable against any IOC feed.
+        let mut whole = Sha256::new();
+        whole.update(body);
+        assert_eq!(
+            files[0].payload_sha256,
+            super::super::ssh::hex(&whole.finalize())
+        );
+
+        let mut prefix = Sha256::new();
+        prefix.update(&body[..4]);
+        assert_ne!(
+            files[0].payload_sha256,
+            super::super::ssh::hex(&prefix.finalize())
+        );
     }
 
     #[test]

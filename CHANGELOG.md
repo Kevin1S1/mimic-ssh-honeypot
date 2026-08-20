@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A truncated SCP upload logged the SHA-256 of the stored prefix while reporting
+  the full `size`, so the recorded hash matched neither the payload the attacker
+  sent nor anything in an IOC feed. The whole body is now hashed as it streams
+  in (it was already being read to keep the protocol in sync): `sha256` is the
+  complete payload, and the new `stored_sha256` field is the quarantined
+  content — the quarantine filename, and identical to `sha256` unless
+  `truncated` is set.
+
 ### Security
 - `wget`/`curl` no longer contradict themselves: the transfer announced a size
   (`Length: 1394 … saved [1394/1394]`) but left a 0-byte file, so one `ls -l`
