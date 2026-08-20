@@ -326,10 +326,12 @@ impl MimicHandler {
         let quarantine_dir = self.config.quarantine_dir.clone();
 
         // Content-address the captured bytes so identical payloads dedupe and
-        // the attacker-supplied filename never influences the stored path.
+        // the attacker-supplied filename never influences the stored path. This
+        // hashes what is stored; `file.payload_sha256` covers the whole upload,
+        // and the two differ once the cap truncates it.
         let mut hasher = Sha256::new();
         hasher.update(&file.data);
-        let sha256 = hex(&hasher.finalize());
+        let stored_sha256 = hex(&hasher.finalize());
 
         // Resolve the destination path inside the emulated filesystem.
         let target = self
@@ -352,7 +354,7 @@ impl MimicHandler {
             tracing::warn!(event = "quarantine_session_cap", session_id);
             String::new()
         } else {
-            match write_quarantine(&quarantine_dir, &sha256, &file.data) {
+            match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
                 Ok(p) => {
                     self.quarantine_bytes += file.data.len() as u64;
                     p
@@ -374,7 +376,8 @@ impl MimicHandler {
             &file.name,
             &dest_path,
             file.size,
-            &sha256,
+            &file.payload_sha256,
+            &stored_sha256,
             &stored_path,
             file.truncated,
         );
@@ -425,7 +428,7 @@ impl MimicHandler {
 }
 
 /// Hex-encode a byte slice.
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
@@ -958,6 +961,7 @@ mod tests {
                 mode: 0o644,
                 data: vec![i as u8; file_size], // distinct content per file
                 size: file_size as u64,
+                payload_sha256: String::new(),
                 truncated: false,
             });
         }

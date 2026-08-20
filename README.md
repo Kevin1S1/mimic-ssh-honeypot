@@ -241,8 +241,10 @@ Pipe to `jq` or ship to your SIEM.
 // wget/curl download logged
 {"fields":{"event":"download","sensor_name":"mimic","session_id":42,"peer":"…","tool":"wget","url":"http://evil.sh/payload","dest":"/tmp/payload"}}
 
-// SCP upload captured
-{"fields":{"event":"upload","sensor_name":"mimic","session_id":42,"peer":"…","name":"bot.elf","dest":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_path":"quarantine/a3f…","truncated":false}}
+// SCP upload captured. `sha256` is the complete payload as it came off the
+// wire — the hash to look up in an IOC feed. `stored_sha256` is what is on
+// disk (and the quarantine filename); the two differ only when `truncated`.
+{"fields":{"event":"upload","sensor_name":"mimic","session_id":42,"peer":"…","name":"bot.elf","dest":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_sha256":"a3f…","stored_path":"quarantine/a3f…","truncated":false}}
 
 // Session ended
 {"fields":{"event":"connection_closed","sensor_name":"mimic","session_id":42,"peer":"…"}}

@@ -71,10 +71,12 @@ pub fn command(session_id: u64, peer: SocketAddr, command: &str) {
 
 /// A file was uploaded via SCP and written to the quarantine store. `name` is
 /// the attacker-supplied filename, `dest` the path it was materialised at in
-/// the emulated filesystem, `sha256` the content hash (also its quarantine
-/// filename), and `stored_path` where the bytes landed on the real disk
-/// (empty if the quarantine write failed). `truncated` flags uploads capped at
-/// the configured size limit.
+/// the emulated filesystem, `sha256` the hash of the complete payload as it
+/// came off the wire (what an IOC lookup needs), `stored_sha256` the hash of
+/// the bytes actually kept — also the quarantine filename — and `stored_path`
+/// where those bytes landed on the real disk (empty if the quarantine write
+/// failed). `truncated` flags uploads capped at the configured size limit; the
+/// two hashes are identical unless it is set.
 #[allow(clippy::too_many_arguments)]
 pub fn upload(
     session_id: u64,
@@ -83,6 +85,7 @@ pub fn upload(
     dest: &str,
     size: u64,
     sha256: &str,
+    stored_sha256: &str,
     stored_path: &str,
     truncated: bool,
 ) {
@@ -95,6 +98,7 @@ pub fn upload(
         dest,
         size,
         sha256,
+        stored_sha256,
         stored_path,
         truncated,
     );
