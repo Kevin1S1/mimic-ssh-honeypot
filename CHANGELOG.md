@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Sessions now export `SSH_CLIENT`, `SSH_CONNECTION`, and — for PTY sessions —
+  `SSH_TTY`, the way every real sshd does. A shell that sets none of them is a
+  one-command honeypot check (`env | grep SSH_`). The values describe the real
+  connection (the client's own address and the socket it dialled) and survive
+  `su`, since they belong to the connection rather than the logged-in identity.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

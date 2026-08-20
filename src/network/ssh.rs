@@ -96,10 +96,16 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         let session_id = session_counter.fetch_add(1, Ordering::Relaxed);
         event::connection_opened(session_id, peer);
 
+        let local = stream
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::new(config.listen_addr, config.port));
+
         let handler = MimicHandler {
             config: Arc::clone(&config),
             session_id,
             peer,
+            local,
+            pty: false,
             auth_attempts: 0,
             username: String::new(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
@@ -189,6 +195,12 @@ struct MimicHandler {
     config: Arc<Config>,
     session_id: u64,
     peer: SocketAddr,
+    /// Local end of the accepted socket, reported to the session as
+    /// `SSH_CLIENT`/`SSH_CONNECTION` the way a real sshd does.
+    local: SocketAddr,
+    /// Whether the client asked for a PTY; a real sshd only sets `SSH_TTY` when
+    /// one was allocated.
+    pty: bool,
     auth_attempts: u32,
     username: String,
     /// Interactive readline-style editor (cursor, history, completion) for the
@@ -259,7 +271,29 @@ impl MimicHandler {
     /// username and configured hostname.
     fn shell(&mut self) -> &mut Shell {
         if self.shell.is_none() {
-            self.shell = Some(Shell::new(&self.username, &self.config.hostname));
+            let mut shell = Shell::new(&self.username, &self.config.hostname);
+            // Every real sshd exports the connection details into the session
+            // environment; a shell without them is a one-line honeypot tell.
+            // The values are the client's own address and the socket it dialled,
+            // so they stay consistent with anything the attacker can check.
+            let (peer_ip, peer_port) = (self.peer.ip(), self.peer.port());
+            shell.env.set(
+                "SSH_CLIENT",
+                &format!("{peer_ip} {peer_port} {}", self.local.port()),
+            );
+            shell.env.set(
+                "SSH_CONNECTION",
+                &format!(
+                    "{peer_ip} {peer_port} {} {}",
+                    self.local.ip(),
+                    self.local.port()
+                ),
+            );
+            if self.pty {
+                // Matches the `tty` command; unset for exec, like a real sshd.
+                shell.env.set("SSH_TTY", "/dev/pts/0");
+            }
+            self.shell = Some(shell);
         }
         self.shell.as_mut().expect("shell just initialised")
     }
@@ -563,6 +597,7 @@ impl Handler for MimicHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.pty = true;
         session.channel_success(channel)?;
         Ok(())
     }
@@ -924,6 +959,8 @@ mod tests {
             config,
             session_id: 1,
             peer,
+            local: "127.0.0.1:2222".parse().unwrap(),
+            pty: false,
             auth_attempts: 0,
             username: "root".to_string(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
