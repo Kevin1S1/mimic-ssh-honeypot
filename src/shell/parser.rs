@@ -87,6 +87,37 @@ pub fn split_segments(line: &str) -> Vec<Segment<'_>> {
     segments
 }
 
+/// Split one segment into pipeline stages on `|`, ignoring pipes inside quotes
+/// or escaped by a backslash. `||` is a separator, not a pipe, and is handled
+/// by [`split_segments`] before this runs.
+pub fn split_pipeline(segment: &str) -> Vec<&str> {
+    let mut stages = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    let bytes = segment.as_bytes();
+    for i in 0..bytes.len() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match bytes[i] {
+            b'\\' if !in_single => escaped = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => {
+                stages.push(&segment[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    stages.push(&segment[start..]);
+    stages
+}
+
 /// Split `line` into argument words. Quotes group whitespace; backslash escapes
 /// the next character (outside single quotes).
 pub fn tokenize(line: &str) -> Vec<String> {

