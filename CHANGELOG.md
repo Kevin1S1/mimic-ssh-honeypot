@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `/usr/bin` listed binaries the shell could not run — `ls /usr/bin` showed
+  `python3`, `sed`, `awk`, `perl`, `vi`, `nano`, `gzip`, `ssh`, and `bash`, all
+  of which answered `command not found`, and `-bash: bash: command not found` on
+  a box whose `$SHELL` is `/bin/bash` identified the honeypot outright. The
+  listing is now exactly the set of commands the registry serves, `/usr/sbin`
+  holds `ip`/`ss` to match what `which` reports, and a test fails the build if
+  the two ever drift apart again.
+
+### Added
+- `bash`/`sh`: `-c LINE` runs the line (how bot payloads usually arrive), and a
+  bare invocation behaves like an interactive subshell. `scp` as an interactive
+  command: local copies work, and a `host:path` operand fails the way an
+  unreachable peer would — the binary has to exist, since SCP uploads to this
+  host succeed.
+- Nested commands (`sudo`, `sh -c`) are capped at 16 levels, so a deeply nested
+  line is refused with bash's `fork: retry` error instead of recursing toward a
+  stack overflow that would abort the whole daemon.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

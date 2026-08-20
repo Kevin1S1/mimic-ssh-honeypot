@@ -95,6 +95,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
 | **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |
 | **Privilege** | `sudo` (transient elevation for one command), `su` (identity switch; prompts a non-root user for a password) |
+| **Shells** | `bash`/`sh` (`-c LINE` runs the line; bare invocation acts as a subshell), `scp` (local copy; remote operands fail as unreachable) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
 | **Processes** | `ps` (`aux`/`-ef`), `top`, `kill`, `pkill`, `free`, `uptime` |
 | **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip` |
