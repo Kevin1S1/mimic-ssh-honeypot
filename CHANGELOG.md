@@ -17,12 +17,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   literal, and splitting happens before variable expansion — so a `;` arriving
   in a variable's value is data, not an extra command.
 
+### Fixed
+- A truncated SCP upload logged the SHA-256 of the stored prefix while reporting
+  the full `size`, so the recorded hash matched neither the payload the attacker
+  sent nor anything in an IOC feed. The whole body is now hashed as it streams
+  in (it was already being read to keep the protocol in sync): `sha256` is the
+  complete payload, and the new `stored_sha256` field is the quarantined
+  content — the quarantine filename, and identical to `sha256` unless
+  `truncated` is set.
+
 ### Security
 - The 1 MiB output cap now bounds a whole command line, not just one command:
   a chained line could otherwise multiply the per-command cap by the number of
   segments that fit in the 4096-byte input limit.
 
 ### Security
+- `/usr/bin` listed binaries the shell could not run — `ls /usr/bin` showed
+  `python3`, `sed`, `awk`, `perl`, `vi`, `nano`, `gzip`, `ssh`, and `bash`, all
+  of which answered `command not found`, and `-bash: bash: command not found` on
+  a box whose `$SHELL` is `/bin/bash` identified the honeypot outright. The
+  listing is now exactly the set of commands the registry serves, `/usr/sbin`
+  holds `ip`/`ss` to match what `which` reports, and a test fails the build if
+  the two ever drift apart again.
+
+### Added
+- `bash`/`sh`: `-c LINE` runs the line (how bot payloads usually arrive), and a
+  bare invocation behaves like an interactive subshell. `scp` as an interactive
+  command: local copies work, and a `host:path` operand fails the way an
+  unreachable peer would — the binary has to exist, since SCP uploads to this
+  host succeed.
+- Nested commands (`sudo`, `sh -c`) are capped at 16 levels, so a deeply nested
+  line is refused with bash's `fork: retry` error instead of recursing toward a
+  stack overflow that would abort the whole daemon.
+
 - `wget`/`curl` no longer contradict themselves: the transfer announced a size
   (`Length: 1394 … saved [1394/1394]`) but left a 0-byte file, so one `ls -l`
   after a download exposed the emulation. The placeholder is now written at the
