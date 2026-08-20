@@ -21,7 +21,7 @@ All emulated commands (`ls`, `cat`, `rm`, `touch`, etc.) operate purely on the `
 - The node arena is kept **acyclic**: `Vfs::rename` refuses to move a directory into itself or into its own subtree (`mv a a/b`), exactly as real `mv` does. A cycle would make every tree walk — path rendering, `find`, `grep -r`, `chmod -R` — run forever, which is a whole-process failure rather than a per-session one. `path_of` is additionally bounded by the arena size as defence-in-depth.
 
 ### 4. Fake Networking (`wget`, `curl`, `ping`)
-When an attacker attempts to download a malicious payload via `wget` or `curl`, the honeypot fakes the download progress, generates a fake IP resolution, and drops a 0-byte placeholder into the in-memory VFS. It never actually opens a network socket to fetch the file, preventing the honeypot from being used in DDoS amplification attacks or as an open proxy.
+When an attacker attempts to download a malicious payload via `wget` or `curl`, the honeypot fakes the download progress, generates a fake IP resolution, and drops a placeholder of the reported size — bounded by the VFS content cap — into the in-memory VFS. It never actually opens a network socket to fetch the file, preventing the honeypot from being used in DDoS amplification attacks or as an open proxy.
 
 ### 5. Safe SCP Quarantining
 The only time the honeypot touches the real disk based on attacker input is during an SCP upload. This is heavily sanitized:

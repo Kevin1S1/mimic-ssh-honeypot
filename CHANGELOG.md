@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `wget`/`curl` no longer contradict themselves: the transfer announced a size
+  (`Length: 1394 … saved [1394/1394]`) but left a 0-byte file, so one `ls -l`
+  after a download exposed the emulation. The placeholder is now written at the
+  size the transfer reports — filled with pseudo-random bytes rather than a
+  block of zeros — and the reported figure comes from what actually landed in
+  the VFS, so it stays honest when the content cap trims the write. `curl -O`
+  also prints its progress table, and `curl -I` reports a matching
+  `Content-Length`, instead of both being silent/zero.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added
