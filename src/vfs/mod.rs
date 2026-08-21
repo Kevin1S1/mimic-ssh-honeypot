@@ -249,6 +249,38 @@ impl Vfs {
         id
     }
 
+    /// Overwrite or extend an existing regular file's contents, keeping its
+    /// permissions and ownership. Returns `false` — leaving the file untouched
+    /// — if `id` is not a regular file, or if the write would push the arena
+    /// past the byte cap; callers must surface that refusal rather than
+    /// reporting a write that did not happen.
+    pub fn write_file(&mut self, id: NodeId, data: &[u8], append: bool) -> bool {
+        let NodeKind::File { contents } = &self.nodes[id].kind else {
+            return false;
+        };
+        let old_len = contents.len();
+        let new_len = if append {
+            old_len + data.len()
+        } else {
+            data.len()
+        };
+        if self.content_bytes - old_len + new_len > MAX_VFS_BYTES {
+            return false;
+        }
+        let NodeKind::File { contents } = &mut self.nodes[id].kind else {
+            return false;
+        };
+        if append {
+            contents.extend_from_slice(data);
+        } else {
+            contents.clear();
+            contents.extend_from_slice(data);
+        }
+        self.content_bytes = self.content_bytes - old_len + new_len;
+        self.nodes[id].meta.mtime = now_ts();
+        true
+    }
+
     /// Create a symbolic link node pointing at `target`.
     pub fn add_symlink(&mut self, parent: NodeId, name: &str, target: &str) -> NodeId {
         if let Some(existing) = self.child(parent, name) {

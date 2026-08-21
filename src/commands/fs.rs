@@ -1214,7 +1214,7 @@ fn strip_trailing_slashes(p: &str) -> &str {
 /// creating, removing, or renaming an entry. Returns `None` if the parent
 /// directory does not exist or is not a directory, or the final component is
 /// empty/`.`/`..`.
-fn resolve_parent(shell: &Shell, path: &str) -> Option<(NodeId, String)> {
+pub(crate) fn resolve_parent(shell: &Shell, path: &str) -> Option<(NodeId, String)> {
     let path = strip_trailing_slashes(path);
     let (dir, name) = Vfs::split_path(path);
     if name.is_empty() || name == "." || name == ".." {
