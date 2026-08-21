@@ -243,6 +243,11 @@ fn longest_common_prefix(items: &[&str]) -> String {
             break;
         }
     }
+    // Bytes can match part-way through a character (`é` and `ê` share a lead
+    // byte); slicing there would panic, so back off to a boundary.
+    while end > 0 && !first.is_char_boundary(end) {
+        end -= 1;
+    }
     first[..end].to_string()
 }
 
@@ -335,5 +340,8 @@ mod tests {
         assert_eq!(longest_common_prefix(&["apt", "apt-get"]), "apt");
         assert_eq!(longest_common_prefix(&["cat", "cd"]), "c");
         assert_eq!(longest_common_prefix(&["ls", "rm"]), "");
+        // Names sharing only part of a character must not slice mid-character.
+        assert_eq!(longest_common_prefix(&["éa", "êb"]), "");
+        assert_eq!(longest_common_prefix(&["éa", "éb"]), "é");
     }
 }

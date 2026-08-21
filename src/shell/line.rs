@@ -9,8 +9,9 @@
 //!
 //! **Security:** the buffer and history are bounded (`max_line`, `max_history`)
 //! so a malicious client cannot drive unbounded memory growth through the line
-//! editor. Only printable ASCII is buffered; everything else is interpreted as
-//! an editing command or ignored.
+//! editor. Printable ASCII and the bytes of non-ASCII characters are buffered
+//! verbatim — a UTF-8 payload has to reach the log the way it was typed —
+//! while everything else is interpreted as an editing command or ignored.
 
 use std::collections::VecDeque;
 
@@ -58,9 +59,14 @@ struct Search {
 pub struct LineEditor {
     prompt: Vec<u8>,
     buf: Vec<u8>,
-    /// Cursor position as a byte index into `buf` (buffer is ASCII, so byte ==
-    /// column).
+    /// Cursor position as a byte index into `buf`. Screen columns are counted
+    /// separately, since a non-ASCII character spans several bytes.
     cursor: usize,
+    /// Text removed by the last kill (Ctrl-U/K/W), waiting for Ctrl-Y.
+    ///
+    /// ponytail: one slot, not readline's kill ring — consecutive kills replace
+    /// rather than accumulate; upgrade when a probe uses Meta-Y or stacked kills.
+    kill: Vec<u8>,
     history: VecDeque<String>,
     /// When browsing history, the index into `history` currently shown.
     hist_pos: Option<usize>,
@@ -80,6 +86,7 @@ impl LineEditor {
             prompt: Vec::new(),
             buf: Vec::new(),
             cursor: 0,
+            kill: Vec::new(),
             history: VecDeque::new(),
             hist_pos: None,
             stash: Vec::new(),
@@ -162,23 +169,25 @@ impl LineEditor {
                 self.esc = Esc::Got;
                 Reaction::Ignore
             }
-            0x09 => Reaction::Complete,       // Tab
-            0x08 | 0x7f => self.backspace(),  // Backspace / DEL
-            0x01 => self.move_home(),         // Ctrl-A
-            0x05 => self.move_end(),          // Ctrl-E
-            0x02 => self.move_left(),         // Ctrl-B
-            0x06 => self.move_right(),        // Ctrl-F
-            0x10 => self.history_prev(),      // Ctrl-P
-            0x0e => self.history_next(),      // Ctrl-N
-            0x15 => self.kill_to_start(),     // Ctrl-U
-            0x0b => self.kill_to_end(),       // Ctrl-K
-            0x17 => self.kill_word(),         // Ctrl-W
-            0x0c => self.clear_screen(),      // Ctrl-L
-            0x12 => self.start_search(),      // Ctrl-R
-            0x03 => self.interrupt(),         // Ctrl-C
-            0x04 => self.ctrl_d(),            // Ctrl-D
-            0x20..=0x7e => self.insert(byte), // printable ASCII
-            _ => Reaction::Ignore,            // other control bytes
+            0x09 => Reaction::Complete,      // Tab
+            0x08 | 0x7f => self.backspace(), // Backspace / DEL
+            0x01 => self.move_home(),        // Ctrl-A
+            0x05 => self.move_end(),         // Ctrl-E
+            0x02 => self.move_left(),        // Ctrl-B
+            0x06 => self.move_right(),       // Ctrl-F
+            0x10 => self.history_prev(),     // Ctrl-P
+            0x0e => self.history_next(),     // Ctrl-N
+            0x15 => self.kill_to_start(),    // Ctrl-U
+            0x0b => self.kill_to_end(),      // Ctrl-K
+            0x17 => self.kill_word(),        // Ctrl-W
+            0x19 => self.yank(),             // Ctrl-Y
+            0x0c => self.clear_screen(),     // Ctrl-L
+            0x12 => self.start_search(),     // Ctrl-R
+            0x03 => self.interrupt(),        // Ctrl-C
+            0x04 => self.ctrl_d(),           // Ctrl-D
+            // Printable ASCII, plus the bytes of any non-ASCII character.
+            0x20..=0x7e | 0x80..=0xff => self.insert(byte),
+            _ => Reaction::Ignore, // other control bytes
         }
     }
 
@@ -260,7 +269,7 @@ impl LineEditor {
                 self.search_recompute();
                 Reaction::Write(self.render_search())
             }
-            0x20..=0x7e => {
+            0x20..=0x7e | 0x80..=0xff => {
                 if let Some(s) = self.search.as_mut() {
                     if s.query.len() < self.max_line {
                         s.query.push(byte);
@@ -374,6 +383,9 @@ impl LineEditor {
 
     fn insert(&mut self, byte: u8) -> Reaction {
         if self.buf.len() >= self.max_line {
+            // ponytail: a non-ASCII character straddling the cap keeps only the
+            // bytes that fit, so the line submits with one U+FFFD in place of
+            // that character; upgrade when payloads that long matter.
             return Reaction::Ignore;
         }
         self.buf.insert(self.cursor, byte);
@@ -390,8 +402,9 @@ impl LineEditor {
         if self.cursor == 0 {
             return Reaction::Ignore;
         }
-        self.cursor -= 1;
-        self.buf.remove(self.cursor);
+        let start = self.prev_char(self.cursor);
+        self.buf.drain(start..self.cursor);
+        self.cursor = start;
         Reaction::Write(self.redraw())
     }
 
@@ -399,7 +412,8 @@ impl LineEditor {
         if self.cursor >= self.buf.len() {
             return Reaction::Ignore;
         }
-        self.buf.remove(self.cursor);
+        let end = self.next_char(self.cursor);
+        self.buf.drain(self.cursor..end);
         Reaction::Write(self.redraw())
     }
 
@@ -417,7 +431,7 @@ impl LineEditor {
         if self.cursor == 0 {
             return Reaction::Ignore;
         }
-        self.cursor -= 1;
+        self.cursor = self.prev_char(self.cursor);
         Reaction::Write(b"\x1b[D".to_vec())
     }
 
@@ -425,7 +439,7 @@ impl LineEditor {
         if self.cursor >= self.buf.len() {
             return Reaction::Ignore;
         }
-        self.cursor += 1;
+        self.cursor = self.next_char(self.cursor);
         Reaction::Write(b"\x1b[C".to_vec())
     }
 
@@ -433,7 +447,7 @@ impl LineEditor {
         if self.cursor == 0 {
             return Reaction::Ignore;
         }
-        self.buf.drain(0..self.cursor);
+        self.kill = self.buf.drain(0..self.cursor).collect();
         self.cursor = 0;
         Reaction::Write(self.redraw())
     }
@@ -442,7 +456,7 @@ impl LineEditor {
         if self.cursor >= self.buf.len() {
             return Reaction::Ignore;
         }
-        self.buf.truncate(self.cursor);
+        self.kill = self.buf.split_off(self.cursor);
         Reaction::Write(self.redraw())
     }
 
@@ -457,8 +471,22 @@ impl LineEditor {
         while start > 0 && !self.buf[start - 1].is_ascii_whitespace() {
             start -= 1;
         }
-        self.buf.drain(start..self.cursor);
+        self.kill = self.buf.drain(start..self.cursor).collect();
         self.cursor = start;
+        Reaction::Write(self.redraw())
+    }
+
+    /// Ctrl-Y: reinsert the last killed text at the cursor, as readline does.
+    fn yank(&mut self) -> Reaction {
+        if self.kill.is_empty() || self.buf.len() + self.kill.len() > self.max_line {
+            return Reaction::Ignore;
+        }
+        let kill = std::mem::take(&mut self.kill);
+        self.buf
+            .splice(self.cursor..self.cursor, kill.iter().copied());
+        self.cursor += kill.len();
+        self.kill = kill;
+        self.hist_pos = None;
         Reaction::Write(self.redraw())
     }
 
@@ -549,6 +577,24 @@ impl LineEditor {
         start
     }
 
+    /// Byte index of the character before `i`.
+    fn prev_char(&self, i: usize) -> usize {
+        let mut start = i - 1;
+        while start > 0 && is_continuation(self.buf[start]) {
+            start -= 1;
+        }
+        start
+    }
+
+    /// Byte index just past the character starting at `i`.
+    fn next_char(&self, i: usize) -> usize {
+        let mut end = i + 1;
+        while end < self.buf.len() && is_continuation(self.buf[end]) {
+            end += 1;
+        }
+        end
+    }
+
     /// Redraw the whole line: return to column 0, reprint prompt + buffer,
     /// clear any trailing leftovers, and reposition the cursor.
     fn redraw(&self) -> Vec<u8> {
@@ -557,12 +603,23 @@ impl LineEditor {
         out.extend_from_slice(&self.prompt);
         out.extend_from_slice(&self.buf);
         out.extend_from_slice(b"\x1b[K");
-        let back = self.buf.len() - self.cursor;
+        // ponytail: one column per character, so a wide CJK glyph or a
+        // combining mark leaves the cursor a column out; upgrade when the box
+        // has to look right under a non-Latin locale.
+        let back = self.buf[self.cursor..]
+            .iter()
+            .filter(|b| !is_continuation(**b))
+            .count();
         if back > 0 {
             out.extend_from_slice(format!("\x1b[{back}D").as_bytes());
         }
         out
     }
+}
+
+/// True if `b` continues a multi-byte UTF-8 character rather than starting one.
+pub(crate) fn is_continuation(b: u8) -> bool {
+    b & 0xc0 == 0x80
 }
 
 /// True if `haystack` contains `needle` as a contiguous byte substring.
@@ -764,6 +821,96 @@ mod tests {
         feed(&mut e, b"cat /etc/pass");
         e.apply_completion("/etc/passwd", true);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("cat /etc/passwd "));
+    }
+
+    #[test]
+    fn non_ascii_reaches_the_submitted_line() {
+        let mut e = editor();
+        assert_eq!(
+            feed(&mut e, "ééunicode\r".as_bytes()).as_deref(),
+            Some("ééunicode")
+        );
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_character() {
+        let mut e = editor();
+        feed(&mut e, "aé".as_bytes());
+        e.input(0x7f);
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn delete_removes_a_whole_character() {
+        let mut e = editor();
+        feed(&mut e, "éa".as_bytes());
+        e.input(0x01); // home
+        e.input(0x04); // Ctrl-D deletes 'é' whole
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cursor_moves_and_redraws_by_column_not_byte() {
+        let mut e = editor();
+        feed(&mut e, "é".as_bytes());
+        // Left arrow steps over both bytes of 'é' but is one column.
+        assert_eq!(e.input(ESC), Reaction::Ignore);
+        assert_eq!(e.input(b'['), Reaction::Ignore);
+        assert_eq!(e.input(b'D'), Reaction::Write(b"\x1b[D".to_vec()));
+        assert_eq!(e.cursor, 0);
+        // Inserting before it redraws with the cursor one column back, not two.
+        assert_eq!(
+            e.input(b'x'),
+            Reaction::Write("\r$ xé\x1b[K\x1b[1D".as_bytes().to_vec())
+        );
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("xé"));
+    }
+
+    #[test]
+    fn ctrl_u_then_ctrl_y_restores_the_line() {
+        let mut e = editor();
+        feed(&mut e, b"rm -rf /");
+        e.input(0x15); // Ctrl-U
+        e.input(0x19); // Ctrl-Y
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("rm -rf /"));
+    }
+
+    #[test]
+    fn ctrl_k_kill_yanks_at_the_cursor() {
+        let mut e = editor();
+        feed(&mut e, b"hello world");
+        e.input(0x01); // home
+        e.input(0x0b); // Ctrl-K takes the whole line
+        feed(&mut e, b"echo ");
+        e.input(0x19); // Ctrl-Y
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("echo hello world"));
+    }
+
+    #[test]
+    fn ctrl_w_kill_is_yankable_and_repeatable() {
+        let mut e = editor();
+        feed(&mut e, b"cat passwd");
+        e.input(0x17); // Ctrl-W takes "passwd"
+        e.input(0x19); // yank it back
+        e.input(0x19); // and again — the kill survives a yank
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("cat passwdpasswd"));
+    }
+
+    #[test]
+    fn yank_is_bounded_by_max_line() {
+        let mut e = LineEditor::new(8, 10);
+        e.set_prompt("$ ");
+        feed(&mut e, b"aaaaaaaa");
+        e.input(0x15); // Ctrl-U kills all 8
+        feed(&mut e, b"bbb");
+        assert_eq!(e.input(0x19), Reaction::Ignore); // would exceed max_line
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn yank_with_nothing_killed_does_nothing() {
+        let mut e = editor();
+        assert_eq!(e.input(0x19), Reaction::Ignore);
     }
 
     #[test]
