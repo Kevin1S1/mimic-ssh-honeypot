@@ -2809,6 +2809,21 @@ mod tests {
         let cwd = shell.cwd;
         shell.vfs.add_file(cwd, "trav.tar", bytes, 0o644, 0, 0);
 
+        // Listing is the asymmetric half: it warns about the prefix it would
+        // strip, prints every stored name unchanged, and succeeds — the `..`
+        // refusal belongs to extraction alone.
+        assert_eq!(
+            run(&mut shell, "tar tf trav.tar"),
+            "tar: Removing leading `../' from member names\n\
+             ../evil\n\
+             tar: Removing leading `a/../../' from member names\n\
+             a/../../etc/passwd\n\
+             tar: Removing leading `/' from member names\n\
+             /abs\n\
+             ok\n"
+        );
+        assert_eq!(shell.last_status, 0);
+
         run(&mut shell, "mkdir /tmp/out && cd /tmp/out");
         let out = run(&mut shell, "tar xf /root/trav.tar");
         assert_eq!(
