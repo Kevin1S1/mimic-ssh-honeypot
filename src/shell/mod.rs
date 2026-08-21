@@ -428,14 +428,15 @@ impl Shell {
     /// goes where the open did even if the command moves the working directory
     /// out from under the path, exactly as an already-open descriptor does.
     fn open_redirect(&mut self, path: &str, append: bool) -> Result<Option<NodeId>, String> {
-        if path == DEV_NULL {
-            return Ok(None);
-        }
-        let (parent, name) = self
-            .resolve_parent(path)
+        let (parent, name) = commands::fs::resolve_parent(self, path)
             .ok_or_else(|| format!("-bash: {path}: No such file or directory\n"))?;
 
         if let Some(existing) = self.vfs.child(parent, &name) {
+            // Matched by node, not by path, so `cd /dev && echo x > null` is
+            // swallowed too rather than filling the bit bucket up.
+            if Some(existing) == self.vfs.resolve(self.vfs.root(), DEV_NULL) {
+                return Ok(None);
+            }
             let meta = &self.vfs.node(existing).meta;
             if meta.is_dir() {
                 return Err(format!("-bash: {path}: Is a directory\n"));
@@ -513,21 +514,6 @@ impl Shell {
             return Err(format!("-bash: {}: No space left on device\n", sink.path));
         }
         Ok(())
-    }
-
-    /// Resolve `path` to the `(parent_directory, final_name)` pair a redirect
-    /// creates its target in.
-    fn resolve_parent(&self, path: &str) -> Option<(NodeId, String)> {
-        let path = path.strip_suffix('/').unwrap_or(path);
-        let (dir, name) = Vfs::split_path(path);
-        if name.is_empty() || name == "." || name == ".." {
-            return None;
-        }
-        let parent = self.vfs.resolve(self.cwd, dir)?;
-        if !self.vfs.node(parent).meta.is_dir() {
-            return None;
-        }
-        Some((parent, name.to_string()))
     }
 
     /// Run one command line: split it on `;`, `&&`, and `||`, then for each
@@ -830,9 +816,12 @@ mod tests {
             .text
             .contains("No such file or directory"));
 
-        // /dev/null discards without growing.
+        // /dev/null discards without growing, however it is reached.
         assert_eq!(shell.execute("echo noise > /dev/null").text, "");
         assert_eq!(shell.execute("cat /dev/null").text, "");
+        shell.execute("cd /dev && echo noise > null");
+        assert_eq!(shell.execute("cat /dev/null").text, "");
+        shell.execute("cd /tmp");
 
         // A missing directory, and a target that is a directory.
         let out = shell.execute("echo x > /nope/f");
