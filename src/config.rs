@@ -78,8 +78,9 @@ pub struct LoggingConfig {
 pub struct AuthConfig {
     /// Strategy used to decide whether a login attempt succeeds.
     pub mode: AuthMode,
-    /// For [`AuthMode::AcceptAfter`], how many failed attempts to allow before
-    /// granting access (mimics an attacker "guessing" the password).
+    /// For [`AuthMode::AcceptAfter`], which attempt succeeds: the first
+    /// `accept_after - 1` are rejected and the `accept_after`th is accepted
+    /// (mimics an attacker "guessing" the password).
     pub accept_after: u32,
     /// For [`AuthMode::Credentials`], the set of accepted username/password
     /// pairs.

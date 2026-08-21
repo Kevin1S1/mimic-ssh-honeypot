@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a variable's value is data, not an extra command.
 
 ### Fixed
+- `README.md` described `accept_after` off by one — it said the first N attempts
+  are rejected, when `accept_after = N` rejects N−1 and accepts the Nth.
+  `deploy/mimic.toml` already had it right; an operator following the README
+  would have configured one more failed attempt than they wanted.
 - A truncated SCP upload logged the SHA-256 of the stored prefix while reporting
   the full `size`, so the recorded hash matched neither the payload the attacker
   sent nor anything in an IOC feed. The whole body is now hashed as it streams
