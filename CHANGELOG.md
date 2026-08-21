@@ -68,7 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to identify the honeypot, and it broke any pasted script carrying a comment
   line. A comment now runs to the end of the line and takes any `;`/`&&`/`|` in
   it with it, while a `#` that does not start a word stays data (`echo a#b`,
-  `echo '#!/bin/sh' > /tmp/x`, `$#`). Comments are cut before variable
+  `echo '#!/bin/sh' > /tmp/x`). Comments are cut before variable
   expansion, so a `#` arriving in a variable's value cannot comment out the rest
   of the line. The full line, comment included, is still what gets logged and
   kept in `history`, as bash does.
