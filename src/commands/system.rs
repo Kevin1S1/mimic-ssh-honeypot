@@ -370,6 +370,10 @@ fn interpret_escapes(s: &str) -> (String, bool) {
             Some('v') => out.push('\x0b'),
             // `\0NNN` takes up to three octal digits, `\xHH` up to two hex
             // ones; with no digits at all both are the character itself.
+            // ponytail: a command's output is a `String`, so a code above 127
+            // becomes that Unicode scalar's UTF-8 bytes where real echo writes
+            // the single byte — `echo -e '\xff' | wc -c` reads 3, not 2.
+            // Upgrade when command output becomes a byte buffer.
             Some('0') => out.push(take_code(&mut chars, 8, 3).unwrap_or('\0')),
             Some('x') => match take_code(&mut chars, 16, 2) {
                 Some(c) => out.push(c),
