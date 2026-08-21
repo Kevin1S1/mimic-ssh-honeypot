@@ -49,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `truncated` is set.
 
 ### Security
+- `#` comments are no longer run as a command. `# comment` answered
+  `-bash: #: command not found`, which no real shell does — a one-keystroke way
+  to identify the honeypot, and it broke any pasted script carrying a comment
+  line. A comment now runs to the end of the line and takes any `;`/`&&`/`|` in
+  it with it, while a `#` that does not start a word stays data (`echo a#b`,
+  `echo '#!/bin/sh' > /tmp/x`, `$#`). Comments are cut before variable
+  expansion, so a `#` arriving in a variable's value cannot comment out the rest
+  of the line. The full line, comment included, is still what gets logged and
+  kept in `history`, as bash does.
 - `ls -l` printed no `total` line unless `-a`/`-A` was given, and when it did
   print one the figure was always `8`. GNU `ls` heads every long directory
   listing with the disk usage of the entries below it, so both the missing line
