@@ -336,6 +336,21 @@ mod tests {
     }
 
     #[test]
+    fn path_completion_over_names_sharing_a_lead_byte() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("mkdir /tmp/éa /tmp/êb");
+        // Both names begin with the same UTF-8 lead byte, so the common prefix
+        // has to stop at a character boundary rather than half of one.
+        match complete(&shell, "/tmp/", false) {
+            Completion::Listing(items) => {
+                assert!(items.iter().any(|i| i.starts_with("éa")));
+                assert!(items.iter().any(|i| i.starts_with("êb")));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn lcp_basic() {
         assert_eq!(longest_common_prefix(&["apt", "apt-get"]), "apt");
         assert_eq!(longest_common_prefix(&["cat", "cd"]), "c");

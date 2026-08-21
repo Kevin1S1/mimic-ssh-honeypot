@@ -130,7 +130,13 @@ impl LineEditor {
             self.buf.push(b' ');
         }
         if self.buf.len() + tail.len() > self.max_line {
-            tail.truncate(self.max_line.saturating_sub(self.buf.len()));
+            // Trim the overflow back to a character boundary, so what is kept
+            // is still the text the client typed.
+            let mut keep = self.max_line.saturating_sub(self.buf.len());
+            while keep > 0 && is_continuation(tail[keep]) {
+                keep -= 1;
+            }
+            tail.truncate(keep);
         }
         self.cursor = self.buf.len();
         self.buf.append(&mut tail);
@@ -911,6 +917,17 @@ mod tests {
     fn yank_with_nothing_killed_does_nothing() {
         let mut e = editor();
         assert_eq!(e.input(0x19), Reaction::Ignore);
+    }
+
+    #[test]
+    fn completion_trims_the_tail_at_a_character_boundary() {
+        let mut e = LineEditor::new(5, 10);
+        e.set_prompt("$ ");
+        feed(&mut e, "xé".as_bytes()); // 3 bytes
+        e.input(0x01); // home, so "xé" is the tail
+        e.apply_completion("cmd", false);
+        // Only "x" fits after "cmd"; half of 'é' must not be kept.
+        assert_eq!(feed(&mut e, b"\r").as_deref(), Some("cmdx"));
     }
 
     #[test]
