@@ -306,7 +306,10 @@ fn word_end(s: &str, start: usize) -> usize {
 }
 
 /// Split `line` into argument words. Quotes group whitespace; backslash escapes
-/// the next character (outside single quotes).
+/// the next character outside quotes, and inside double quotes only the four
+/// characters bash lets it escape there (`$`, `` ` ``, `"`, `\`) — every other
+/// backslash inside double quotes is an ordinary character, which is how
+/// `echo -e "a\tb"` reaches `echo` with its escapes still in it.
 pub fn tokenize(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
@@ -325,13 +328,23 @@ pub fn tokenize(line: &str) -> Vec<String> {
                 in_double = !in_double;
                 has_token = true;
             }
-            '\\' if !in_single => {
-                if let Some(&next) = chars.peek() {
+            '\\' if !in_single => match chars.peek() {
+                // Inside double quotes a backslash is only special in front of
+                // these; anywhere else there it is a literal character that the
+                // command receives, so `echo -e "a\tb"` still has a `\t` to
+                // interpret and `grep "\." f` matches a literal dot.
+                Some(&next) if !in_double || matches!(next, '$' | '`' | '"' | '\\') => {
                     cur.push(next);
                     chars.next();
                     has_token = true;
                 }
-            }
+                Some(_) => {
+                    cur.push('\\');
+                    has_token = true;
+                }
+                // A trailing backslash with nothing after it.
+                None => {}
+            },
             c if c.is_whitespace() && !in_single && !in_double => {
                 if has_token {
                     tokens.push(std::mem::take(&mut cur));
@@ -480,6 +493,18 @@ mod tests {
         // The target keeps its quoting and `$VAR` for the caller to expand.
         let (_, redirects) = split_redirects(r#"echo hi > "$HOME/my file""#).unwrap();
         assert_eq!(redirects[0].target, file(r#""$HOME/my file""#, false));
+    }
+
+    #[test]
+    fn backslashes_inside_double_quotes_survive_to_the_command() {
+        // Only `$`, backtick, `"` and `\` are escapable inside double quotes.
+        assert_eq!(tokenize(r#""a\tb\nc""#), vec![r"a\tb\nc"]);
+        assert_eq!(tokenize(r#""a\"b\\c""#), vec![r#"a"b\c"#]);
+        assert_eq!(tokenize(r#""cost: \$5""#), vec!["cost: $5"]);
+        // Unquoted and single-quoted behaviour is unchanged.
+        assert_eq!(tokenize(r"a\tb"), vec!["atb"]);
+        assert_eq!(tokenize(r"one\ word"), vec!["one word"]);
+        assert_eq!(tokenize(r"'a\tb'"), vec![r"a\tb"]);
     }
 
     #[test]
