@@ -955,6 +955,7 @@ fn format_columns(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AuthConfig;
     use crate::network::limiter::ConnectionRegistry;
     use crate::network::scp::CompletedFile;
 
@@ -1031,6 +1032,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `accept_after = N` accepts the Nth attempt, not the (N+1)th — the README
+    /// and `deploy/mimic.toml` promise an operator that exact count.
+    #[test]
+    fn accept_after_grants_on_the_nth_attempt() {
+        let mut handler = test_handler(std::env::temp_dir(), 1024);
+        handler.config = Arc::new(Config {
+            auth: AuthConfig {
+                mode: AuthMode::AcceptAfter,
+                accept_after: 2,
+                credentials: Vec::new(),
+            },
+            ..Config::default()
+        });
+
+        let mut decisions = Vec::new();
+        for _ in 0..3 {
+            handler.auth_attempts += 1;
+            decisions.push(handler.decide_auth("root", "hunter2"));
+        }
+        assert_eq!(decisions, vec![false, true, true]);
     }
 
     #[test]

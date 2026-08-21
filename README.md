@@ -183,7 +183,7 @@ dir            = "/data/logs"    # omit to keep stdout-only logging
 [auth]
 # accept_all   – every password succeeds immediately (maximum interaction)
 # reject_all   – capture creds only, never grant a shell
-# accept_after – succeed after N failed attempts (mimics "guessing" the password)
+# accept_after – succeed on the Nth attempt (mimics "guessing" the password)
 # credentials  – only specific username/password pairs succeed
 mode         = "accept_after"
 accept_after = 2
@@ -199,7 +199,7 @@ accept_after = 2
 |---|---|---|
 | `accept_all` | Every password works on the first try | Maximum attacker interaction, capturing commands |
 | `reject_all` | Always rejects — captures creds but never grants a shell | Passive credential harvesting only |
-| `accept_after` | Rejects the first N attempts, then accepts | Realistic (attackers expect a few tries) |
+| `accept_after` | Rejects the first N−1 attempts and accepts the Nth (`accept_after = 2` → the second password works) | Realistic (attackers expect a few tries) |
 | `credentials` | Only specific pairs succeed | Targeted studies |
 
 ---

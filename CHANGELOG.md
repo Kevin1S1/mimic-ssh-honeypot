@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a variable's value is data, not an extra command.
 
 ### Fixed
+- `README.md` described `accept_after` off by one — it said the first N attempts
+  are rejected, when `accept_after = N` rejects N−1 and accepts the Nth.
+  `deploy/mimic.toml` already had it right; an operator following the README
+  would have configured one more failed attempt than they wanted.
 - A truncated SCP upload logged the SHA-256 of the stored prefix while reporting
   the full `size`, so the recorded hash matched neither the payload the attacker
   sent nor anything in an IOC feed. The whole body is now hashed as it streams
@@ -51,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the constant were one-glance honeypot tells. The total is now summed from
   the listed entries, on an ext4-shaped model (4 KiB blocks, empty files and
   short symlinks occupying none), and moves as files are created and written.
+- Backslashes inside double quotes were eaten by the tokenizer, so
+  `echo -e "a\tb\nc"` printed `atbnc`. Bash only lets a backslash escape `$`,
+  `` ` ``, `"` and `\` inside double quotes and passes every other one through;
+  the command now receives what bash would give it, and `echo -e` interprets the
+  full GNU escape table (`\e`, `\v`, `\f`, `\0NNN`, `\xHH`, `\c` as well as the
+  escapes it already knew). This is the form bot payloads use, and with output
+  redirection those bytes now land in the VFS as the capture — so a mangled
+  escape corrupted the recorded payload as well as the illusion.
 - The 1 MiB output cap now bounds a whole command line, not just one command:
   a chained line could otherwise multiply the per-command cap by the number of
   segments that fit in the 4096-byte input limit.

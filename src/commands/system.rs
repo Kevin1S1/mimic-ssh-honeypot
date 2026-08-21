@@ -338,17 +338,19 @@ pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
     }
 
     let mut text = args[idx..].join(" ");
+    let mut stopped = false;
     if interpret {
-        text = interpret_escapes(&text);
+        (text, stopped) = interpret_escapes(&text);
     }
-    if !no_newline {
+    if !no_newline && !stopped {
         text.push('\n');
     }
     CommandResult::ok(text)
 }
 
-/// Interpret the backslash escapes `echo -e` understands.
-fn interpret_escapes(s: &str) -> String {
+/// Interpret the backslash escapes `echo -e` understands. The flag is set by
+/// `\c`, which ends the output there and takes the trailing newline with it.
+fn interpret_escapes(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -363,7 +365,18 @@ fn interpret_escapes(s: &str) -> String {
             Some('\\') => out.push('\\'),
             Some('a') => out.push('\x07'),
             Some('b') => out.push('\x08'),
-            Some('0') => out.push('\0'),
+            Some('e') | Some('E') => out.push('\x1b'),
+            Some('f') => out.push('\x0c'),
+            Some('v') => out.push('\x0b'),
+            // `\0NNN` takes up to three octal digits, `\xHH` up to two hex
+            // ones; with no digits at all both are the character itself.
+            Some('0') => out.push(take_code(&mut chars, 8, 3).unwrap_or('\0')),
+            Some('x') => match take_code(&mut chars, 16, 2) {
+                Some(c) => out.push(c),
+                None => out.push_str("\\x"),
+            },
+            // `\c` drops the rest of the output, trailing newline included.
+            Some('c') => return (out, true),
             Some(other) => {
                 out.push('\\');
                 out.push(other);
@@ -371,7 +384,28 @@ fn interpret_escapes(s: &str) -> String {
             None => out.push('\\'),
         }
     }
-    out
+    (out, false)
+}
+
+/// Read up to `max` digits in `radix` off `chars` and return the character
+/// they encode, or `None` if the next character is not a digit in that radix.
+fn take_code(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    radix: u32,
+    max: usize,
+) -> Option<char> {
+    let mut value = 0u32;
+    let mut digits = 0;
+    while digits < max {
+        let Some(d) = chars.peek().and_then(|c| c.to_digit(radix)) else {
+            break;
+        };
+        value = value * radix + d;
+        chars.next();
+        digits += 1;
+    }
+    // Every value a byte escape can name is a valid `char`.
+    (digits > 0).then(|| char::from(value as u8))
 }
 
 /// `env` / `printenv`
@@ -1396,6 +1430,17 @@ mod tests {
         assert_eq!(run(&mut shell, r"echo -e 'a\tb'"), "a\tb\n");
         // Without -e, the escape stays literal.
         assert_eq!(run(&mut shell, r"echo 'a\tb'"), "a\\tb\n");
+        // Double quotes leave a backslash alone unless it escapes one of the
+        // four characters that are special inside them, so `echo -e` gets the
+        // same string it would in bash.
+        assert_eq!(run(&mut shell, "echo -e \"a\\tb\\nc\""), "a\tb\nc\n");
+        assert_eq!(run(&mut shell, "echo \"a\\tb\""), "a\\tb\n");
+        assert_eq!(run(&mut shell, "echo \"a\\\"b\\\\c\""), "a\"b\\c\n");
+        // The rest of the GNU escape table.
+        assert_eq!(run(&mut shell, r"echo -e 'x\e[0m'"), "x\x1b[0m\n");
+        assert_eq!(run(&mut shell, r"echo -e '\0101\x42\x2'"), "AB\x02\n");
+        assert_eq!(run(&mut shell, r"echo -e 'no newline\c'"), "no newline");
+        assert_eq!(run(&mut shell, r"echo -e 'keep\q\xzz'"), "keep\\q\\xzz\n");
     }
 
     #[test]
