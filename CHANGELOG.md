@@ -49,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `truncated` is set.
 
 ### Security
+- `cd` now needs a directory's execute (search) bit. An unprivileged session
+  could `cd /root` and watch the prompt change while `ls /root` in that same
+  directory answered `Permission denied` — a box that contradicts itself on two
+  consecutive commands. `cd` into a directory the session cannot enter now
+  fails with bash's `-bash: cd: /root: Permission denied` and leaves the shell
+  where it was. `cd -` is checked the same way, since the directory may have
+  become unreachable since the shell left it.
+- `sudo -i` and `sudo -s` printed the usage block. They are the two most common
+  ways an attacker asks for a root shell, and a `sudo` that rejects its own
+  documented flags is a tell; both now hand over a root shell for the rest of
+  the session, the way `su` does. `-i` is a login shell (root's environment and
+  home); `-s` only changes the identity, leaving the caller's directory and
+  `$HOME` alone, as Debian's sudoers does without `always_set_home`. `sudo -i
+  COMMAND` still runs just that command as root.
 - `#` comments are no longer run as a command. `# comment` answered
   `-bash: #: command not found`, which no real shell does — a one-keystroke way
   to identify the honeypot, and it broke any pasted script carrying a comment

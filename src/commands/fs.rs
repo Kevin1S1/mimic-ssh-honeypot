@@ -321,14 +321,16 @@ fn gid_name(gid: u32) -> String {
 
 /// `cd [DIR]`
 pub fn cd(shell: &mut Shell, args: &[String]) -> CommandResult {
+    // `cd -` goes back to the previous directory and prints where it landed;
+    // every other form is silent. It resolves and is permission-checked like
+    // any other destination, since the directory may have become unreachable
+    // since the shell was last in it.
+    let mut announce = false;
     let target_path = match args.first().map(String::as_str) {
         None | Some("~") => shell.vfs.path_of(shell.home),
         Some("-") => {
-            let prev = shell.vfs.path_of(shell.prev_cwd);
-            // `cd -` swaps to the previous directory and prints where it landed.
-            std::mem::swap(&mut shell.prev_cwd, &mut shell.cwd);
-            shell.env.set("PWD", &prev);
-            return CommandResult::ok(format!("{prev}\n"));
+            announce = true;
+            shell.vfs.path_of(shell.prev_cwd)
         }
         Some(path) if path.starts_with("~/") => {
             format!("{}/{}", shell.vfs.path_of(shell.home), &path[2..])
@@ -343,15 +345,26 @@ pub fn cd(shell: &mut Shell, args: &[String]) -> CommandResult {
         );
     };
 
-    if !shell.vfs.node(target).meta.is_dir() {
+    let meta = &shell.vfs.node(target).meta;
+    if !meta.is_dir() {
         return CommandResult::err(format!("-bash: cd: {target_path}: Not a directory\n"), 1);
+    }
+    // Entering a directory needs its execute (search) bit. Without this an
+    // unprivileged session could `cd /root` and watch the prompt change while
+    // `ls /root` in the same directory said `Permission denied`.
+    if !meta.executable_by(shell.uid, shell.gid) {
+        return CommandResult::err(format!("-bash: cd: {target_path}: Permission denied\n"), 1);
     }
 
     shell.prev_cwd = shell.cwd;
     shell.cwd = target;
     let pwd = shell.vfs.path_of(target);
     shell.env.set("PWD", &pwd);
-    CommandResult::empty()
+    if announce {
+        CommandResult::ok(format!("{pwd}\n"))
+    } else {
+        CommandResult::empty()
+    }
 }
 
 /// `pwd`
@@ -1860,6 +1873,42 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert!(run(&mut shell, "cd /nope").contains("No such file or directory"));
         assert!(run(&mut shell, "cd /etc/hostname").contains("Not a directory"));
+    }
+
+    #[test]
+    fn cd_needs_the_directorys_search_bit() {
+        let mut user = Shell::new("attacker", "debian");
+
+        // `/root` is 0700: entering it has to fail the way `ls /root` already
+        // does, and leave the session where it was.
+        assert_eq!(
+            run(&mut user, "cd /root"),
+            "-bash: cd: /root: Permission denied\n"
+        );
+        assert_eq!(user.last_status, 1);
+        assert_eq!(run(&mut user, "pwd"), "/home/attacker\n");
+
+        // Their own directories are still theirs to enter.
+        run(&mut user, "mkdir /tmp/mine && cd /tmp/mine");
+        assert_eq!(run(&mut user, "pwd"), "/tmp/mine\n");
+
+        // Root goes anywhere, as it does everywhere else in the VFS.
+        let mut root = Shell::new("root", "debian");
+        assert_eq!(run(&mut root, "cd /root"), "");
+        assert_eq!(run(&mut root, "pwd"), "/root\n");
+
+        // `cd -` is checked too: it is a destination like any other, and the
+        // directory may have become unreachable since the shell left it.
+        let mut user = Shell::new("attacker", "debian");
+        run(&mut user, "mkdir /tmp/locked && cd /tmp/locked");
+        assert_eq!(run(&mut user, "pwd"), "/tmp/locked\n");
+        run(&mut user, "cd /tmp");
+        run(&mut user, "chmod 600 /tmp/locked");
+        assert_eq!(
+            run(&mut user, "cd -"),
+            "-bash: cd: /tmp/locked: Permission denied\n"
+        );
+        assert_eq!(run(&mut user, "pwd"), "/tmp\n");
     }
 
     #[test]

@@ -228,17 +228,33 @@ pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
     super::dispatch(shell, &argv)
 }
 
-/// `sudo [-u USER] [-l] COMMAND [ARG]...`
+/// `sudo [-u USER] [-l] [-i | -s] COMMAND [ARG]...`
 ///
 /// The honeypot never gates this on a real password: the attacker's session
 /// credentials were already accepted at login, and `id` already reports
 /// membership in the `sudo` group, so denying here would be an inconsistent
 /// tell for no forensic benefit. Elevation only lasts for the wrapped
 /// command; the caller's uid/gid are restored afterward.
+///
+/// `-i` and `-s` with no command are the exception: they are the two common
+/// ways an attacker asks for a root *shell*, so they switch the session's
+/// identity for good, the way [`su`] does. `-i` is a login shell (root's
+/// environment and home); `-s` keeps the directory the caller was in.
 pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut login_shell = false;
+    let mut keep_cwd = false;
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.peek() {
         match arg.as_str() {
+            "-i" | "--login" => {
+                login_shell = true;
+                iter.next();
+            }
+            "-s" | "--shell" => {
+                login_shell = true;
+                keep_cwd = true;
+                iter.next();
+            }
             "-l" | "--list" => {
                 return CommandResult::ok(format!(
                     "Matching Defaults entries for {user} on {host}:\n    env_reset, mail_badpass, secure_path=/usr/local/sbin\\:/usr/local/bin\\:/usr/sbin\\:/usr/bin\\:/sbin\\:/bin\n\nUser {user} may run the following commands on {host}:\n    (ALL : ALL) ALL\n",
@@ -257,6 +273,23 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
         }
     }
     let rest: Vec<String> = iter.cloned().collect();
+    if rest.is_empty() && login_shell {
+        // A root shell for the rest of the session. `-i` is a login shell, so
+        // the switch is all of it. `-s` is not: Debian's sudoers resets the
+        // environment but does not set `always_set_home`, so the caller keeps
+        // their directory and `$HOME` and only the identity changes.
+        let (cwd, home) = (shell.cwd, shell.home);
+        shell.switch_user("root");
+        if keep_cwd {
+            shell.cwd = cwd;
+            shell.prev_cwd = cwd;
+            shell.home = home;
+            let (pwd, home) = (shell.vfs.path_of(cwd), shell.vfs.path_of(home));
+            shell.env.set("PWD", &pwd);
+            shell.env.set("HOME", &home);
+        }
+        return CommandResult::empty();
+    }
     if rest.is_empty() {
         return CommandResult::err(
             "usage: sudo -h | -K | -k | -V\n\
@@ -1353,6 +1386,42 @@ mod tests {
 
     fn run(shell: &mut Shell, line: &str) -> String {
         shell.execute(line).text
+    }
+
+    #[test]
+    fn sudo_dash_i_and_dash_s_hand_over_a_root_shell() {
+        // `-i` is a login shell: root's identity, environment, and home.
+        let mut shell = Shell::new("attacker", "debian");
+        assert_eq!(run(&mut shell, "sudo -i"), "");
+        assert_eq!(shell.last_status, 0);
+        assert_eq!(run(&mut shell, "whoami"), "root\n");
+        assert_eq!(run(&mut shell, "pwd"), "/root\n");
+        assert_eq!(shell.prompt(), "root@debian:~# ");
+        assert_eq!(run(&mut shell, "echo $HOME"), "/root\n");
+
+        // `-s` changes the identity but not where the caller stood: Debian's
+        // sudoers does not set `always_set_home`, so `$HOME` stays theirs too.
+        let mut shell = Shell::new("attacker", "debian");
+        run(&mut shell, "cd /tmp");
+        assert_eq!(run(&mut shell, "sudo -s"), "");
+        assert_eq!(run(&mut shell, "whoami"), "root\n");
+        assert_eq!(run(&mut shell, "pwd"), "/tmp\n");
+        assert_eq!(shell.prompt(), "root@debian:/tmp# ");
+        assert_eq!(run(&mut shell, "echo $HOME"), "/home/attacker\n");
+
+        // A flag with a command still runs just that command as root, without
+        // handing over the session.
+        let mut shell = Shell::new("attacker", "debian");
+        assert_eq!(
+            run(&mut shell, "sudo -i id"),
+            "uid=0(root) gid=0(root) groups=0(root)\n"
+        );
+        assert_eq!(run(&mut shell, "whoami"), "attacker\n");
+
+        // Everything else with no command is still the usage block.
+        let mut shell = Shell::new("attacker", "debian");
+        assert!(run(&mut shell, "sudo").contains("usage: sudo"));
+        assert_eq!(run(&mut shell, "whoami"), "attacker\n");
     }
 
     #[test]
