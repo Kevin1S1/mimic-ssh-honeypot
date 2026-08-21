@@ -4,7 +4,7 @@
 
 use super::CommandResult;
 use crate::shell::Shell;
-use crate::vfs::nodes::{NodeKind, S_IFDIR, S_IFLNK, S_IFMT};
+use crate::vfs::nodes::{Metadata, NodeKind, S_IFDIR, S_IFLNK, S_IFMT};
 use crate::vfs::{NodeId, Vfs};
 
 /// Flags parsed from a leading run of `-xyz` arguments.
@@ -1080,30 +1080,343 @@ fn apply_tar_flags(
     None
 }
 
-/// Non-empty, non-identifying placeholder bytes written by `tar -c`. Starts
-/// with the real gzip magic (`1f 8b 08 00`) so the file "looks" like a gzip
-/// stream at a glance, followed by random bytes — never a plaintext marker
-/// string, since an attacker who creates and then `cat`s the archive would
-/// otherwise read it directly (unlike the honest corrupt-archive errors
-/// `tar`'s own extract/list paths already give).
-const FAKE_ARCHIVE_BYTES: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x56, 0xc7, 0xb6, 0xee, 0x0d, 0xa0,
-    0xf8, 0x4b, 0xaf, 0x0c, 0xab, 0xea, 0xd2, 0x59, 0x3d, 0x8f, 0xc1, 0x3d, 0x59, 0x5f, 0x67, 0x2c,
-    0x22, 0x44,
-];
+/// One ustar record. Everything in an archive — headers, file contents, the
+/// end-of-archive marker — is a whole number of these.
+const TAR_BLOCK: usize = 512;
+
+/// GNU tar's default blocking factor: it pads the finished archive to a
+/// multiple of 20 records, which is why a real `.tar`'s size is always a
+/// multiple of 10240.
+const TAR_BLOCKING: usize = 20 * TAR_BLOCK;
+
+/// Copy `bytes` into a header field, truncating to the field width. Fields are
+/// NUL-padded, and the header starts zeroed, so short values need no padding.
+fn tar_put(header: &mut [u8; TAR_BLOCK], at: usize, width: usize, bytes: &[u8]) {
+    let n = bytes.len().min(width);
+    header[at..at + n].copy_from_slice(&bytes[..n]);
+}
+
+/// Write a ustar numeric field: zero-padded octal with a trailing NUL.
+fn tar_put_octal(header: &mut [u8; TAR_BLOCK], at: usize, width: usize, value: u64) {
+    let digits = format!("{value:0>width$o}", width = width - 1);
+    tar_put(header, at, width - 1, digits.as_bytes());
+}
+
+/// Read a ustar numeric field (octal, NUL- or space-terminated).
+fn tar_read_octal(field: &[u8]) -> u64 {
+    let text = String::from_utf8_lossy(field);
+    u64::from_str_radix(text.trim_matches(['\0', ' ']), 8).unwrap_or(0)
+}
+
+/// Read a NUL-terminated ustar text field.
+fn tar_read_str(field: &[u8]) -> String {
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+/// Split a member name across the ustar `prefix`/`name` fields, which hold 155
+/// and 100 bytes. Names that fit go in `name` alone; longer ones split at a
+/// `/`. A name too long to split either way is left for [`tar_put`] to
+/// truncate rather than rejected, since nothing here can act on the error.
+fn tar_split_name(name: &str) -> (&str, &str) {
+    if name.len() <= 100 {
+        return ("", name);
+    }
+    for (i, _) in name.match_indices('/') {
+        let (prefix, rest) = (&name[..i], &name[i + 1..]);
+        if prefix.len() <= 155 && rest.len() <= 100 {
+            return (prefix, rest);
+        }
+    }
+    ("", name)
+}
+
+/// Append one ustar header record describing `name`.
+fn tar_write_header(
+    name: &str,
+    link: &str,
+    meta: &Metadata,
+    typeflag: u8,
+    size: usize,
+    out: &mut Vec<u8>,
+) {
+    let mut h = [0u8; TAR_BLOCK];
+    let (prefix, stem) = tar_split_name(name);
+    tar_put(&mut h, 0, 100, stem.as_bytes());
+    tar_put_octal(&mut h, 100, 8, (meta.mode & 0o7777) as u64);
+    tar_put_octal(&mut h, 108, 8, meta.uid as u64);
+    tar_put_octal(&mut h, 116, 8, meta.gid as u64);
+    tar_put_octal(&mut h, 124, 12, size as u64);
+    tar_put_octal(&mut h, 136, 12, meta.mtime.max(0) as u64);
+    // The checksum is computed with its own field read as spaces.
+    h[148..156].fill(b' ');
+    h[156] = typeflag;
+    tar_put(&mut h, 157, 100, link.as_bytes());
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    tar_put(&mut h, 265, 32, uid_name(meta.uid).as_bytes());
+    tar_put(&mut h, 297, 32, gid_name(meta.gid).as_bytes());
+    tar_put(&mut h, 345, 155, prefix.as_bytes());
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    out.extend_from_slice(&h);
+}
+
+/// The archive `tar -c` is building, plus what it has to say about it.
+struct TarBuild {
+    bytes: Vec<u8>,
+    /// Warnings and, under `-v`, the member names as they are added.
+    log: String,
+    status: i32,
+    verbose: bool,
+    /// The archive's own node, when it already exists: a tree containing it
+    /// must skip it rather than read its own growing output.
+    archive: Option<NodeId>,
+}
+
+/// Depth-first walk appending `id` and everything under it to the archive,
+/// storing each member as `name`.
+///
+/// Permission checks mirror real `tar`: a directory it cannot read and a file
+/// it cannot open are both reported and skipped, so an unprivileged session
+/// cannot archive `/root` to read it back.
+fn tar_walk(shell: &Shell, id: NodeId, name: &str, build: &mut TarBuild) {
+    if build.archive == Some(id) {
+        build
+            .log
+            .push_str(&format!("tar: {name}: file is the archive; not dumped\n"));
+        return;
+    }
+    let node = shell.vfs.node(id);
+    match &node.kind {
+        NodeKind::Symlink { target } => {
+            tar_write_header(name, target, &node.meta, b'2', 0, &mut build.bytes);
+            if build.verbose {
+                build.log.push_str(&format!("{name}\n"));
+            }
+        }
+        NodeKind::File { contents } => {
+            if !node.meta.readable_by(shell.uid, shell.gid) {
+                build
+                    .log
+                    .push_str(&format!("tar: {name}: Cannot open: Permission denied\n"));
+                build.status = 2;
+                return;
+            }
+            tar_write_header(name, "", &node.meta, b'0', contents.len(), &mut build.bytes);
+            build.bytes.extend_from_slice(contents);
+            let pad = contents.len().next_multiple_of(TAR_BLOCK) - contents.len();
+            build.bytes.resize(build.bytes.len() + pad, 0);
+            if build.verbose {
+                build.log.push_str(&format!("{name}\n"));
+            }
+        }
+        NodeKind::Directory { .. } => {
+            let dir_name = format!("{}/", name.trim_end_matches('/'));
+            tar_write_header(&dir_name, "", &node.meta, b'5', 0, &mut build.bytes);
+            if build.verbose {
+                build.log.push_str(&format!("{dir_name}\n"));
+            }
+            if !node.meta.readable_by(shell.uid, shell.gid) {
+                build
+                    .log
+                    .push_str(&format!("tar: {name}: Cannot open: Permission denied\n"));
+                build.status = 2;
+                return;
+            }
+            for (child, child_id) in shell.vfs.entries(id).unwrap_or_default() {
+                tar_walk(shell, child_id, &format!("{dir_name}{child}"), build);
+            }
+        }
+    }
+}
+
+/// One member read out of an archive.
+struct TarEntry {
+    name: String,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: usize,
+    mtime: i64,
+    typeflag: u8,
+    link: String,
+    /// Offset of the member's contents within the archive bytes.
+    offset: usize,
+}
+
+/// Parse `data` as a ustar stream, or return `None` if it is not one — which
+/// is what a gzip-compressed or otherwise foreign upload looks like here.
+fn tar_parse(data: &[u8]) -> Option<Vec<TarEntry>> {
+    if data.len() < TAR_BLOCK || &data[257..262] != b"ustar" {
+        return None;
+    }
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while at + TAR_BLOCK <= data.len() {
+        let h = &data[at..at + TAR_BLOCK];
+        // Two zero records end the stream; the blocking-factor padding after
+        // them is zeros too, so the first one is enough to stop on.
+        if h.iter().all(|b| *b == 0) || &h[257..262] != b"ustar" {
+            break;
+        }
+        let prefix = tar_read_str(&h[345..500]);
+        let stem = tar_read_str(&h[0..100]);
+        let size = tar_read_octal(&h[124..136]) as usize;
+        entries.push(TarEntry {
+            name: if prefix.is_empty() {
+                stem
+            } else {
+                format!("{prefix}/{stem}")
+            },
+            mode: tar_read_octal(&h[100..108]) as u32 & 0o7777,
+            uid: tar_read_octal(&h[108..116]) as u32,
+            gid: tar_read_octal(&h[116..124]) as u32,
+            size,
+            mtime: tar_read_octal(&h[136..148]) as i64,
+            typeflag: h[156],
+            link: tar_read_str(&h[157..257]),
+            offset: at + TAR_BLOCK,
+        });
+        at = at.saturating_add(TAR_BLOCK + size.next_multiple_of(TAR_BLOCK));
+    }
+    Some(entries)
+}
+
+/// Whether a listed/extracted member is selected by the operands given after
+/// the archive (`tar xf a.tar dir/one`). No operands selects everything.
+fn tar_selected(name: &str, members: &[&str]) -> bool {
+    if members.is_empty() {
+        return true;
+    }
+    let name = name.trim_end_matches('/');
+    members.iter().any(|m| {
+        let m = strip_trailing_slashes(m).trim_start_matches('/');
+        name == m || name.starts_with(&format!("{m}/"))
+    })
+}
+
+/// Minimum width GNU tar gives the joined `owner/group` and size columns of a
+/// `-tv` listing. It widens to fit a long name or size — and, because tar
+/// keeps the widened value for the rest of the run, only from that member on.
+const TAR_UGSWIDTH: usize = 18;
+
+/// One `tar -tv` line: `ls -l`-shaped, but with `owner/group` joined and a
+/// full `YYYY-MM-DD HH:MM` date. `ugswidth` carries GNU tar's column width
+/// across the listing.
+fn tar_long_entry(entry: &TarEntry, ugswidth: &mut usize) -> String {
+    let type_bits = match entry.typeflag {
+        b'5' => S_IFDIR,
+        b'2' => S_IFLNK,
+        _ => 0,
+    };
+    let mode = mode_string(type_bits | entry.mode);
+    let owner = format!("{}/{}", uid_name(entry.uid), gid_name(entry.gid));
+    let size = entry.size.to_string();
+    *ugswidth = (*ugswidth).max(owner.len() + size.len());
+    let width = *ugswidth - owner.len();
+    let link = if entry.typeflag == b'2' {
+        format!(" -> {}", entry.link)
+    } else {
+        String::new()
+    };
+    let date = tar_date(entry.mtime);
+    format!(
+        "{mode} {owner} {size:>width$} {date} {}{link}\n",
+        entry.name
+    )
+}
+
+/// Format a member's mtime the way `tar -tv` does (`2024-05-03 00:00`, UTC).
+fn tar_date(ts: i64) -> String {
+    let (year, month, day) = civil_from_days(ts.div_euclid(86_400));
+    let secs = ts.rem_euclid(86_400);
+    let (hour, minute) = (secs / 3_600, (secs % 3_600) / 60);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+/// Whether any component of a member name is `..`. Real tar refuses to
+/// extract such a member outright rather than letting an uploaded archive
+/// pick where in the tree it lands.
+fn tar_has_dot_dot(name: &str) -> bool {
+    name.split('/').any(|c| c == "..")
+}
+
+/// Strip the leading run GNU tar drops from a member name — every component up
+/// to and including the last `..`, plus the slashes after it — warning the
+/// first time each distinct prefix is dropped, exactly as tar does. `warned`
+/// carries the last prefix warned about across the members of one run.
+fn tar_strip_leading<'a>(name: &'a str, warned: &mut String, log: &mut String) -> &'a str {
+    let b = name.as_bytes();
+    let mut prefix = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i..].starts_with(b"..") && (i + 2 == b.len() || b[i + 2] == b'/') {
+            prefix = i + 2;
+        }
+        while i < b.len() && b[i] != b'/' {
+            i += 1;
+        }
+        while i < b.len() && b[i] == b'/' {
+            i += 1;
+        }
+    }
+    while prefix < b.len() && b[prefix] == b'/' {
+        prefix += 1;
+    }
+    if prefix > 0 && warned.as_str() != &name[..prefix] {
+        warned.clear();
+        warned.push_str(&name[..prefix]);
+        log.push_str(&format!(
+            "tar: Removing leading `{warned}' from member names\n"
+        ));
+    }
+    &name[prefix..]
+}
+
+/// Create the directory chain leading to an extracted member, returning the
+/// parent directory and final name. Returns `None` if a component collides
+/// with a non-directory or the arena node cap refuses the `mkdir`.
+fn tar_dest(shell: &mut Shell, name: &str) -> Option<(NodeId, String)> {
+    // `..` never reaches here — the caller refuses those members — and `.` is
+    // a no-op component, as it is in any path.
+    if tar_has_dot_dot(name) {
+        return None;
+    }
+    let mut parts: Vec<&str> = name
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let last = parts.pop()?;
+    let (uid, gid) = (shell.uid, shell.gid);
+    let mut dir = shell.cwd;
+    for comp in parts {
+        let next = match shell.vfs.child(dir, comp) {
+            Some(existing) if shell.vfs.node(existing).meta.is_dir() => existing,
+            Some(_) => return None,
+            None => shell.vfs.mkdir(dir, comp, 0o755, uid, gid),
+        };
+        if next == dir {
+            return None; // node cap: `mkdir` dropped the insert
+        }
+        dir = next;
+    }
+    Some((dir, last.to_string()))
+}
 
 /// `tar [OPTION]... [-f ARCHIVE] [FILE]...`
 ///
-/// Only creation (`-c`) is emulated meaningfully: it writes a small non-empty
-/// placeholder archive into the VFS. Extraction (`-x`) and listing (`-t`)
-/// always report a corrupt/empty archive — which is honest, since every file
-/// an attacker can get onto this honeypot (faked `wget`/`curl` downloads, the
-/// VFS mirror of an SCP upload) is either a zero-byte placeholder or has no
-/// real archive structure. A real host fails identically on a 0-byte or
-/// garbage "archive".
+/// Creation (`-c`), listing (`-t`) and extraction (`-x`) all speak real POSIX
+/// ustar, so an archive created here round-trips through the emulator's own
+/// reader the way a scripted `tar czf … && tar xzf …` on a real box does.
+/// Anything that is not a ustar stream — a zero-byte `wget` placeholder, a
+/// genuinely gzip-compressed upload — still gets the honest errors real tools
+/// give.
 ///
-/// ponytail: no real (de)compression; upgrade only if genuinely round-tripping
-/// a created archive's contents is needed.
+/// ponytail: `-z`/`-j`/`-J` are accepted but nothing is ever compressed. That
+/// is unobservable from inside the box (no `file`, `gzip` or `gunzip` command,
+/// and the SSH layer refuses `scp -f` downloads); upgrade when any of those
+/// would let an attacker see the missing gzip container.
 pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut create = false;
     let mut extract = false;
@@ -1167,24 +1480,86 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
     }
 
     if create {
+        if members.is_empty() {
+            return CommandResult::err(
+                "tar: Cowardly refusing to create an empty archive\nTry 'tar --help' or 'tar --usage' for more information.\n",
+                2,
+            );
+        }
         let Some((parent, name)) = resolve_parent(shell, archive_path) else {
             return CommandResult::err(
                 format!("tar: {archive_path}: Cannot open: Not a directory\n"),
                 2,
             );
         };
-        let (uid, gid) = (shell.uid, shell.gid);
-        shell
+        if !shell
             .vfs
-            .add_file(parent, &name, FAKE_ARCHIVE_BYTES, 0o644, uid, gid);
-        let mut out = String::new();
-        if verbose {
-            for m in &members {
-                out.push_str(m);
-                out.push('\n');
-            }
+            .node(parent)
+            .meta
+            .writable_by(shell.uid, shell.gid)
+        {
+            return CommandResult::err(
+                format!(
+                    "tar: {archive_path}: Cannot open: Permission denied\ntar: Error is not recoverable: exiting now\n"
+                ),
+                2,
+            );
         }
-        return CommandResult::ok(out);
+        let mut build = TarBuild {
+            bytes: Vec::new(),
+            log: String::new(),
+            status: 0,
+            verbose,
+            archive: shell.vfs.child(parent, &name),
+        };
+        let mut warned = String::new();
+        for member in &members {
+            let Some(id) = shell.vfs.resolve(shell.cwd, member) else {
+                build.log.push_str(&format!(
+                    "tar: {member}: Cannot stat: No such file or directory\n"
+                ));
+                build.status = 2;
+                continue;
+            };
+            // An operand is stored relative, without the leading `/` or `../`
+            // run tar refuses to put in an archive.
+            let stored =
+                tar_strip_leading(strip_trailing_slashes(member), &mut warned, &mut build.log);
+            let stored = if stored.is_empty() { "." } else { stored };
+            tar_walk(shell, id, stored, &mut build);
+        }
+        // Two zero records end the stream, then GNU tar pads to its blocking
+        // factor — which is what makes a real archive's size a round 10240.
+        let TarBuild {
+            mut bytes,
+            mut log,
+            status,
+            ..
+        } = build;
+        bytes.resize(bytes.len() + 2 * TAR_BLOCK, 0);
+        bytes.resize(bytes.len().next_multiple_of(TAR_BLOCKING), 0);
+
+        let (uid, gid) = (shell.uid, shell.gid);
+        let written = bytes.len();
+        let id = shell.vfs.add_file(parent, &name, bytes, 0o644, uid, gid);
+        // The arena's byte cap drops an oversized write silently; a real box
+        // fills up too, so report it the way a full disk does rather than
+        // claiming an archive that is not there.
+        let stored_ok = matches!(
+            &shell.vfs.node(id).kind,
+            NodeKind::File { contents } if contents.len() == written
+        );
+        if !stored_ok {
+            // A full disk stops tar dead, before it can summarise anything else.
+            log.push_str(&format!(
+                "tar: {archive_path}: Cannot write: No space left on device\ntar: Error is not recoverable: exiting now\n"
+            ));
+            return CommandResult::err(log, 2);
+        }
+        if status != 0 {
+            log.push_str("tar: Exiting with failure status due to previous errors\n");
+        }
+        return finish(log, status);
     }
 
     if extract || list {
@@ -1196,27 +1571,133 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
                 2,
             );
         };
-        match &shell.vfs.node(id).kind {
-            NodeKind::Directory { .. } => {
-                return CommandResult::err(
-                    format!(
-                        "tar: {archive_path}: Cannot open: Is a directory\ntar: Error is not recoverable: exiting now\n"
-                    ),
-                    2,
-                );
-            }
-            NodeKind::File { contents } if contents.is_empty() => {
-                return CommandResult::err(
-                    "gzip: stdin: unexpected end of file\ntar: Child returned status 1\ntar: Error is not recoverable: exiting now\n",
-                    2,
-                );
-            }
-            _ => {}
+        let node = shell.vfs.node(id);
+        if node.meta.is_dir() {
+            return CommandResult::err(
+                format!(
+                    "tar: {archive_path}: Cannot open: Is a directory\ntar: Error is not recoverable: exiting now\n"
+                ),
+                2,
+            );
         }
-        return CommandResult::err(
-            "tar: This does not look like a tar archive\ntar: Exiting with failure status due to previous errors\n",
-            2,
-        );
+        if !node.meta.readable_by(shell.uid, shell.gid) {
+            return CommandResult::err(
+                format!(
+                    "tar: {archive_path}: Cannot open: Permission denied\ntar: Error is not recoverable: exiting now\n"
+                ),
+                2,
+            );
+        }
+        let NodeKind::File { contents } = &node.kind else {
+            return CommandResult::err(
+                "tar: This does not look like a tar archive\ntar: Exiting with failure status due to previous errors\n",
+                2,
+            );
+        };
+        if contents.is_empty() {
+            return CommandResult::err(
+                "gzip: stdin: unexpected end of file\ntar: Child returned status 1\ntar: Error is not recoverable: exiting now\n",
+                2,
+            );
+        }
+        let Some(entries) = tar_parse(contents) else {
+            return CommandResult::err(
+                "tar: This does not look like a tar archive\ntar: Exiting with failure status due to previous errors\n",
+                2,
+            );
+        };
+
+        if list {
+            let mut out = String::new();
+            let mut ugswidth = TAR_UGSWIDTH;
+            let mut warned = String::new();
+            for entry in entries.iter().filter(|e| tar_selected(&e.name, &members)) {
+                // A listing warns about the prefix it would strip on the way
+                // out, but prints the name the archive actually stores.
+                tar_strip_leading(&entry.name, &mut warned, &mut out);
+                if verbose {
+                    out.push_str(&tar_long_entry(entry, &mut ugswidth));
+                } else {
+                    out.push_str(&format!("{}\n", entry.name));
+                }
+            }
+            return CommandResult::ok(out);
+        }
+
+        // Extraction mutates the VFS, so take a copy of the archive bytes and
+        // let go of the borrow on it.
+        let data = contents.clone();
+        let (uid, gid) = (shell.uid, shell.gid);
+        let mut out = String::new();
+        let mut status = 0;
+        let mut warned = String::new();
+        for entry in entries {
+            if !tar_selected(&entry.name, &members) {
+                continue;
+            }
+            let member = tar_strip_leading(&entry.name, &mut warned, &mut out).to_string();
+            // A `..` left anywhere in the name is refused outright: an archive
+            // does not get to choose a path outside the one being extracted to.
+            if tar_has_dot_dot(&entry.name) {
+                out.push_str(&format!("tar: {}: Member name contains '..'\n", entry.name));
+                status = 2;
+                continue;
+            }
+            if verbose {
+                out.push_str(&format!("{member}\n"));
+            }
+            let Some((parent, name)) = tar_dest(shell, &member) else {
+                out.push_str(&format!(
+                    "tar: {member}: Cannot open: No such file or directory\n"
+                ));
+                status = 2;
+                continue;
+            };
+            if !shell.vfs.node(parent).meta.writable_by(uid, gid) {
+                out.push_str(&format!("tar: {member}: Cannot open: Permission denied\n"));
+                status = 2;
+                continue;
+            }
+            // Only root restores the archived ownership; for anyone else the
+            // extracted copy belongs to them, as it does on a real box.
+            let (owner, group) = if uid == 0 {
+                (entry.uid, entry.gid)
+            } else {
+                (uid, gid)
+            };
+            match entry.typeflag {
+                b'5' => {
+                    shell.vfs.mkdir(parent, &name, entry.mode, owner, group);
+                }
+                b'2' => {
+                    shell.vfs.add_symlink(parent, &name, &entry.link);
+                }
+                b'0' | 0 => {
+                    let end = entry.offset.saturating_add(entry.size).min(data.len());
+                    let body = &data[entry.offset.min(end)..end];
+                    let id = shell
+                        .vfs
+                        .add_file(parent, &name, body, entry.mode, owner, group);
+                    let stored_ok = matches!(
+                        &shell.vfs.node(id).kind,
+                        NodeKind::File { contents } if contents.len() == body.len()
+                    );
+                    if !stored_ok {
+                        out.push_str(&format!(
+                            "tar: {member}: Cannot write: No space left on device\n"
+                        ));
+                        status = 2;
+                    }
+                }
+                // Hard links, devices and FIFOs are not modelled; real tar
+                // skips what it cannot create and carries on.
+                _ => {}
+            }
+        }
+        if status != 0 {
+            out.push_str("tar: Exiting with failure status due to previous errors\n");
+        }
+        return finish(out, status);
     }
 
     CommandResult::err(
@@ -2171,21 +2652,195 @@ mod tests {
     }
 
     #[test]
-    fn tar_create_writes_placeholder_and_extract_reports_corrupt() {
+    fn tar_round_trips_a_created_archive() {
         let mut shell = Shell::new("root", "debian");
-        run(&mut shell, "touch /tmp/a");
-        assert_eq!(run(&mut shell, "tar czf /tmp/out.tar.gz /tmp/a"), "");
-        assert!(run(&mut shell, "ls /tmp").contains("out.tar.gz"));
-        // Extracting our own fake (non-gzip) archive reports a corrupt archive.
+        run(&mut shell, "mkdir -p /tmp/d/sub");
+        let cwd = shell.vfs.resolve(shell.cwd, "/tmp/d").unwrap();
+        shell.vfs.add_file(cwd, "one", "hello\n", 0o644, 0, 0);
+        let sub = shell.vfs.resolve(shell.cwd, "/tmp/d/sub").unwrap();
+        shell.vfs.add_file(sub, "two", "world\n", 0o600, 0, 0);
+
+        assert_eq!(run(&mut shell, "cd /tmp && tar czf out.tgz d"), "");
+        // A real archive is a whole number of 20-record blocks.
+        let size = match &shell
+            .vfs
+            .node(shell.vfs.resolve(shell.cwd, "out.tgz").unwrap())
+            .kind
+        {
+            NodeKind::File { contents } => contents.len(),
+            other => panic!("archive is not a file: {other:?}"),
+        };
+        assert_eq!(size % TAR_BLOCKING, 0);
+
+        // Listing shows every member, directories with a trailing slash.
+        let listed = run(&mut shell, "tar tzf out.tgz");
+        assert_eq!(listed, "d/\nd/one\nd/sub/\nd/sub/two\n");
+
+        // Extracting elsewhere reproduces the tree, contents and modes intact.
+        run(&mut shell, "mkdir /tmp/back && cd /tmp/back");
+        assert_eq!(run(&mut shell, "tar xzf /tmp/out.tgz"), "");
+        assert_eq!(run(&mut shell, "cat d/one"), "hello\n");
+        assert_eq!(run(&mut shell, "cat d/sub/two"), "world\n");
+        assert!(run(&mut shell, "ls -l d/sub").contains("-rw-------"));
+    }
+
+    #[test]
+    fn tar_lists_verbosely_and_selects_members() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir -p /tmp/d/sub");
+        let cwd = shell.vfs.resolve(shell.cwd, "/tmp/d").unwrap();
+        shell.vfs.add_file(cwd, "one", "hello\n", 0o644, 0, 0);
+        run(&mut shell, "cd /tmp && tar cf out.tar d");
+
+        // Byte-for-byte the shape GNU tar 1.35 prints: the joined owner/group
+        // and the size share an 18-column field, then a UTC `YYYY-MM-DD HH:MM`.
+        let long = run(&mut shell, "tar tvf out.tar");
         assert!(
-            run(&mut shell, "tar xzf /tmp/out.tar.gz").contains("does not look like a tar archive")
+            long.contains("drwxr-xr-x root/root         0 2024-05-03 00:00 d/\n"),
+            "unexpected listing: {long}"
         );
-        // Extracting a genuinely empty file reports the gzip EOF error real
-        // tools give on a 0-byte "download".
-        run(&mut shell, "touch /tmp/empty.tar.gz");
-        assert!(run(&mut shell, "tar xzf /tmp/empty.tar.gz").contains("unexpected end of file"));
-        // Missing archive.
-        assert!(run(&mut shell, "tar xzf /tmp/nope.tar.gz").contains("No such file or directory"));
+        assert!(
+            long.contains("-rw-r--r-- root/root         6 2024-05-03 00:00 d/one\n"),
+            "unexpected listing: {long}"
+        );
+
+        // An operand after the archive selects a subtree.
+        assert_eq!(run(&mut shell, "tar tf out.tar d/sub"), "d/sub/\n");
+
+        // Extracting a single member leaves the rest behind.
+        run(&mut shell, "mkdir /tmp/back && cd /tmp/back");
+        run(&mut shell, "tar xf /tmp/out.tar d/one");
+        assert_eq!(run(&mut shell, "cat d/one"), "hello\n");
+        assert!(!run(&mut shell, "ls d").contains("sub"));
+    }
+
+    #[test]
+    fn tar_symlinks_survive_the_round_trip() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir /tmp/d");
+        let d = shell.vfs.resolve(shell.cwd, "/tmp/d").unwrap();
+        shell.vfs.add_file(d, "real", "x\n", 0o644, 0, 0);
+        shell.vfs.add_symlink(d, "link", "real");
+
+        run(&mut shell, "cd /tmp && tar cf out.tar d");
+        assert!(run(&mut shell, "tar tvf out.tar").contains("link -> real"));
+
+        run(&mut shell, "mkdir /tmp/back && cd /tmp/back");
+        run(&mut shell, "tar xf /tmp/out.tar");
+        assert_eq!(run(&mut shell, "cat d/link"), "x\n");
+    }
+
+    #[test]
+    fn tar_reports_what_it_cannot_read_or_write() {
+        // An unprivileged session cannot use `tar -c` to read a tree `ls` and
+        // `cd` already refuse it.
+        let mut user = Shell::new("attacker", "debian");
+        let out = run(&mut user, "cd /tmp && tar cf mine.tar /root");
+        assert!(
+            out.contains("tar: root: Cannot open: Permission denied"),
+            "{out}"
+        );
+        assert!(out.contains("Exiting with failure status"));
+        assert_eq!(user.last_status, 2);
+        // The archive still exists — real tar writes what it could read — but
+        // nothing from /root is in it.
+        assert_eq!(run(&mut user, "tar tf mine.tar"), "root/\n");
+
+        // Reading an archive needs read permission on the archive itself —
+        // checked before its contents, so an unreadable file cannot be probed
+        // by the shape of the "not a tar archive" reply.
+        assert!(run(&mut user, "tar tf /etc/shadow").contains("Cannot open: Permission denied"));
+
+        // Missing operands and missing archives report the same way real tar does.
+        let mut shell = Shell::new("root", "debian");
+        assert!(run(&mut shell, "tar cf /tmp/a.tar /nope").contains("Cannot stat"));
+        assert!(run(&mut shell, "tar cf /tmp/a.tar").contains("Cowardly refusing"));
+        assert!(run(&mut shell, "tar xf /tmp/nope.tar").contains("No such file or directory"));
+        assert!(run(&mut shell, "tar xf /etc").contains("Is a directory"));
+    }
+
+    #[test]
+    fn tar_cannot_grow_the_vfs_past_its_byte_cap() {
+        // `tar -c` copies member contents, so repeatedly archiving an archive
+        // would double the arena's bytes each round if nothing stopped it. The
+        // VFS cap does; the point of the test is that the refusal is reported
+        // rather than leaving a truncated archive that lies about its contents.
+        let mut shell = Shell::new("root", "debian");
+        let cwd = shell.cwd;
+        shell
+            .vfs
+            .add_file(cwd, "big", vec![b'x'; 5 * 1024 * 1024], 0o644, 0, 0);
+        let out = run(&mut shell, "tar cf big.tar big");
+        assert!(out.contains("No space left on device"), "{out}");
+        assert_eq!(shell.last_status, 2);
+        assert!(!run(&mut shell, "ls").contains("big.tar"));
+    }
+
+    #[test]
+    fn tar_rejects_what_is_not_a_ustar_stream() {
+        let mut shell = Shell::new("root", "debian");
+        // A genuinely gzip-compressed upload: the magic is right for a `.tgz`,
+        // but there is no ustar header to read, and inventing one would be the
+        // lie. Real tar fails here too when the payload is not an archive.
+        let cwd = shell.cwd;
+        let gzip = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        shell.vfs.add_file(cwd, "up.tgz", &gzip[..], 0o644, 0, 0);
+        assert!(run(&mut shell, "tar tzf up.tgz").contains("does not look like a tar archive"));
+
+        // A zero-byte "download" gets the gzip EOF error real tools give.
+        run(&mut shell, "touch empty.tar.gz");
+        assert!(run(&mut shell, "tar xzf empty.tar.gz").contains("unexpected end of file"));
+    }
+
+    #[test]
+    fn tar_refuses_a_traversal_member() {
+        // An uploaded archive whose members climb out of the extraction
+        // directory: real tar strips the leading run, refuses any name that
+        // still holds a `..`, and extracts the rest.
+        let mut shell = Shell::new("root", "debian");
+        let meta = Metadata::new(crate::vfs::nodes::S_IFREG, 0o644, 0, 0);
+        let mut bytes = Vec::new();
+        for name in ["../evil", "a/../../etc/passwd", "/abs", "ok"] {
+            tar_write_header(name, "", &meta, b'0', 4, &mut bytes);
+            bytes.extend_from_slice(b"pwn\n");
+            bytes.resize(bytes.len() + TAR_BLOCK - 4, 0);
+        }
+        bytes.resize(bytes.len() + 2 * TAR_BLOCK, 0);
+        let cwd = shell.cwd;
+        shell.vfs.add_file(cwd, "trav.tar", bytes, 0o644, 0, 0);
+
+        run(&mut shell, "mkdir /tmp/out && cd /tmp/out");
+        let out = run(&mut shell, "tar xf /root/trav.tar");
+        assert_eq!(
+            out,
+            "tar: Removing leading `../' from member names\n\
+             tar: ../evil: Member name contains '..'\n\
+             tar: Removing leading `a/../../' from member names\n\
+             tar: a/../../etc/passwd: Member name contains '..'\n\
+             tar: Removing leading `/' from member names\n\
+             tar: Exiting with failure status due to previous errors\n"
+        );
+        assert_eq!(shell.last_status, 2);
+        // The two traversal members landed nowhere; the others extracted here.
+        assert_eq!(run(&mut shell, "ls"), "abs  ok\n");
+        assert_eq!(
+            run(&mut shell, "cat /etc/passwd | head -n 1"),
+            "root:x:0:0:root:/root:/bin/bash\n"
+        );
+    }
+
+    #[test]
+    fn tar_does_not_archive_itself() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir /tmp/d");
+        let d = shell.vfs.resolve(shell.cwd, "/tmp/d").unwrap();
+        shell.vfs.add_file(d, "f", "data\n", 0o644, 0, 0);
+        // The archive lives inside the tree being archived: real tar warns and
+        // skips it instead of reading its own growing output.
+        run(&mut shell, "cd /tmp/d && tar cf inner.tar .");
+        let out = run(&mut shell, "tar cf inner.tar .");
+        assert!(out.contains("file is the archive; not dumped"), "{out}");
+        assert_eq!(run(&mut shell, "tar tf inner.tar"), "./\n./f\n");
     }
 
     #[test]

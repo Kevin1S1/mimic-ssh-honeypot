@@ -91,7 +91,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | Category | Commands |
 |---|---|
 | **Navigation** | `ls` (`-a`/`-A`/`-l`/`-h`/`-1`), `cd` (`~`/`-`/`..`), `pwd` |
-| **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`, dashless bundled flags) |
+| **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`/`-v`, dashless bundled flags) |
 | **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
 | **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |
 | **Privilege** | `sudo` (transient elevation for one command; `-i`/`-s` hand over a root shell for the session), `su` (identity switch; prompts a non-root user for a password) |
@@ -104,7 +104,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Shell built-ins** | `exit`, `logout`, `true`, `false`, `cd`, `export`, `unset` |
 | **Line syntax** | `;`, `&&`, `||` chaining, `|` pipelines, and `>`/`>>`/`2>`/`&>`/`2>&1` output redirection (all quoting-aware), `#` comments, `$VAR`/`${VAR}`/`$?`/`$$` expansion, single/double quotes, backslash escapes |
 
-`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit.
+`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit. `tar` reads and writes real POSIX ustar archives, so `tar czf t.tgz d && tar tzf t.tgz` round-trips inside the VFS; nothing is compressed, since no command in the emulator can tell (`-z`/`-j`/`-J` are accepted and ignored).
 
 
 ### SSH Banner

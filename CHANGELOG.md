@@ -89,6 +89,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The 1 MiB output cap now bounds a whole command line, not just one command:
   a chained line could otherwise multiply the per-command cap by the number of
   segments that fit in the 4096-byte input limit.
+- `tar` archives no longer fail to open in `tar`. Creating one wrote a fixed
+  34-byte placeholder, so the round-trip every packing script does —
+  `tar czf t.tgz d && tar tzf t.tgz` — answered `This does not look like a tar
+  archive` on the box that had just written the file. `-c` now writes a real
+  POSIX ustar stream (contents, modes, ownership, symlinks, GNU's 10240-byte
+  blocking), and `-t`/`-x` read one back, including an uncompressed archive
+  uploaded over SCP. `-t` honours `-v` and member operands, `-x` restores modes
+  and (for root) archived ownership, and both refuse what real `tar` refuses:
+  a member the session cannot read, an archive it cannot read or write, and a
+  tree containing the archive being written (`file is the archive; not dumped`).
+  An uploaded archive whose members climb out of the extraction directory is
+  handled the way real tar handles it: the leading `/` or `../` run is stripped
+  with tar's own warning, a name that still contains a `..` component is
+  refused (`Member name contains '..'`) rather than quietly relocated, and the
+  attempt lands in the capture. Nothing is actually compressed — `-z`/`-j`/`-J`
+  are accepted and ignored, which no command in the emulator can observe — and
+  an archive that would push the VFS past its byte cap now reports a full disk
+  instead of silently not being written.
 
 ### Security
 - `/usr/bin` listed binaries the shell could not run — `ls /usr/bin` showed
