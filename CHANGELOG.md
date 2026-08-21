@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `truncated` is set.
 
 ### Security
+- Backslashes inside double quotes were eaten by the tokenizer, so
+  `echo -e "a\tb\nc"` printed `atbnc`. Bash only lets a backslash escape `$`,
+  `` ` ``, `"` and `\` inside double quotes and passes every other one through;
+  the command now receives what bash would give it, and `echo -e` interprets the
+  full GNU escape table (`\e`, `\v`, `\f`, `\0NNN`, `\xHH`, `\c` as well as the
+  escapes it already knew). This is the form bot payloads use, and with output
+  redirection those bytes now land in the VFS as the capture — so a mangled
+  escape corrupted the recorded payload as well as the illusion.
 - The 1 MiB output cap now bounds a whole command line, not just one command:
   a chained line could otherwise multiply the per-command cap by the number of
   segments that fit in the 4096-byte input limit.
