@@ -11,7 +11,7 @@ use crate::logging::event;
 use crate::network::limiter::{ConnectionGuard, ConnectionRegistry};
 use crate::network::scp::{self, ScpMode, ScpSink};
 use crate::shell::complete::{self, Completion};
-use crate::shell::line::{LineEditor, Reaction};
+use crate::shell::line::{is_continuation, LineEditor, Reaction};
 use crate::shell::{Capture, Shell};
 
 use anyhow::{Context, Result};
@@ -809,12 +809,13 @@ impl Handler for MimicHandler {
                         session.data(channel, self.editor.render().to_vec())?;
                     }
                     0x08 | 0x7f => {
-                        // Backspace: edit the buffer without echoing.
+                        // Backspace: edit the buffer without echoing. Drop the
+                        // whole character, not one byte of it.
                         if let Some(buf) = self.password_buf.as_mut() {
-                            buf.pop();
+                            while buf.pop().is_some_and(is_continuation) {}
                         }
                     }
-                    0x20..=0x7e => {
+                    0x20..=0x7e | 0x80..=0xff => {
                         // Printable byte: buffer it (bounded), no echo.
                         if let Some(buf) = self.password_buf.as_mut() {
                             if buf.len() < MAX_COMMAND_LEN {

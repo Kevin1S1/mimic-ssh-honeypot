@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete payload, and the new `stored_sha256` field is the quarantined
   content — the quarantine filename, and identical to `sha256` unless
   `truncated` is set.
+- `Ctrl-Y` did nothing although the README advertises kill/yank keys: text taken
+  by `Ctrl-U`, `Ctrl-K` or `Ctrl-W` was discarded instead of kept. The last kill
+  is now reinserted at the cursor and survives the yank, so it can be pasted
+  more than once, as readline does.
 
 ### Security
 - `cd` now needs a directory's execute (search) bit. An unprivileged session
@@ -107,6 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are accepted and ignored, which no command in the emulator can observe — and
   an archive that would push the VFS past its byte cap now reports a full disk
   instead of silently not being written.
+- The interactive line editor dropped every non-ASCII byte, so typing
+  `ééunicode` ran — and logged — `unicode`: a two-keystroke way to identify the
+  shell, and worse, any UTF-8 payload typed at the prompt reached the capture
+  mangled. Characters outside ASCII are now buffered as typed, deleted and
+  stepped over whole (backspace, Delete, arrow keys), and counted as one column
+  each when the line is redrawn, so the echo stays in sync with the cursor. The
+  `su` password prompt keeps them too — a non-ASCII credential is recorded the
+  way it was entered — and Tab completion no longer panics on two names that
+  share part of a multi-byte character.
 
 ### Security
 - `/usr/bin` listed binaries the shell could not run — `ls /usr/bin` showed

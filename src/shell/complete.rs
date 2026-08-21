@@ -243,6 +243,11 @@ fn longest_common_prefix(items: &[&str]) -> String {
             break;
         }
     }
+    // Bytes can match part-way through a character (`é` and `ê` share a lead
+    // byte); slicing there would panic, so back off to a boundary.
+    while end > 0 && !first.is_char_boundary(end) {
+        end -= 1;
+    }
     first[..end].to_string()
 }
 
@@ -331,9 +336,27 @@ mod tests {
     }
 
     #[test]
+    fn path_completion_over_names_sharing_a_lead_byte() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("mkdir /tmp/éa /tmp/êb");
+        // Both names begin with the same UTF-8 lead byte, so the common prefix
+        // has to stop at a character boundary rather than half of one.
+        match complete(&shell, "/tmp/", false) {
+            Completion::Listing(items) => {
+                assert!(items.iter().any(|i| i.starts_with("éa")));
+                assert!(items.iter().any(|i| i.starts_with("êb")));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn lcp_basic() {
         assert_eq!(longest_common_prefix(&["apt", "apt-get"]), "apt");
         assert_eq!(longest_common_prefix(&["cat", "cd"]), "c");
         assert_eq!(longest_common_prefix(&["ls", "rm"]), "");
+        // Names sharing only part of a character must not slice mid-character.
+        assert_eq!(longest_common_prefix(&["éa", "êb"]), "");
+        assert_eq!(longest_common_prefix(&["éa", "éb"]), "é");
     }
 }
