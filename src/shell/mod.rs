@@ -516,9 +516,10 @@ impl Shell {
         Ok(())
     }
 
-    /// Run one command line: split it on `;`, `&&`, and `||`, then for each
-    /// segment expand variables, tokenize, dispatch to the command registry,
-    /// and record the resulting `$?`. Empty lines are no-ops.
+    /// Run one command line: cut off any `#` comment, split what is left on
+    /// `;`, `&&`, and `||`, then for each segment expand variables, tokenize,
+    /// dispatch to the command registry, and record the resulting `$?`. Empty
+    /// lines — and comment-only ones — are no-ops that leave `$?` alone.
     pub fn execute(&mut self, line: &str) -> Output {
         self.captures.clear();
 
@@ -527,7 +528,7 @@ impl Shell {
         let mut exit = false;
         let mut ran = false;
 
-        for segment in parser::split_segments(line) {
+        for segment in parser::split_segments(parser::strip_comment(line)) {
             if segment.text.trim().is_empty() {
                 if segment.run_if != parser::Separator::Always {
                     // `&& cmd` with nothing in front of it, as bash sees it.
@@ -690,6 +691,36 @@ mod tests {
         // And one that arrives via a variable stays data too.
         shell.execute("export EVIL='x; echo pwned'");
         assert_eq!(shell.execute("echo $EVIL").text, "x; echo pwned\n");
+    }
+
+    #[test]
+    fn comments_are_not_commands() {
+        let mut shell = Shell::new("root", "debian");
+
+        // A comment-only line runs nothing and leaves `$?` alone.
+        shell.execute("false");
+        let out = shell.execute("# just looking");
+        assert_eq!(out.text, "");
+        assert_eq!(shell.execute("echo $?").text, "1\n");
+
+        // A trailing comment is cut off the command, and takes the rest of the
+        // line with it.
+        assert_eq!(shell.execute("echo a # b").text, "a\n");
+        assert_eq!(shell.execute("echo a # b; echo c").text, "a\n");
+        assert_eq!(shell.execute("echo a; # b").text, "a\n");
+
+        // A `#` that does not start a word is an ordinary character — dropping
+        // a shebang script is the payload this must not break.
+        assert_eq!(shell.execute("echo a#b").text, "a#b\n");
+        assert_eq!(shell.execute("echo '#!/bin/sh' > /tmp/x").text, "");
+        assert_eq!(shell.execute("cat /tmp/x").text, "#!/bin/sh\n");
+        assert_eq!(shell.execute(r##"echo "# kept""##).text, "# kept\n");
+        assert_eq!(shell.execute(r"echo \# kept").text, "# kept\n");
+
+        // Comments are cut before expansion, so one arriving in a variable's
+        // value is data, not a comment.
+        shell.execute("export C='# x'");
+        assert_eq!(shell.execute("echo $C").text, "# x\n");
     }
 
     #[test]

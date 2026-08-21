@@ -1,11 +1,56 @@
 //! Minimal POSIX-ish command-line tokenizer.
 //!
 //! Splits a line into argument words, honouring single quotes, double quotes,
-//! and backslash escaping, splits a compound line on `;`, `&&`, and `||`, a
-//! segment into pipeline stages on `|`, and a stage's output redirections off
-//! its command text. This is deliberately small: command substitution and
-//! heredocs are intentionally unsupported. Variable expansion happens *before*
-//! tokenization in [`crate::shell::Shell`].
+//! and backslash escaping, cuts a `#` comment off a line, splits a compound
+//! line on `;`, `&&`, and `||`, a segment into pipeline stages on `|`, and a
+//! stage's output redirections off its command text. This is deliberately
+//! small: command substitution and heredocs are intentionally unsupported.
+//! Variable expansion happens *before* tokenization in [`crate::shell::Shell`].
+
+/// Cut a `#` comment off the end of `line`, returning what is left to run.
+///
+/// Bash starts a comment at an unquoted, unescaped `#` that begins a word — so
+/// `echo a # b` runs `echo a`, while `echo a#b`, `echo '#!/bin/sh'` and `$#`
+/// keep their `#` as data. A comment runs to the end of the line and swallows
+/// any separator in it, which is why this happens before [`split_segments`]
+/// rather than per segment. Like the splitting that follows, it runs on the raw
+/// line, before variable expansion, so a `#` arriving in a variable's value
+/// stays data instead of commenting out the rest of the line.
+pub fn strip_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    // A `#` only opens a comment at the start of a word: at the start of the
+    // line, after whitespace, or after an operator character that ended one.
+    let mut word_start = true;
+
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len() {
+        let c = bytes[i];
+        if escaped {
+            escaped = false;
+            word_start = false;
+            continue;
+        }
+        match c {
+            b'\\' if !in_single => escaped = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if word_start && !in_single && !in_double => return &line[..i],
+            b';' | b'&' | b'|' if !in_single && !in_double => {
+                word_start = true;
+                continue;
+            }
+            c if c.is_ascii_whitespace() && !in_single && !in_double => {
+                word_start = true;
+                continue;
+            }
+            _ => {}
+        }
+        word_start = false;
+    }
+    line
+}
 
 /// Whether a segment runs, based on how the previous one exited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +450,34 @@ mod tests {
     fn single_ampersand_and_pipe_stay_literal() {
         assert_eq!(split("echo a & b"), vec![(Separator::Always, "echo a & b")]);
         assert_eq!(split("echo a | b"), vec![(Separator::Always, "echo a | b")]);
+    }
+
+    #[test]
+    fn a_comment_runs_to_the_end_of_the_line() {
+        assert_eq!(strip_comment("# just a comment"), "");
+        assert_eq!(strip_comment("echo a # b"), "echo a ");
+        assert_eq!(strip_comment("   # indented"), "   ");
+        // The comment swallows the rest of the line, separators included.
+        assert_eq!(strip_comment("echo a # b; echo c"), "echo a ");
+        assert_eq!(strip_comment("echo a;# b && echo c"), "echo a;");
+        assert_eq!(strip_comment("echo a |# b"), "echo a |");
+    }
+
+    #[test]
+    fn a_hash_that_does_not_start_a_word_is_data() {
+        // Mid-word, quoted, or escaped: all literal, as in bash.
+        assert_eq!(strip_comment("echo a#b"), "echo a#b");
+        assert_eq!(
+            strip_comment("echo '#!/bin/sh' > /tmp/x"),
+            "echo '#!/bin/sh' > /tmp/x"
+        );
+        assert_eq!(
+            strip_comment(r##"echo "# not a comment""##),
+            r##"echo "# not a comment""##
+        );
+        assert_eq!(strip_comment(r"echo \# hash"), r"echo \# hash");
+        assert_eq!(strip_comment("echo $#"), "echo $#");
+        assert_eq!(strip_comment("echo ''#x"), "echo ''#x");
     }
 
     fn file(path: &str, append: bool) -> Target {
