@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `truncated` is set.
 
 ### Security
+- `ls -l` printed no `total` line unless `-a`/`-A` was given, and when it did
+  print one the figure was always `8`. GNU `ls` heads every long directory
+  listing with the disk usage of the entries below it, so both the missing line
+  and the constant were one-glance honeypot tells. The total is now summed from
+  the listed entries, on an ext4-shaped model (4 KiB blocks, empty files and
+  short symlinks occupying none), and moves as files are created and written.
 - The 1 MiB output cap now bounds a whole command line, not just one command:
   a chained line could otherwise multiply the per-command cap by the number of
   segments that fit in the 4096-byte input limit.

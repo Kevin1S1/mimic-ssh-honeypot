@@ -126,10 +126,10 @@ fn list_dir(vfs: &Vfs, dir: NodeId, flags: &LsFlags) -> String {
 
     if flags.long {
         let mut out = String::new();
-        if flags.all || flags.almost_all {
-            // GNU ls prints a "total" line for long listings.
-            out.push_str("total 8\n");
-        }
+        // GNU ls heads every long directory listing with the disk usage of the
+        // entries it is about to print — including an empty one, as `total 0`.
+        let total: u64 = names.iter().map(|(_, id)| allocated_kib(vfs, *id)).sum();
+        out.push_str(&format!("total {total}\n"));
         for (name, id) in &names {
             out.push_str(&long_entry(vfs, *id, name, flags));
             out.push('\n');
@@ -192,6 +192,18 @@ fn long_entry(vfs: &Vfs, id: NodeId, name: &str, flags: &LsFlags) -> String {
     };
 
     format!("{mode} {nlink:>2} {owner:<8} {group:<8} {size:>6} {date} {name}{suffix}")
+}
+
+/// Disk space a node occupies in 1 KiB units, the unit `ls -l` sums into its
+/// `total` line. Modelled on ext4 with 4 KiB blocks: a file rounds up to whole
+/// blocks and an empty one occupies none, a directory is one block, and a short
+/// symlink is stored inside its inode and so occupies none either.
+fn allocated_kib(vfs: &Vfs, id: NodeId) -> u64 {
+    match &vfs.node(id).kind {
+        NodeKind::File { contents } => (contents.len() as u64).div_ceil(4096) * 4,
+        NodeKind::Directory { .. } => 4,
+        NodeKind::Symlink { .. } => 0,
+    }
 }
 
 /// Apparent size of a node, as `ls -l` reports it.
@@ -1853,6 +1865,26 @@ mod tests {
         // Home dotfiles are hidden without -a.
         assert!(!run(&mut shell, "ls").contains(".bashrc"));
         assert!(run(&mut shell, "ls -a").contains(".bashrc"));
+    }
+
+    #[test]
+    fn ls_long_totals_the_entries_it_prints() {
+        let mut shell = Shell::new("root", "debian");
+        // Every long directory listing is headed by a total, -a or not.
+        assert!(run(&mut shell, "ls -l /").starts_with("total "));
+        assert!(run(&mut shell, "ls -la /").starts_with("total "));
+        // A single file operand is not a directory listing, so it has none.
+        assert!(!run(&mut shell, "ls -l /etc/hostname").contains("total"));
+
+        run(&mut shell, "mkdir /tmp/t && cd /tmp/t");
+        assert_eq!(run(&mut shell, "ls -l"), "total 0\n");
+        // An empty file occupies no blocks; a written one takes a 4 KiB block,
+        // and `.`/`..` add a block each.
+        run(&mut shell, "touch empty");
+        assert!(run(&mut shell, "ls -l").starts_with("total 0\n"));
+        run(&mut shell, "echo hello > small");
+        assert!(run(&mut shell, "ls -l").starts_with("total 4\n"));
+        assert!(run(&mut shell, "ls -la").starts_with("total 12\n"));
     }
 
     #[test]
