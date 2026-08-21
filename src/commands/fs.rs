@@ -198,6 +198,12 @@ fn long_entry(vfs: &Vfs, id: NodeId, name: &str, flags: &LsFlags) -> String {
 /// `total` line. Modelled on ext4 with 4 KiB blocks: a file rounds up to whole
 /// blocks and an empty one occupies none, a directory is one block, and a short
 /// symlink is stored inside its inode and so occupies none either.
+///
+/// ext4 is the right model for every path in the snapshot because `mount`
+/// reports one real filesystem, `/dev/sda1 on / type ext4`, with no separate
+/// `/tmp`; a tmpfs would give directories no blocks at all and the two would
+/// disagree. The one-block directory also matches the 4096 `ls -l` prints as a
+/// directory's size.
 fn allocated_kib(vfs: &Vfs, id: NodeId) -> u64 {
     match &vfs.node(id).kind {
         NodeKind::File { contents } => (contents.len() as u64).div_ceil(4096) * 4,
