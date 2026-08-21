@@ -91,6 +91,23 @@ impl Metadata {
             self.mode & 0o002 != 0
         }
     }
+
+    /// Whether a session with `uid`/`gid` may execute this node, following the
+    /// same owner/group/other rule as [`Metadata::readable_by`] on the execute
+    /// bits. On a directory that bit is search permission: entering it, which
+    /// is what `cd` checks.
+    pub fn executable_by(&self, uid: u32, gid: u32) -> bool {
+        if uid == 0 {
+            return true;
+        }
+        if uid == self.uid {
+            self.mode & 0o100 != 0
+        } else if gid == self.gid {
+            self.mode & 0o010 != 0
+        } else {
+            self.mode & 0o001 != 0
+        }
+    }
 }
 
 /// The payload of a node, discriminated by kind.
