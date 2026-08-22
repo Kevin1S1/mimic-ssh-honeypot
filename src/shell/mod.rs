@@ -118,6 +118,10 @@ pub struct Shell {
     pub last_status: i32,
     /// Fake shell PID (for `$$`).
     pub pid: u32,
+    /// When this session logged in, unix seconds. `w`, `last` and `ps` report
+    /// it, so it has to be the real login instant rather than a fixed time of
+    /// day that contradicts the clock `date` returns.
+    pub login: i64,
     /// Current command-nesting depth (`sudo`, `sh -c`, ...), bounded by the
     /// command registry so a deeply nested line cannot overflow the stack.
     pub nesting: u32,
@@ -174,6 +178,7 @@ impl Shell {
             gid,
             last_status: 0,
             pid: 1337,
+            login: crate::clock::now(),
             nesting: 0,
             stdin: None,
             stdout_is_tty: true,

@@ -740,8 +740,13 @@ impl Handler for MimicHandler {
         let banner = self.out(&self.motd());
         session.data(channel, banner)?;
         // PAM prints the previous login right before handing off to the shell.
-        // Kept in lockstep with the fabricated `last`/`w` session.
-        let last_login = self.out("Last login: Mon Jun 24 10:01:33 2024 from 10.0.0.5\n");
+        // Kept in lockstep with the session `last` lists as the previous one.
+        let (prev, _) = crate::clock::prev_login();
+        let last_login = self.out(&format!(
+            "Last login: {} from {}\n",
+            crate::clock::format(prev, "%a %b %e %H:%M:%S %Y"),
+            crate::clock::PREV_LOGIN_FROM,
+        ));
         session.data(channel, last_login)?;
         let prompt = self.shell().prompt();
         self.editor.set_prompt(&prompt);

@@ -244,13 +244,27 @@ fn format_time(ts: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    /// Half a mean year, the window coreutils calls "recent".
+    const SIX_MONTHS: i64 = 15_778_800;
+
     let days = ts.div_euclid(86_400);
     let secs = ts.rem_euclid(86_400);
-    let (_, month, day) = civil_from_days(days);
+    let (year, month, day) = civil_from_days(days);
     let hour = secs / 3_600;
     let minute = (secs % 3_600) / 60;
     let mon = MONTHS[(month - 1) as usize];
-    format!("{mon} {day:>2} {hour:02}:{minute:02}")
+
+    // Real `ls -l` shows the clock only for a recent mtime, and the year for
+    // anything older than six months or dated in the future. Reachable here
+    // because the snapshot's install date is fixed at startup while the clock
+    // keeps moving: a process left running for months would otherwise report
+    // `/etc` with a time of day where a real box reports a year.
+    let now = crate::clock::now();
+    if ts > now + 3_600 || ts < now - SIX_MONTHS {
+        format!("{mon} {day:>2}  {year}")
+    } else {
+        format!("{mon} {day:>2} {hour:02}:{minute:02}")
+    }
 }
 
 /// Convert days since the Unix epoch to `(year, month, day)` (UTC).
@@ -2328,13 +2342,28 @@ mod tests {
     }
 
     #[test]
-    fn format_time_matches_default_mtime() {
-        // DEFAULT_MTIME = 1_714_694_400 = 2024-05-03 00:00:00 UTC.
-        assert_eq!(format_time(1_714_694_400), "May  3 00:00");
-        // A timestamp with non-zero time-of-day and a two-digit day.
+    fn format_time_shows_the_clock_only_for_a_recent_mtime() {
+        let now = crate::clock::now();
+        // Recent: month, day, and the time of day.
         assert_eq!(
-            format_time(1_734_652_800 + 13 * 3600 + 7 * 60),
-            "Dec 20 13:07"
+            format_time(now - 86_400),
+            crate::clock::format(now - 86_400, "%b %e %H:%M")
+        );
+        // Older than six months, or dated in the future: the year instead,
+        // which is what a real `ls -l` switches to.
+        for ts in [now - 200 * 86_400, now + 7_200] {
+            assert_eq!(
+                format_time(ts),
+                crate::clock::format(ts, "%b %e  %Y"),
+                "expected the year form for {ts}"
+            );
+        }
+        // The snapshot's install date is inside the recent window, so `ls -l`
+        // on `/etc` shows a time of day like a freshly installed box.
+        let install = crate::clock::install_time();
+        assert_eq!(
+            format_time(install),
+            crate::clock::format(install, "%b %e %H:%M")
         );
     }
 
@@ -2694,13 +2723,16 @@ mod tests {
 
         // Byte-for-byte the shape GNU tar 1.35 prints: the joined owner/group
         // and the size share an 18-column field, then a UTC `YYYY-MM-DD HH:MM`.
+        // The members were created during this session, so they carry the
+        // current time — not the install date the snapshot carries.
+        let now = crate::clock::format(crate::clock::now(), "%F %H:%M");
         let long = run(&mut shell, "tar tvf out.tar");
         assert!(
-            long.contains("drwxr-xr-x root/root         0 2024-05-03 00:00 d/\n"),
+            long.contains(&format!("drwxr-xr-x root/root         0 {now} d/\n")),
             "unexpected listing: {long}"
         );
         assert!(
-            long.contains("-rw-r--r-- root/root         6 2024-05-03 00:00 d/one\n"),
+            long.contains(&format!("-rw-r--r-- root/root         6 {now} d/one\n")),
             "unexpected listing: {long}"
         );
 

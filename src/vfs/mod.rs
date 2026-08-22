@@ -319,6 +319,15 @@ impl Vfs {
         id
     }
 
+    /// Stamp every node in the arena with `ts`. Used once, at the end of
+    /// [`snapshot::build`], to date the boot snapshot from the box's install
+    /// date rather than from the moment the session started.
+    pub fn set_all_mtimes(&mut self, ts: i64) {
+        for node in &mut self.nodes {
+            node.meta.mtime = ts;
+        }
+    }
+
     /// Set the permission bits of `id`, preserving the file-type bits.
     pub fn chmod(&mut self, id: NodeId, perms: u32) {
         let file_type = self.nodes[id].meta.mode & nodes::S_IFMT;
@@ -441,10 +450,7 @@ impl Vfs {
 
 /// Current wall-clock time in unix seconds, for freshly created/modified nodes.
 fn now_ts() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::clock::now()
 }
 
 #[cfg(test)]
