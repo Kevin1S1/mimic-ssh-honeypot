@@ -774,45 +774,96 @@ pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `top` (batch-mode snapshot; the interactive UI is not emulated).
-pub fn top(shell: &Shell, args: &[String]) -> CommandResult {
+/// One `top` display, able to redraw itself at any later instant.
+///
+/// The process rows are fixed when the command runs — this box has one session
+/// on it, and nothing starts or exits while an attacker watches — but the
+/// header carries the clock and the uptime, which are exactly what a viewer
+/// checks to see whether the screen is alive. Holding only the rendered rows
+/// keeps this free of any borrow on the shell, so the network layer can redraw
+/// it on a timer without reaching back into the session.
+#[derive(Clone)]
+pub struct TopScreen {
+    rows: Vec<String>,
+    total: usize,
+    running: usize,
+}
+
+impl TopScreen {
+    /// Render the whole display as of now.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("top - {}\n", clock::uptime_banner()));
+        out.push_str(&format!(
+            "Tasks: {:>3} total,   {} running, {:>3} sleeping,   0 stopped,   0 zombie\n",
+            self.total,
+            self.running,
+            self.total - self.running
+        ));
+        out.push_str(
+            "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n",
+        );
+        out.push_str(
+            "MiB Mem :   1993.4 total,   1468.3 free,    179.0 used,    346.0 buff/cache\n",
+        );
+        out.push_str(
+            "MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1723.6 avail Mem\n",
+        );
+        out.push('\n');
+        out.push_str(
+            "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n",
+        );
+        for row in &self.rows {
+            out.push_str(row);
+        }
+        out
+    }
+}
+
+/// `top [-b] [-n N]`
+///
+/// On a terminal, real `top` takes the screen and redraws every three seconds
+/// until `q`. The display is built here; the holding is the network layer's,
+/// which is the only layer allowed to own a timer. Batch mode (`-b`), an
+/// iteration count (`-n`), a pipe, and any channel without a terminal all get
+/// the one-shot dump instead — the same cases real `top` prints once for.
+pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
     let table = session_table(shell, &invocation("top", args));
     let running = table.iter().filter(|p| p.stat.starts_with('R')).count();
-    let sleeping = table.len() - running;
-
-    let mut out = String::new();
-    out.push_str(&format!("top - {}\n", clock::uptime_banner()));
-    out.push_str(&format!(
-        "Tasks: {:>3} total,   {} running, {:>3} sleeping,   0 stopped,   0 zombie\n",
-        table.len(),
+    let rows = table
+        .iter()
+        .map(|p| {
+            format!(
+                "{:>7} {:<8}  20   0 {:>7} {:>6} {:>6} {} {:>5} {:>5}   {:>7} {}\n",
+                p.pid,
+                p.user,
+                p.vsz,
+                p.rss,
+                p.rss / 2,
+                &p.stat[..1],
+                p.cpu,
+                p.mem,
+                p.time,
+                p.cmd.split_whitespace().next().unwrap_or(&p.cmd)
+            )
+        })
+        .collect();
+    let screen = TopScreen {
+        rows,
+        total: table.len(),
         running,
-        sleeping
-    ));
-    out.push_str(
-        "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n",
-    );
-    out.push_str("MiB Mem :   1993.4 total,   1468.3 free,    179.0 used,    346.0 buff/cache\n");
-    out.push_str("MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1723.6 avail Mem\n");
-    out.push('\n');
-    out.push_str(
-        "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n",
-    );
-    for p in &table {
-        out.push_str(&format!(
-            "{:>7} {:<8}  20   0 {:>7} {:>6} {:>6} {} {:>5} {:>5}   {:>7} {}\n",
-            p.pid,
-            p.user,
-            p.vsz,
-            p.rss,
-            p.rss / 2,
-            &p.stat[..1],
-            p.cpu,
-            p.mem,
-            p.time,
-            p.cmd.split_whitespace().next().unwrap_or(&p.cmd)
-        ));
+    };
+
+    let batch = args
+        .iter()
+        .any(|a| a == "-b" || a == "--batch" || (a.starts_with('-') && a.contains('n')));
+    if !batch && shell.interactive && shell.stdout_is_tty {
+        // The display paints itself once the network layer picks it up, so the
+        // command writes nothing: a frame here would be painted twice.
+        shell.screen = Some(screen);
+        return CommandResult::empty();
     }
-    CommandResult::ok(out)
+    CommandResult::ok(screen.render())
 }
 
 /// `kill [-SIG] PID...`
@@ -1482,9 +1533,60 @@ mod tests {
     }
 
     #[test]
+    fn top_takes_the_screen_only_where_a_real_one_would() {
+        let mut shell = Shell::new("root", "debian");
+
+        // On a terminal it takes the screen and prints nothing itself: the
+        // display paints from the network layer's redraw timer.
+        let out = run(&mut shell, "top");
+        assert_eq!(out, "");
+        let screen = shell.screen.take().expect("top should hold the screen");
+        assert!(screen.render().contains("Tasks:"));
+
+        // Batch mode and an iteration count are the one-shot dump.
+        for line in ["top -b", "top -bn1", "top -n 1", "top --batch"] {
+            assert!(
+                run(&mut shell, line).contains("Tasks:"),
+                "{line} should print a dump"
+            );
+            assert!(shell.screen.is_none(), "{line} should not hold the screen");
+        }
+
+        // A pipe is not a terminal, and neither is a redirect.
+        assert!(
+            run(&mut shell, "top | wc -l")
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+                > 5
+        );
+        assert!(shell.screen.is_none(), "a pipe should not hold the screen");
+        run(&mut shell, "top > /tmp/t");
+        assert!(
+            shell.screen.is_none(),
+            "a redirect should not hold the screen"
+        );
+
+        // Neither is a one-shot `exec`, whatever its stdout is.
+        shell.interactive = false;
+        assert!(run(&mut shell, "top").contains("Tasks:"));
+        assert!(shell.screen.is_none(), "exec should not hold the screen");
+        shell.interactive = true;
+
+        // A substitution runs in a subshell with no terminal of its own, so it
+        // captures a dump and hands the session back unheld.
+        let sub = run(&mut shell, "echo $(top)");
+        assert!(sub.contains("Tasks:"));
+        assert!(
+            shell.screen.is_none(),
+            "a substitution should not hold the screen"
+        );
+    }
+
+    #[test]
     fn top_and_free_render() {
         let mut shell = Shell::new("root", "debian");
-        assert!(run(&mut shell, "top").contains("Tasks:"));
+        assert!(run(&mut shell, "top -b").contains("Tasks:"));
         assert!(run(&mut shell, "free").contains("Mem:"));
         // procps' scaling: a decimal place only below 10, so `1.9Gi` but
         // `346Mi` — never `346.0Mi`.
@@ -1675,7 +1777,7 @@ mod tests {
         let banner = clock::uptime_banner();
         assert!(run(&mut shell, "uptime").contains(&banner));
         assert!(run(&mut shell, "w").contains(&banner));
-        assert!(run(&mut shell, "top").contains(&banner));
+        assert!(run(&mut shell, "top -b").contains(&banner));
 
         // `last` reports this year's boot, not a date frozen at compile time.
         let last = run(&mut shell, "last");
@@ -1699,7 +1801,7 @@ mod tests {
     #[test]
     fn top_and_ps_list_themselves_not_each_other() {
         let mut shell = Shell::new("root", "debian");
-        let top = run(&mut shell, "top");
+        let top = run(&mut shell, "top -b");
         assert!(top.contains(" top\n"), "top should list itself: {top}");
         assert!(!top.contains("ps aux"));
         assert!(run(&mut shell, "ps aux").contains("ps aux"));
@@ -1732,6 +1834,6 @@ mod tests {
         assert!(df.contains(&format!("{}", total / 2)), "/dev/shm is RAM/2");
         assert!(df.contains(&format!("{}", total / 10)), "/run is RAM/10");
         // `top`'s header is the same total in MiB.
-        assert!(run(&mut shell, "top").contains(&format!("{:.1} total", total as f64 / 1024.0)));
+        assert!(run(&mut shell, "top -b").contains(&format!("{:.1} total", total as f64 / 1024.0)));
     }
 }

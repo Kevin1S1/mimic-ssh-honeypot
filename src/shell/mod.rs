@@ -141,6 +141,7 @@ struct Subshell {
     uid: u32,
     gid: u32,
     pending: Option<Pending>,
+    screen: Option<commands::system::TopScreen>,
 }
 
 /// Per-session shell.
@@ -203,6 +204,14 @@ pub struct Shell {
     /// An interactive prompt a command is waiting on (e.g. `su` reading a
     /// password). `None` between commands.
     pub pending: Option<Pending>,
+    /// A full-screen display a command asked to hold the terminal with (`top`).
+    /// The network layer takes it after the line runs and owns the redraw timer
+    /// — this layer never has a clock of its own.
+    pub screen: Option<commands::system::TopScreen>,
+    /// How many command substitutions are open around the running command. A
+    /// substitution captures its body's stdout through a pipe, so nothing
+    /// inside one is writing to a terminal however the stage itself looks.
+    subst_depth: u32,
 }
 
 impl Shell {
@@ -247,6 +256,8 @@ impl Shell {
             stdin: None,
             stdout_is_tty: true,
             interactive: true,
+            screen: None,
+            subst_depth: 0,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,
@@ -433,6 +444,7 @@ impl Shell {
             return String::new();
         }
         self.nesting += 1;
+        self.subst_depth += 1;
         let session = Subshell {
             env: self.env.clone(),
             cwd: self.cwd,
@@ -442,6 +454,7 @@ impl Shell {
             uid: self.uid,
             gid: self.gid,
             pending: self.pending.clone(),
+            screen: self.screen.clone(),
         };
         let saved = std::mem::take(&mut self.captures);
         let output = self.execute(body);
@@ -455,7 +468,11 @@ impl Shell {
         self.uid = session.uid;
         self.gid = session.gid;
         self.pending = session.pending;
+        // A substitution runs in a subshell with no terminal of its own, so
+        // `echo $(top)` captures a dump and does not take the screen.
+        self.screen = session.screen;
         self.nesting -= 1;
+        self.subst_depth -= 1;
 
         // Held stderr is capped like any other stream: a line has room for
         // hundreds of substitutions, and each one's stderr is only bounded on
@@ -600,7 +617,7 @@ impl Shell {
                 continue;
             }
             self.stdin = piped.take();
-            self.stdout_is_tty = i == last_stage && sinks.stdout.is_none();
+            self.stdout_is_tty = i == last_stage && sinks.stdout.is_none() && self.subst_depth == 0;
             let result = commands::dispatch(self, &argv);
             self.stdin = None;
             self.stdout_is_tty = true;

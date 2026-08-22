@@ -18,6 +18,9 @@ use crate::shell::{Capture, Output, Shell};
 use anyhow::{Context, Result};
 use russh::server::{Auth, Config as ServerConfig, Handler, Msg, Session};
 use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
+// What `Handle::data` takes, reached through russh's own re-export so this
+// stays free of a direct `bytes` dependency.
+use russh::keys::ssh_encoding::bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use std::net::SocketAddr;
@@ -126,6 +129,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             quarantine_bytes: 0,
             password_buf: None,
             line_buf: Vec::new(),
+            screen: None,
             _guard: guard,
         };
 
@@ -254,9 +258,32 @@ struct MimicHandler {
     /// editor to hold it. Bounded by [`MAX_COMMAND_LEN`] like every other path
     /// that accepts a command line.
     line_buf: Vec<u8>,
+    /// The redraw task of a full-screen command holding the terminal (`top`).
+    /// While it is `Some`, input goes to the display rather than the editor.
+    screen: Option<ScreenHold>,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
+}
+
+/// How often a full-screen command repaints. Real `top`'s default delay.
+const SCREEN_REFRESH: Duration = Duration::from_secs(3);
+
+/// Move the cursor home and erase what is below it — what a full-screen program
+/// sends before painting a frame, so each redraw lands on top of the last.
+const SCREEN_HOME: &str = "\x1b[H\x1b[J";
+
+/// A full-screen command holding the terminal. Dropping this aborts the redraw
+/// task, so the timer cannot outlive the channel it paints — closing the
+/// channel, ending the session, or quitting the display all stop it.
+struct ScreenHold {
+    redraw: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ScreenHold {
+    fn drop(&mut self) {
+        self.redraw.abort();
+    }
 }
 
 /// Per-session ceiling on real-disk quarantine writes, as a multiple of
@@ -283,6 +310,10 @@ impl MimicHandler {
             self.scp = None;
             self.sftp = None;
             self.password_buf = None;
+            self.line_buf.clear();
+            // Dropping the hold aborts its redraw task, so a timer never
+            // outlives the channel it was painting.
+            self.screen = None;
             self.shell_started = false;
             // `pty-req` is per channel: a connection that runs an interactive
             // session and then an `exec` must not carry the PTY's line endings
@@ -382,6 +413,63 @@ impl MimicHandler {
         }
         let result = self.shell().execute(&trimmed);
         self.deliver(channel, &result, session).await
+    }
+
+    /// Take over the terminal with a full-screen display, repainting it every
+    /// [`SCREEN_REFRESH`] until the client quits.
+    ///
+    /// The emulation layers own no clock, so the display arrives as a value
+    /// that can render itself at any instant and the timer lives here. The task
+    /// holds a session handle rather than a borrow of the shell, and stops on
+    /// the first write that fails — which is what a closed session looks like
+    /// from the outside — so it cannot outlive the connection even if nothing
+    /// aborts it first.
+    fn hold_screen(
+        &mut self,
+        channel: ChannelId,
+        screen: crate::commands::system::TopScreen,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let first = format!("{SCREEN_HOME}{}", screen.render());
+        session.data(channel, self.out(&first))?;
+        let handle = session.handle();
+        let pty = self.pty;
+        let redraw = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SCREEN_REFRESH);
+            // The first tick fires immediately; the frame above is that one.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let frame = format!("{SCREEN_HOME}{}", screen.render());
+                let bytes = if pty {
+                    frame.replace('\n', "\r\n").into_bytes()
+                } else {
+                    frame.into_bytes()
+                };
+                if handle.data(channel, Bytes::from(bytes)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.screen = Some(ScreenHold { redraw });
+        Ok(())
+    }
+
+    /// Feed a keystroke to a display holding the terminal. Returns whether the
+    /// display is still up.
+    ///
+    /// Real `top` quits on `q`, and Ctrl-C kills it like any foreground job;
+    /// every other key is consumed by the display rather than echoed, which is
+    /// the whole point of holding the screen.
+    fn screen_input(&mut self, byte: u8) -> bool {
+        match byte {
+            b'q' | 0x03 => {
+                // Dropping the hold aborts the redraw task.
+                self.screen = None;
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Feed input to a shell channel that never asked for a PTY.
@@ -1057,7 +1145,25 @@ impl Handler for MimicHandler {
             return self.feed_no_tty(channel, data, session).await;
         }
 
-        for &byte in data {
+        // A full-screen command has the terminal: keystrokes drive the display,
+        // not the line editor, until it quits and hands the prompt back.
+        let mut rest = data;
+        if self.screen.is_some() {
+            let quit_at = data.iter().position(|&byte| !self.screen_input(byte));
+            let Some(i) = quit_at else {
+                return Ok(());
+            };
+            // Real `top` clears the screen on its way out.
+            let bytes = self.out(SCREEN_HOME);
+            session.data(channel, bytes)?;
+            let prompt = self.shell().prompt();
+            self.editor.set_prompt(&prompt);
+            session.data(channel, self.editor.render().to_vec())?;
+            // Anything typed after the quit key is ordinary input again.
+            rest = &data[i + 1..];
+        }
+
+        for &byte in rest {
             // A command (e.g. `su`) is waiting for a password line: collect
             // bytes with echo suppressed until Enter, then resume the shell.
             if self.password_buf.is_some() {
@@ -1132,6 +1238,13 @@ impl Handler for MimicHandler {
 
                     if self.submit_line(channel, &line, session).await? {
                         return Ok(());
+                    }
+                    // A command took the screen (`top`): it paints itself and
+                    // keeps the terminal until the client quits it, so no
+                    // prompt is drawn.
+                    if let Some(screen) = self.shell().screen.take() {
+                        self.hold_screen(channel, screen, session)?;
+                        continue;
                     }
                     // A command left an interactive prompt pending (e.g. `su`
                     // asking for a password): switch to no-echo collection
@@ -1275,6 +1388,7 @@ mod tests {
             quarantine_bytes: 0,
             password_buf: None,
             line_buf: Vec::new(),
+            screen: None,
             _guard: guard,
         }
     }
@@ -1569,6 +1683,25 @@ mod tests {
         (seen, status)
     }
 
+    /// Collect whatever the server sends over `window`, then stop. Unlike
+    /// [`drain_until_closed`] this expects the channel to stay open, so it is
+    /// what a display that keeps painting has to be measured with.
+    async fn read_for(
+        channel: &mut russh::Channel<russh::client::Msg>,
+        window: Duration,
+    ) -> Vec<u8> {
+        let mut seen = Vec::new();
+        let _ = tokio::time::timeout(window, async {
+            while let Some(msg) = channel.wait().await {
+                if let russh::ChannelMsg::Data { ref data } = msg {
+                    seen.extend_from_slice(data);
+                }
+            }
+        })
+        .await;
+        seen
+    }
+
     /// Drain a channel keeping the two data streams apart, as the client's own
     /// stdout and stderr do.
     async fn drain_streams(
@@ -1786,6 +1919,79 @@ mod tests {
         // A shell that ended cleanly reports a status; without one `ssh`
         // reports 255, which no real server does.
         assert_eq!(status, Some(2), "missing exit status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real `top` holds the screen and repaints until `q`. One snapshot and an
+    /// immediate prompt is the tell this closes: the display has to keep
+    /// arriving with no further input, and the clock in its header has to move.
+    #[tokio::test]
+    async fn top_holds_the_screen_until_q() {
+        let (_handle, mut channel, dir) = shell_session("top-hold").await;
+        // Drain the login banner and first prompt.
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel.data(&b"top\r"[..]).await.expect("send top");
+        // Long enough for the paint plus at least one timed repaint.
+        let held = read_for(&mut channel, SCREEN_REFRESH + Duration::from_secs(2)).await;
+        let held = String::from_utf8_lossy(&held).into_owned();
+
+        let frames = held.matches("Tasks:").count();
+        assert!(
+            frames >= 2,
+            "expected a repaint with no further input, saw {frames} frame(s): {held:?}"
+        );
+        // A full-screen program homes the cursor and erases before painting,
+        // so each frame lands on top of the last instead of scrolling.
+        assert!(held.contains(SCREEN_HOME), "no screen-home before a frame");
+        // No prompt while the display owns the terminal.
+        assert!(
+            !held.contains("root@debian"),
+            "prompt drawn under top: {held:?}"
+        );
+
+        // `q` quits, and the shell comes back.
+        channel.data(&b"q"[..]).await.expect("send q");
+        let after = read_for(&mut channel, Duration::from_millis(400)).await;
+        let after = String::from_utf8_lossy(&after).into_owned();
+        assert!(
+            after.contains("root@debian"),
+            "no prompt after q: {after:?}"
+        );
+
+        // The redraw task is gone: nothing more arrives once it has quit.
+        let quiet = read_for(&mut channel, SCREEN_REFRESH + Duration::from_secs(1)).await;
+        assert!(
+            quiet.is_empty(),
+            "the redraw timer outlived the display: {:?}",
+            String::from_utf8_lossy(&quiet)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot `exec` has no terminal to hold, so `ssh host top` must print
+    /// its dump and exit rather than hanging until the idle timeout.
+    #[tokio::test]
+    async fn exec_top_prints_once_and_exits() {
+        let (handle, dir) = honeypot("exec-top").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.exec(true, &b"top"[..]).await.expect("exec");
+
+        let (seen, _, status) = drain_streams(&mut channel).await;
+        let out = String::from_utf8_lossy(&seen);
+
+        assert_eq!(
+            out.matches("Tasks:").count(),
+            1,
+            "expected one dump: {out:?}"
+        );
+        assert!(!out.contains(SCREEN_HOME), "exec should not paint a screen");
+        assert_eq!(status, Some(0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
