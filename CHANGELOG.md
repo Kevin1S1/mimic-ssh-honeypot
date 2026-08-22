@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more than once, as readline does.
 
 ### Security
+- Ctrl-D on an empty line now prints `logout` before the session ends, the same
+  line MIMIC's own `exit` prints. Ending in silence where a real login shell
+  announces itself is a one-keystroke tell, and it is the first thing a session
+  transcript shows.
+- A client closing its end of the connection now ends the session immediately.
+  End-of-input is what Ctrl-D delivers to a shell, so a real sshd session is
+  gone the moment stdin closes — `ssh -tt host < script` used to hang here until
+  the idle timeout instead of returning, and every abandoned probe held a
+  connection slot for `idle_timeout_secs`.
 - `cd` now needs a directory's execute (search) bit. An unprivileged session
   could `cd /root` and watch the prompt change while `ls /root` in that same
   directory answered `Permission denied` — a box that contradicts itself on two
