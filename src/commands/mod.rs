@@ -193,7 +193,35 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
 
         "true" => return CommandResult::ok(""),
         "false" => return CommandResult::err("", 1),
-        "exit" | "logout" => return CommandResult::ok(LOGOUT).exiting(),
+        "exit" | "logout" => {
+            if args.is_empty() {
+                return CommandResult {
+                    output: LOGOUT.to_string(),
+                    status: shell.last_status,
+                    exit: true,
+                };
+            }
+            if args.len() == 1 {
+                if let Ok(n) = args[0].parse::<i64>() {
+                    let code = ((n % 256 + 256) % 256) as i32;
+                    return CommandResult {
+                        output: LOGOUT.to_string(),
+                        status: code,
+                        exit: true,
+                    };
+                } else {
+                    return CommandResult {
+                        output: format!(
+                            "-bash: {cmd}: {}: numeric argument required\n{LOGOUT}",
+                            args[0]
+                        ),
+                        status: 2,
+                        exit: true,
+                    };
+                }
+            }
+            return CommandResult::err(format!("-bash: {cmd}: too many arguments\n"), 1);
+        }
 
         other => return CommandResult::err(format!("-bash: {other}: command not found\n"), 127),
     };

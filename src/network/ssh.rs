@@ -36,11 +36,6 @@ const MAX_COMMAND_LEN: usize = 4096;
 /// builtin's own output. Line endings are applied by [`MimicHandler::out`].
 const LOGOUT: &str = "logout\n";
 
-/// Status reported when the interactive shell ends. `exit`, Ctrl-D and a
-/// client EOF are all a login shell finishing normally, and all three have to
-/// agree: a status on one path but not another is a tell of its own.
-const SHELL_EXIT_STATUS: u32 = 0;
-
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
     // Persist host keys so the server fingerprint stays stable across restarts.
@@ -846,7 +841,7 @@ impl Handler for MimicHandler {
                             session.data(channel, bytes)?;
                         }
                         if output.exit {
-                            self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
+                            self.end_channel(channel, session, output.status as u32)?;
                             return Ok(());
                         }
                         let prompt = self.shell().prompt();
@@ -900,7 +895,8 @@ impl Handler for MimicHandler {
                     // echoed newline.
                     let bytes = self.out(LOGOUT);
                     session.data(channel, bytes)?;
-                    self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
+                    let status = self.shell().last_status as u32;
+                    self.end_channel(channel, session, status)?;
                     return Ok(());
                 }
                 Reaction::Submit { echo, line } => {
@@ -924,7 +920,7 @@ impl Handler for MimicHandler {
                         session.data(channel, bytes)?;
                     }
                     if result.exit {
-                        self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
+                        self.end_channel(channel, session, result.status as u32)?;
                         return Ok(());
                     }
                     // A command left an interactive prompt pending (e.g. `su`
@@ -958,7 +954,8 @@ impl Handler for MimicHandler {
             // session — and its connection slot — until the idle timeout.
             let bytes = self.out(LOGOUT);
             session.data(channel, bytes)?;
-            self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
+            let status = self.shell().last_status as u32;
+            self.end_channel(channel, session, status)?;
         }
         Ok(())
     }
@@ -1319,7 +1316,7 @@ mod tests {
             tail.ends_with("logout\r\n"),
             "expected the session to end with a logout line, got {tail:?}"
         );
-        assert_eq!(status, Some(SHELL_EXIT_STATUS), "missing exit status");
+        assert_eq!(status, Some(0), "missing exit status");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1339,7 +1336,7 @@ mod tests {
             tail.ends_with("logout\r\n"),
             "expected the session to end with a logout line, got {tail:?}"
         );
-        assert_eq!(status, Some(SHELL_EXIT_STATUS), "missing exit status");
+        assert_eq!(status, Some(0), "missing exit status");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1351,7 +1348,7 @@ mod tests {
     async fn exit_reports_a_status() {
         let (_handle, mut channel, dir) = shell_session("shell-exit").await;
 
-        channel.data(&b"exit\r"[..]).await.expect("send exit");
+        channel.data(&b"exit 42\r"[..]).await.expect("send exit");
         let (seen, status) = drain_until_closed(&mut channel).await;
 
         let tail = String::from_utf8_lossy(&seen);
@@ -1359,7 +1356,7 @@ mod tests {
             tail.ends_with("logout\r\n"),
             "expected the session to end with a logout line, got {tail:?}"
         );
-        assert_eq!(status, Some(SHELL_EXIT_STATUS), "missing exit status");
+        assert_eq!(status, Some(42), "missing exit status");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
