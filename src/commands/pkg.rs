@@ -116,10 +116,12 @@ pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
                 .filter(|p| !INSTALLED.iter().any(|(n, _, _)| n == *p))
                 .collect();
             if !unknown.is_empty() {
+                // apt's progress chatter is stdout; every `E:` line is stderr.
+                let mut errs = String::new();
                 for pkg in &unknown {
-                    out.push_str(&format!("E: Unable to locate package {pkg}\n"));
+                    errs.push_str(&format!("E: Unable to locate package {pkg}\n"));
                 }
-                return CommandResult::err(out, 100);
+                return CommandResult::streams(out, errs, 100);
             }
             out.push_str("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n");
             CommandResult::ok(out)

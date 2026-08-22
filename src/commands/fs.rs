@@ -67,11 +67,12 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
 
     let multiple = paths.len() > 1;
     let mut out = String::new();
+    let mut errs = String::new();
     let mut status = 0;
 
-    for (idx, path) in paths.iter().enumerate() {
+    for path in paths.iter() {
         let Some(target) = shell.vfs.resolve(shell.cwd, path) else {
-            out.push_str(&format!(
+            errs.push_str(&format!(
                 "ls: cannot access '{path}': No such file or directory\n"
             ));
             status = 2;
@@ -89,7 +90,7 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
         // like real `ls` — otherwise a non-root user reading e.g. /root would
         // be an obvious honeypot tell.
         if !node.meta.readable_by(shell.uid, shell.gid) {
-            out.push_str(&format!(
+            errs.push_str(&format!(
                 "ls: cannot open directory '{path}': Permission denied\n"
             ));
             status = 2;
@@ -97,7 +98,10 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
         }
 
         if multiple {
-            if idx > 0 {
+            // The blank line separates one listing from the next, so it
+            // depends on what actually reached stdout — an operand that failed
+            // wrote to stderr and does not earn one.
+            if !out.is_empty() {
                 out.push('\n');
             }
             out.push_str(&format!("{path}:\n"));
@@ -105,11 +109,7 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
         out.push_str(&list_dir(&shell.vfs, target, &flags));
     }
 
-    if status == 0 {
-        CommandResult::ok(out)
-    } else {
-        CommandResult::err(out, status)
-    }
+    CommandResult::streams(out, errs, status)
 }
 
 /// Render the listing for one directory's contents.
@@ -399,23 +399,24 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
     }
 
     let mut out = String::new();
+    let mut errs = String::new();
     let mut status = 0;
 
     for arg in args {
         let Some(id) = shell.vfs.resolve(shell.cwd, arg) else {
-            out.push_str(&format!("cat: {arg}: No such file or directory\n"));
+            errs.push_str(&format!("cat: {arg}: No such file or directory\n"));
             status = 1;
             continue;
         };
         let node = shell.vfs.node(id);
         if !node.meta.readable_by(shell.uid, shell.gid) {
-            out.push_str(&format!("cat: {arg}: Permission denied\n"));
+            errs.push_str(&format!("cat: {arg}: Permission denied\n"));
             status = 1;
             continue;
         }
         match &node.kind {
             NodeKind::Directory { .. } => {
-                out.push_str(&format!("cat: {arg}: Is a directory\n"));
+                errs.push_str(&format!("cat: {arg}: Is a directory\n"));
                 status = 1;
             }
             NodeKind::File { contents } => {
@@ -428,11 +429,7 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
         }
     }
 
-    if status == 0 {
-        CommandResult::ok(out)
-    } else {
-        CommandResult::err(out, status)
-    }
+    CommandResult::streams(out, errs, status)
 }
 
 /// Parse a numeric count operand for `head`/`tail` (`-n`/`-c`). Rejects
@@ -513,10 +510,11 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
 
     let show_headers = files.len() > 1;
     let mut out = String::new();
+    let mut errs = String::new();
     let mut status = 0;
     for (i, path) in files.iter().enumerate() {
         let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
-            out.push_str(&format!(
+            errs.push_str(&format!(
                 "{cmd}: cannot open '{path}' for reading: No such file or directory\n"
             ));
             status = 1;
@@ -524,14 +522,14 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
         };
         let node = shell.vfs.node(id);
         if !node.meta.readable_by(shell.uid, shell.gid) {
-            out.push_str(&format!(
+            errs.push_str(&format!(
                 "{cmd}: cannot open '{path}' for reading: Permission denied\n"
             ));
             status = 1;
             continue;
         }
         let NodeKind::File { contents } = &node.kind else {
-            out.push_str(&format!("{cmd}: error reading '{path}': Is a directory\n"));
+            errs.push_str(&format!("{cmd}: error reading '{path}': Is a directory\n"));
             status = 1;
             continue;
         };
@@ -544,11 +542,7 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
         out.push_str(&select_slice(contents, count, by_bytes, from_end));
     }
 
-    if status == 0 {
-        CommandResult::ok(out)
-    } else {
-        CommandResult::err(out, status)
-    }
+    CommandResult::streams(out, errs, status)
 }
 
 /// The "invalid number of lines/bytes" error shared by `head`/`tail`.
@@ -640,24 +634,25 @@ pub fn wc(shell: &Shell, args: &[String]) -> CommandResult {
     }
 
     let mut out = String::new();
+    let mut errs = String::new();
     let mut status = 0;
     let (mut tl, mut tw, mut tc) = (0usize, 0usize, 0usize);
     let mut counted = 0;
 
     for path in &files {
         let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
-            out.push_str(&format!("wc: {path}: No such file or directory\n"));
+            errs.push_str(&format!("wc: {path}: No such file or directory\n"));
             status = 1;
             continue;
         };
         let node = shell.vfs.node(id);
         if !node.meta.readable_by(shell.uid, shell.gid) {
-            out.push_str(&format!("wc: {path}: Permission denied\n"));
+            errs.push_str(&format!("wc: {path}: Permission denied\n"));
             status = 1;
             continue;
         }
         let NodeKind::File { contents } = &node.kind else {
-            out.push_str(&format!("wc: {path}: Is a directory\n"));
+            errs.push_str(&format!("wc: {path}: Is a directory\n"));
             status = 1;
             continue;
         };
@@ -678,11 +673,7 @@ pub fn wc(shell: &Shell, args: &[String]) -> CommandResult {
         out.push_str(" total\n");
     }
 
-    if status == 0 {
-        CommandResult::ok(out)
-    } else {
-        CommandResult::err(out, status)
-    }
+    CommandResult::streams(out, errs, status)
 }
 
 /// Format the selected `wc` counts as coreutils does: each count right-aligned
@@ -790,10 +781,11 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
     flags.show_filename = paths.len() > 1 || recursive;
 
     let mut out = String::new();
+    let mut errs = String::new();
     let mut any_match = false;
     for path in &paths {
         let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
-            out.push_str(&format!("grep: {path}: No such file or directory\n"));
+            errs.push_str(&format!("grep: {path}: No such file or directory\n"));
             continue;
         };
         if shell.vfs.node(id).meta.is_dir() {
@@ -810,10 +802,10 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
                     &mut any_match,
                 );
             } else {
-                out.push_str(&format!("grep: {path}: Is a directory\n"));
+                errs.push_str(&format!("grep: {path}: Is a directory\n"));
             }
         } else if !shell.vfs.node(id).meta.readable_by(shell.uid, shell.gid) {
-            out.push_str(&format!("grep: {path}: Permission denied\n"));
+            errs.push_str(&format!("grep: {path}: Permission denied\n"));
         } else {
             grep_file(
                 &shell.vfs,
@@ -827,11 +819,7 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
         }
     }
 
-    if any_match {
-        CommandResult::ok(out)
-    } else {
-        CommandResult::err(out, 1)
-    }
+    CommandResult::streams(out, errs, i32::from(!any_match))
 }
 
 /// Search a single file's contents for `needle`, appending matching lines.
@@ -1183,8 +1171,12 @@ fn tar_write_header(
 /// The archive `tar -c` is building, plus what it has to say about it.
 struct TarBuild {
     bytes: Vec<u8>,
-    /// Warnings and, under `-v`, the member names as they are added.
+    /// Under `-v`, the member names as they are added. GNU tar puts these on
+    /// stdout whenever the archive itself is not going there, which it never
+    /// is here — only the `tar: …` diagnostics below go to stderr.
     log: String,
+    /// Warnings and errors about members that could not be archived.
+    errs: String,
     status: i32,
     verbose: bool,
     /// The archive's own node, when it already exists: a tree containing it
@@ -1201,7 +1193,7 @@ struct TarBuild {
 fn tar_walk(shell: &Shell, id: NodeId, name: &str, build: &mut TarBuild) {
     if build.archive == Some(id) {
         build
-            .log
+            .errs
             .push_str(&format!("tar: {name}: file is the archive; not dumped\n"));
         return;
     }
@@ -1216,7 +1208,7 @@ fn tar_walk(shell: &Shell, id: NodeId, name: &str, build: &mut TarBuild) {
         NodeKind::File { contents } => {
             if !node.meta.readable_by(shell.uid, shell.gid) {
                 build
-                    .log
+                    .errs
                     .push_str(&format!("tar: {name}: Cannot open: Permission denied\n"));
                 build.status = 2;
                 return;
@@ -1237,7 +1229,7 @@ fn tar_walk(shell: &Shell, id: NodeId, name: &str, build: &mut TarBuild) {
             }
             if !node.meta.readable_by(shell.uid, shell.gid) {
                 build
-                    .log
+                    .errs
                     .push_str(&format!("tar: {name}: Cannot open: Permission denied\n"));
                 build.status = 2;
                 return;
@@ -1363,8 +1355,10 @@ fn tar_has_dot_dot(name: &str) -> bool {
 /// Strip the leading run GNU tar drops from a member name — every component up
 /// to and including the last `..`, plus the slashes after it — warning the
 /// first time each distinct prefix is dropped, exactly as tar does. `warned`
-/// carries the last prefix warned about across the members of one run.
-fn tar_strip_leading<'a>(name: &'a str, warned: &mut String, log: &mut String) -> &'a str {
+/// carries the last prefix warned about across the members of one run, and the
+/// warning itself goes to `errs` — it is a `tar:` diagnostic, not part of the
+/// listing.
+fn tar_strip_leading<'a>(name: &'a str, warned: &mut String, errs: &mut String) -> &'a str {
     let b = name.as_bytes();
     let mut prefix = 0;
     let mut i = 0;
@@ -1385,7 +1379,7 @@ fn tar_strip_leading<'a>(name: &'a str, warned: &mut String, log: &mut String) -
     if prefix > 0 && warned.as_str() != &name[..prefix] {
         warned.clear();
         warned.push_str(&name[..prefix]);
-        log.push_str(&format!(
+        errs.push_str(&format!(
             "tar: Removing leading `{warned}' from member names\n"
         ));
     }
@@ -1526,6 +1520,7 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
         let mut build = TarBuild {
             bytes: Vec::new(),
             log: String::new(),
+            errs: String::new(),
             status: 0,
             verbose,
             archive: shell.vfs.child(parent, &name),
@@ -1533,7 +1528,7 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
         let mut warned = String::new();
         for member in &members {
             let Some(id) = shell.vfs.resolve(shell.cwd, member) else {
-                build.log.push_str(&format!(
+                build.errs.push_str(&format!(
                     "tar: {member}: Cannot stat: No such file or directory\n"
                 ));
                 build.status = 2;
@@ -1542,7 +1537,7 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
             // An operand is stored relative, without the leading `/` or `../`
             // run tar refuses to put in an archive.
             let stored =
-                tar_strip_leading(strip_trailing_slashes(member), &mut warned, &mut build.log);
+                tar_strip_leading(strip_trailing_slashes(member), &mut warned, &mut build.errs);
             let stored = if stored.is_empty() { "." } else { stored };
             tar_walk(shell, id, stored, &mut build);
         }
@@ -1550,7 +1545,8 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
         // factor — which is what makes a real archive's size a round 10240.
         let TarBuild {
             mut bytes,
-            mut log,
+            log,
+            mut errs,
             status,
             ..
         } = build;
@@ -1569,15 +1565,15 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
         );
         if !stored_ok {
             // A full disk stops tar dead, before it can summarise anything else.
-            log.push_str(&format!(
+            errs.push_str(&format!(
                 "tar: {archive_path}: Cannot write: No space left on device\ntar: Error is not recoverable: exiting now\n"
             ));
-            return CommandResult::err(log, 2);
+            return CommandResult::streams(log, errs, 2);
         }
         if status != 0 {
-            log.push_str("tar: Exiting with failure status due to previous errors\n");
+            errs.push_str("tar: Exiting with failure status due to previous errors\n");
         }
-        return finish(log, status);
+        return CommandResult::streams(log, errs, status);
     }
 
     if extract || list {
@@ -1627,19 +1623,20 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
 
         if list {
             let mut out = String::new();
+            let mut errs = String::new();
             let mut ugswidth = TAR_UGSWIDTH;
             let mut warned = String::new();
             for entry in entries.iter().filter(|e| tar_selected(&e.name, &members)) {
                 // A listing warns about the prefix it would strip on the way
                 // out, but prints the name the archive actually stores.
-                tar_strip_leading(&entry.name, &mut warned, &mut out);
+                tar_strip_leading(&entry.name, &mut warned, &mut errs);
                 if verbose {
                     out.push_str(&tar_long_entry(entry, &mut ugswidth));
                 } else {
                     out.push_str(&format!("{}\n", entry.name));
                 }
             }
-            return CommandResult::ok(out);
+            return CommandResult::streams(out, errs, 0);
         }
 
         // Extraction mutates the VFS, so take a copy of the archive bytes and
@@ -1647,17 +1644,18 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
         let data = contents.clone();
         let (uid, gid) = (shell.uid, shell.gid);
         let mut out = String::new();
+        let mut errs = String::new();
         let mut status = 0;
         let mut warned = String::new();
         for entry in entries {
             if !tar_selected(&entry.name, &members) {
                 continue;
             }
-            let member = tar_strip_leading(&entry.name, &mut warned, &mut out).to_string();
+            let member = tar_strip_leading(&entry.name, &mut warned, &mut errs).to_string();
             // A `..` left anywhere in the name is refused outright: an archive
             // does not get to choose a path outside the one being extracted to.
             if tar_has_dot_dot(&entry.name) {
-                out.push_str(&format!("tar: {}: Member name contains '..'\n", entry.name));
+                errs.push_str(&format!("tar: {}: Member name contains '..'\n", entry.name));
                 status = 2;
                 continue;
             }
@@ -1665,14 +1663,14 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
                 out.push_str(&format!("{member}\n"));
             }
             let Some((parent, name)) = tar_dest(shell, &member) else {
-                out.push_str(&format!(
+                errs.push_str(&format!(
                     "tar: {member}: Cannot open: No such file or directory\n"
                 ));
                 status = 2;
                 continue;
             };
             if !shell.vfs.node(parent).meta.writable_by(uid, gid) {
-                out.push_str(&format!("tar: {member}: Cannot open: Permission denied\n"));
+                errs.push_str(&format!("tar: {member}: Cannot open: Permission denied\n"));
                 status = 2;
                 continue;
             }
@@ -1701,7 +1699,7 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
                         NodeKind::File { contents } if contents.len() == body.len()
                     );
                     if !stored_ok {
-                        out.push_str(&format!(
+                        errs.push_str(&format!(
                             "tar: {member}: Cannot write: No space left on device\n"
                         ));
                         status = 2;
@@ -1713,9 +1711,9 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
             }
         }
         if status != 0 {
-            out.push_str("tar: Exiting with failure status due to previous errors\n");
+            errs.push_str("tar: Exiting with failure status due to previous errors\n");
         }
-        return finish(out, status);
+        return CommandResult::streams(out, errs, status);
     }
 
     CommandResult::err(
@@ -1762,13 +1760,11 @@ fn basename(path: &str) -> &str {
     Vfs::split_path(strip_trailing_slashes(path)).1
 }
 
-/// Build a [`CommandResult`] from accumulated output and an exit status.
-fn finish(out: String, status: i32) -> CommandResult {
-    if status == 0 {
-        CommandResult::ok(out)
-    } else {
-        CommandResult::err(out, status)
-    }
+/// Build a [`CommandResult`] from the diagnostics a mutating operation
+/// accumulated and its exit status. These commands say nothing on success, so
+/// everything they collected is stderr.
+fn finish(errs: String, status: i32) -> CommandResult {
+    CommandResult::err(errs, status)
 }
 
 /// `touch [OPTION]... FILE...`
@@ -2868,16 +2864,21 @@ mod tests {
 
         // Listing is the asymmetric half: it warns about the prefix it would
         // strip, prints every stored name unchanged, and succeeds — the `..`
-        // refusal belongs to extraction alone.
+        // refusal belongs to extraction alone. The listing is stdout and every
+        // `tar:` warning is stderr, so `tar tf … 2>/dev/null` is just names.
+        let listed = shell.execute("tar tf trav.tar");
         assert_eq!(
-            run(&mut shell, "tar tf trav.tar"),
-            "tar: Removing leading `../' from member names\n\
-             ../evil\n\
-             tar: Removing leading `a/../../' from member names\n\
+            listed.stdout,
+            "../evil\n\
              a/../../etc/passwd\n\
-             tar: Removing leading `/' from member names\n\
              /abs\n\
              ok\n"
+        );
+        assert_eq!(
+            listed.stderr,
+            "tar: Removing leading `../' from member names\n\
+             tar: Removing leading `a/../../' from member names\n\
+             tar: Removing leading `/' from member names\n"
         );
         assert_eq!(shell.last_status, 0);
 
