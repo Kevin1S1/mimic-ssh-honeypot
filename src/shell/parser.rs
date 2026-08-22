@@ -4,8 +4,93 @@
 //! and backslash escaping, cuts a `#` comment off a line, splits a compound
 //! line on `;`, `&&`, and `||`, a segment into pipeline stages on `|`, and a
 //! stage's output redirections off its command text. This is deliberately
-//! small: command substitution and heredocs are intentionally unsupported.
-//! Variable expansion happens *before* tokenization in [`crate::shell::Shell`].
+//! small: heredocs are intentionally unsupported. Variable expansion — and the
+//! command substitution the splitters below skip over — happens *before*
+//! tokenization in [`crate::shell::Shell`].
+
+/// A `$(…)`, `` `…` `` or `$((…))` region found in a raw line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Substitution {
+    /// Byte index just past the closing delimiter.
+    pub end: usize,
+    /// Byte range of the text between the delimiters.
+    pub body: (usize, usize),
+    /// `$((…))`: the body is an arithmetic expression, not a command line.
+    pub arithmetic: bool,
+}
+
+/// Recognise a substitution starting at byte `i`, returning where it ends and
+/// what is inside it.
+///
+/// A substitution is one word to bash, so everything that splits a *raw* line —
+/// comments, `;`/`&&`/`||`, pipes, redirections — has to step over it whole, or
+/// `echo $(ls | wc -l)` becomes two pipeline stages and `$((3>2))` becomes a
+/// redirect. Quoting inside the body is tracked (`$(echo ')')` does not end
+/// early) and `$(…)` nests; backticks do not nest in bash either, so the scan
+/// for the closing one is flat. Returns `None` for an unterminated region,
+/// which leaves the caller scanning it as ordinary text.
+pub fn substitution_at(line: &str, i: usize) -> Option<Substitution> {
+    let bytes = line.as_bytes();
+    match bytes.get(i)? {
+        b'`' => {
+            let mut j = i + 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' => j += 1,
+                    b'`' => {
+                        return Some(Substitution {
+                            end: j + 1,
+                            body: (i + 1, j),
+                            arithmetic: false,
+                        })
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        b'$' if bytes.get(i + 1) == Some(&b'(') => {
+            // `$((` is read as arithmetic, as bash's own ambiguity resolves it
+            // for everything but a subshell written `$( (cmd) )`.
+            let arithmetic = bytes.get(i + 2) == Some(&b'(');
+            let mut depth = 0usize;
+            let mut in_single = false;
+            let mut in_double = false;
+            let mut j = i + 1;
+
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' if !in_single => j += 1,
+                    b'\'' if !in_double => in_single = !in_single,
+                    b'"' if !in_single => in_double = !in_double,
+                    b'(' if !in_single && !in_double => depth += 1,
+                    b')' if !in_single && !in_double => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // Closing an arithmetic region takes two `)`, so
+                            // the body never runs past its own start.
+                            let body = if arithmetic {
+                                (i + 3, j - 1)
+                            } else {
+                                (i + 2, j)
+                            };
+                            return Some(Substitution {
+                                end: j + 1,
+                                body,
+                                arithmetic,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => None,
+    }
+}
 
 /// Cut a `#` comment off the end of `line`, returning what is left to run.
 ///
@@ -25,12 +110,23 @@ pub fn strip_comment(line: &str) -> &str {
     let mut word_start = true;
 
     let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
+    let mut i = 0;
+    while i < bytes.len() {
         let c = bytes[i];
         if escaped {
             escaped = false;
             word_start = false;
+            i += 1;
             continue;
+        }
+        // A `#` inside `$(…)` comments out the rest of *that* command, which is
+        // the substitution's business, not this line's.
+        if !in_single {
+            if let Some(subst) = substitution_at(line, i) {
+                i = subst.end;
+                word_start = false;
+                continue;
+            }
         }
         match c {
             b'\\' if !in_single => escaped = true,
@@ -39,15 +135,18 @@ pub fn strip_comment(line: &str) -> &str {
             b'#' if word_start && !in_single && !in_double => return &line[..i],
             b';' | b'&' | b'|' if !in_single && !in_double => {
                 word_start = true;
+                i += 1;
                 continue;
             }
             c if c.is_ascii_whitespace() && !in_single && !in_double => {
                 word_start = true;
+                i += 1;
                 continue;
             }
             _ => {}
         }
         word_start = false;
+        i += 1;
     }
     line
 }
@@ -95,6 +194,12 @@ pub fn split_segments(line: &str) -> Vec<Segment<'_>> {
             escaped = false;
             i += 1;
             continue;
+        }
+        if !in_single {
+            if let Some(subst) = substitution_at(line, i) {
+                i = subst.end;
+                continue;
+            }
         }
         match c {
             b'\\' if !in_single => escaped = true,
@@ -144,10 +249,18 @@ pub fn split_pipeline(segment: &str) -> Vec<&str> {
     let mut escaped = false;
 
     let bytes = segment.as_bytes();
-    for i in 0..bytes.len() {
+    let mut i = 0;
+    while i < bytes.len() {
         if escaped {
             escaped = false;
+            i += 1;
             continue;
+        }
+        if !in_single {
+            if let Some(subst) = substitution_at(segment, i) {
+                i = subst.end;
+                continue;
+            }
         }
         match bytes[i] {
             b'\\' if !in_single => escaped = true,
@@ -159,6 +272,7 @@ pub fn split_pipeline(segment: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        i += 1;
     }
     stages.push(&segment[start..]);
     stages
@@ -233,6 +347,15 @@ pub fn split_redirects(stage: &str) -> Result<(String, Vec<Redirect>), String> {
             escaped = false;
             i += 1;
             continue;
+        }
+        // `$((3>2))` is one word, not a redirect, and a `>` inside `$(…)`
+        // belongs to the command being substituted.
+        if !in_single {
+            if let Some(subst) = substitution_at(stage, i) {
+                i = subst.end;
+                plain_word = false;
+                continue;
+            }
         }
         match c {
             b'\\' if !in_single => {
@@ -337,6 +460,13 @@ fn word_end(s: &str, start: usize) -> usize {
             i += 1;
             continue;
         }
+        // `> $(echo f)` names one target word, spaces and all.
+        if !in_single {
+            if let Some(subst) = substitution_at(s, i) {
+                i = subst.end;
+                continue;
+            }
+        }
         match c {
             b'\\' if !in_single => escaped = true,
             b'\'' if !in_double => in_single = !in_single,
@@ -418,6 +548,55 @@ mod tests {
             .into_iter()
             .map(|s| (s.run_if, s.text))
             .collect()
+    }
+
+    #[test]
+    fn a_substitution_is_one_word_to_every_splitter() {
+        // Separators, pipes, redirects and comments inside `$(…)` belong to the
+        // command being substituted, not to the line holding it.
+        assert_eq!(
+            strip_comment("echo $(ls # inner) # outer"),
+            "echo $(ls # inner) "
+        );
+        assert_eq!(
+            split("echo $(a; b) && c"),
+            vec![
+                (Separator::Always, "echo $(a; b) "),
+                (Separator::AndIf, " c"),
+            ]
+        );
+        assert_eq!(
+            split_pipeline("echo $(a | b) | c"),
+            vec!["echo $(a | b) ", " c"]
+        );
+        assert_eq!(
+            split_redirects("echo $((3>2))").unwrap(),
+            ("echo $((3>2))".to_string(), vec![])
+        );
+        // The target word is still found, substitution and all.
+        assert_eq!(
+            split_redirects("echo hi > $(echo /tmp/f)").unwrap(),
+            (
+                "echo hi ".to_string(),
+                vec![Redirect {
+                    stream: Stream::Stdout,
+                    target: Target::File {
+                        path: "$(echo /tmp/f)".to_string(),
+                        append: false,
+                    },
+                }]
+            )
+        );
+        // Backticks and quoting inside the body are handled too, and a single
+        // quote around the whole thing turns it back into ordinary text.
+        assert_eq!(split_pipeline("echo `a | b` c"), vec!["echo `a | b` c"]);
+        assert_eq!(
+            split_pipeline("echo $(a ')' | b)"),
+            vec!["echo $(a ')' | b)"]
+        );
+        assert_eq!(split_pipeline("echo '$(a | b)'"), vec!["echo '$(a | b)'"]);
+        // An unterminated one is scanned as the ordinary text it looks like.
+        assert_eq!(split_pipeline("echo $(a | b"), vec!["echo $(a ", " b"]);
     }
 
     #[test]

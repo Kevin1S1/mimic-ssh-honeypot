@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path it actually carries.
 
 ### Security
+- Command substitution. `$(…)`, backticks and `$((…))` were echoed back
+  literally, so `echo $(whoami)` printed `$(whoami)` — a one-command check that
+  identifies the shell as fake, and one that hides the payload of anything
+  written as `$(wget http://x/a)`. The body now runs as a command line of its
+  own — separators, pipes, redirections and `#` comments inside it belong to it,
+  not to the line around it — and its output is spliced back in with trailing
+  newlines stripped, splitting into words only where bash would. `$((…))`
+  evaluates 64-bit integer arithmetic with the usual precedence, parentheses,
+  comparisons, and names read from the environment. A substitution runs in a
+  subshell: `cd`, `export` and `su` inside one no longer leak into the session,
+  it cannot log the session out, and what it captured (a `wget` inside `$(…)`)
+  is recorded alongside the rest of the line's. Both new recursions are bounded
+  — nesting reuses the command-nesting cap, since the descent happens during
+  expansion before any command is dispatched, and a per-line budget bounds the
+  total output a line can splice into itself, so hundreds of substitutions of a
+  large file cannot multiply the 1 MiB output cap.
 - Variable expansion now respects the quoting around it, and what a variable
   holds is treated as data rather than as more shell source. `echo "it's
   $USER"` printed `it's $USER`, because the apostrophe inside double quotes was
