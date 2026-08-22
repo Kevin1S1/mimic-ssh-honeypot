@@ -623,6 +623,10 @@ impl Shell {
     fn open_redirects(&mut self, redirects: &[parser::Redirect]) -> Result<Sinks, String> {
         let mut sinks = Sinks::default();
         for redirect in redirects {
+            // `>&1` and `2>&2` point a stream at itself, which changes nothing.
+            if matches!(&redirect.target, parser::Target::Dup(s) if *s == redirect.stream) {
+                continue;
+            }
             // A dup against a stream that is still the terminal cannot be
             // resolved to a sink: it means "come back on that stream instead",
             // which only the routing below can honour.
@@ -1364,10 +1368,14 @@ mod tests {
         );
         assert_eq!(out.stderr, "");
         assert_eq!(shell.execute("ls /nope 2>&1 | wc -l").stdout, "1\n");
-        // The mirror case sends stdout to stderr instead.
+        // The mirror case sends stdout to stderr instead, and a stream pointed
+        // at itself changes nothing.
         let out = shell.execute("echo oops >&2");
         assert_eq!(out.stdout, "");
         assert_eq!(out.stderr, "oops\n");
+        let out = shell.execute("echo fine >&1");
+        assert_eq!(out.stdout, "fine\n");
+        assert_eq!(out.stderr, "");
 
         // Redirects apply left to right: `2>&1 > f` duplicates stderr onto the
         // terminal first, then moves stdout to the file, so the error is still
