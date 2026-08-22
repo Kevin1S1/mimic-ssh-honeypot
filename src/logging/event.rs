@@ -69,14 +69,26 @@ pub fn command(session_id: u64, peer: SocketAddr, command: &str) {
     info!(event = "command", sensor_name = sensor_name(), session_id, peer = %peer, command);
 }
 
-/// A file was uploaded via SCP and written to the quarantine store. `name` is
-/// the attacker-supplied filename, `dest` the path it was materialised at in
-/// the emulated filesystem, `sha256` the hash of the complete payload as it
-/// came off the wire (what an IOC lookup needs), `stored_sha256` the hash of
-/// the bytes actually kept — also the quarantine filename — and `stored_path`
-/// where those bytes landed on the real disk (empty if the quarantine write
-/// failed). `truncated` flags uploads capped at the configured size limit; the
-/// two hashes are identical unless it is set.
+/// An SSH subsystem request (such as `sftp`) was received from the client.
+pub fn subsystem_request(session_id: u64, peer: SocketAddr, subsystem: &str, accepted: bool) {
+    info!(
+        event = "subsystem_request",
+        sensor_name = sensor_name(),
+        session_id,
+        peer = %peer,
+        subsystem,
+        accepted,
+    );
+}
+
+/// A file was uploaded via SCP or SFTP and written to the quarantine store.
+/// `name` is the attacker-supplied filename, `dest` the path it was
+/// materialised at in the emulated filesystem, `sha256` the hash of the
+/// complete payload as it came off the wire (what an IOC lookup needs),
+/// `stored_sha256` the hash of the bytes actually kept — also the quarantine
+/// filename — and `stored_path` where those bytes landed on the real disk (empty
+/// if the quarantine write failed). `truncated` flags uploads capped at the
+/// configured size limit; the two hashes are identical unless it is set.
 #[allow(clippy::too_many_arguments)]
 pub fn upload(
     session_id: u64,
@@ -213,6 +225,25 @@ mod tests {
         assert_eq!(dl["tool"], "wget");
         assert_eq!(dl["url"], "http://evil.example/x.sh");
         assert_eq!(dl["dest"], "/root/x.sh");
+    }
+
+    #[test]
+    fn subsystem_request_event_records_name_and_status() {
+        let (_, events) = capture(|| {
+            subsystem_request(4, peer(), "sftp", true);
+            subsystem_request(4, peer(), "custom", false);
+        });
+        assert_eq!(events.len(), 2);
+        let sftp = fields(&events[0]);
+        assert_eq!(sftp["event"], "subsystem_request");
+        assert_eq!(sftp["session_id"], 4);
+        assert_eq!(sftp["subsystem"], "sftp");
+        assert_eq!(sftp["accepted"], true);
+
+        let custom = fields(&events[1]);
+        assert_eq!(custom["event"], "subsystem_request");
+        assert_eq!(custom["subsystem"], "custom");
+        assert_eq!(custom["accepted"], false);
     }
 
     #[test]

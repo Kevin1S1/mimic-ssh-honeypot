@@ -23,8 +23,8 @@ All emulated commands (`ls`, `cat`, `rm`, `touch`, etc.) operate purely on the `
 ### 4. Fake Networking (`wget`, `curl`, `ping`)
 When an attacker attempts to download a malicious payload via `wget` or `curl`, the honeypot fakes the download progress, generates a fake IP resolution, and drops a placeholder of the reported size — bounded by the VFS content cap — into the in-memory VFS. It never actually opens a network socket to fetch the file, preventing the honeypot from being used in DDoS amplification attacks or as an open proxy.
 
-### 5. Safe SCP Quarantining
-The only time the honeypot touches the real disk based on attacker input is during an SCP upload. This is heavily sanitized:
+### 5. Safe SCP and SFTP Quarantining
+The only time the honeypot touches the real disk based on attacker input is during an SCP or SFTP upload. This is heavily sanitized:
 - Path separators (`/`, `\`) and `..` are replaced with `_` in that order — separators first, so the dotless replacement can never let `..` re-form after the collapse.
 - Control bytes (including NUL) are stripped to prevent log/VFS injection.
 - Files are deduplicated and saved by their SHA-256 hash, so the attacker-supplied name never influences the stored path on disk.
@@ -79,7 +79,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 ```
 
 ### Adversary model
-- **Capabilities:** can open arbitrary TCP connections; speak SSH; attempt unlimited credentials; type arbitrary bytes (including malformed UTF-8, ANSI escapes, oversized lines, control floods); run any command string; upload arbitrary files via SCP.
+- **Capabilities:** can open arbitrary TCP connections; speak SSH; attempt unlimited credentials; type arbitrary bytes (including malformed UTF-8, ANSI escapes, oversized lines, control floods); run any command string; upload arbitrary files via SCP or SFTP.
 - **Assumed goals:** RCE on the host, escaping the emulation, reading the real filesystem, using the host as a pivot/proxy/DDoS amplifier, exhausting host resources, or fingerprinting the honeypot.
 - **Out of scope:** attacks on the host kernel/hypervisor, supply-chain compromise of the build toolchain, and a privileged operator misconfiguring the deployment (see the README Disclaimer).
 
@@ -91,7 +91,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T2 | Real filesystem read/write | `cat`, `rm`, `cp`, path traversal | All ops act on the in-memory `Vfs`; real FS decoupled | None by design |
 | T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; fuzz/robustness tests on the line editor | Unknown bug in a dependency |
 | T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping` to attacker host | Network commands are faked; no real socket opened | None by design |
-| T5 | Disk exhaustion | SCP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec, per-session quarantine disk-write cap (`max_upload_bytes` × 32) | Bounded per session; capped total across sessions only by the daily reset |
+| T5 | Disk exhaustion | SCP / SFTP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec, per-session quarantine disk-write cap (`max_upload_bytes` × 32) | Bounded per session; capped total across sessions only by the daily reset |
 | T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output, SSH channel flood | Shipped defaults cap connections at 32 globally/4 per IP under a 1 GiB process ceiling; each connection permits one active channel; VFS ≤ 2k nodes and ≤ 8 MiB content bytes; uploads ≤ 8 MiB; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session and by deployment memory controls |
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |

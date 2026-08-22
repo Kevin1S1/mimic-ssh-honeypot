@@ -217,7 +217,7 @@ fn allocated_kib(vfs: &Vfs, id: NodeId) -> u64 {
 }
 
 /// Apparent size of a node, as `ls -l` reports it.
-fn node_size(node: &crate::vfs::Node) -> u64 {
+pub(crate) fn node_size(node: &crate::vfs::Node) -> u64 {
     match &node.kind {
         NodeKind::File { contents } => contents.len() as u64,
         NodeKind::Symlink { target } => target.len() as u64,
@@ -226,7 +226,7 @@ fn node_size(node: &crate::vfs::Node) -> u64 {
 }
 
 /// Render a numeric mode as a `drwxr-xr-x`-style string.
-fn mode_string(mode: u32) -> String {
+pub(crate) fn mode_string(mode: u32) -> String {
     let type_char = match mode & S_IFMT {
         S_IFDIR => 'd',
         S_IFLNK => 'l',
@@ -244,7 +244,7 @@ fn mode_string(mode: u32) -> String {
 }
 
 /// Format a unix timestamp the way `ls -l` does (`May  3 00:00`), in UTC.
-fn format_time(ts: i64) -> String {
+pub(crate) fn format_time(ts: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -304,7 +304,7 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// Map a uid to a Debian account name.
-fn uid_name(uid: u32) -> String {
+pub(crate) fn uid_name(uid: u32) -> String {
     match uid {
         0 => "root".into(),
         1 => "daemon".into(),
@@ -321,7 +321,7 @@ fn uid_name(uid: u32) -> String {
 }
 
 /// Map a gid to a Debian group name.
-fn gid_name(gid: u32) -> String {
+pub(crate) fn gid_name(gid: u32) -> String {
     match gid {
         0 => "root".into(),
         4 => "adm".into(),

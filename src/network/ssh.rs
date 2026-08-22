@@ -10,6 +10,7 @@ use crate::config::{AuthMode, Config};
 use crate::logging::event;
 use crate::network::limiter::{ConnectionGuard, ConnectionRegistry};
 use crate::network::scp::{self, ScpMode, ScpSink};
+use crate::network::sftp::{self, SftpSession};
 use crate::shell::complete::{self, Completion};
 use crate::shell::line::{is_continuation, LineEditor, Reaction};
 use crate::shell::{Capture, Shell};
@@ -118,6 +119,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             shell: None,
             active_channel: None,
             scp: None,
+            sftp: None,
             quarantine_bytes: 0,
             password_buf: None,
             _guard: guard,
@@ -234,6 +236,8 @@ struct MimicHandler {
     active_channel: Option<u32>,
     /// Active SCP upload sink, when the channel is running `scp -t`.
     scp: Option<ScpSink>,
+    /// Active SFTP session, when the channel requested the `sftp` subsystem.
+    sftp: Option<SftpSession>,
     /// Cumulative bytes this session has written to the real-disk quarantine
     /// store. Bounds disk growth from a flood of distinct small uploads (the
     /// content-addressed dedup only bounds *repeated* payloads).
@@ -269,6 +273,7 @@ impl MimicHandler {
             self.editor = LineEditor::new(MAX_COMMAND_LEN, 1000);
             self.shell = None;
             self.scp = None;
+            self.sftp = None;
             self.password_buf = None;
             self.shell_started = false;
             // `pty-req` is per channel: a connection that runs an interactive
@@ -445,8 +450,8 @@ impl MimicHandler {
             String::new()
         } else {
             match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
-                Ok(p) => {
-                    self.quarantine_bytes += file.data.len() as u64;
+                Ok((p, written)) => {
+                    self.quarantine_bytes += written;
                     p
                 }
                 Err(err) => {
@@ -470,6 +475,58 @@ impl MimicHandler {
             &stored_sha256,
             &stored_path,
             file.truncated,
+        );
+    }
+
+    /// Persist one SFTP-uploaded file: copy it to the quarantine store on the
+    /// real filesystem, and emit an `upload` event. (The file is already written
+    /// to the session VFS during SFTP close).
+    fn store_sftp_upload(&mut self, upload: sftp::SftpCompletedUpload) {
+        let (session_id, peer) = (self.session_id, self.peer);
+        let quarantine_dir = self.config.quarantine_dir.clone();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&upload.data);
+        let stored_sha256 = hex(&hasher.finalize());
+
+        let cap = self
+            .config
+            .max_upload_bytes
+            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
+        let stored_path = if self
+            .quarantine_bytes
+            .saturating_add(upload.data.len() as u64)
+            > cap
+        {
+            tracing::warn!(event = "quarantine_session_cap", session_id);
+            String::new()
+        } else {
+            match write_quarantine(&quarantine_dir, &stored_sha256, &upload.data) {
+                Ok((p, written)) => {
+                    self.quarantine_bytes += written;
+                    p
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        event = "quarantine_error",
+                        session_id,
+                        error = %err,
+                    );
+                    String::new()
+                }
+            }
+        };
+
+        event::upload(
+            session_id,
+            peer,
+            &upload.name,
+            &upload.dest_path,
+            upload.size,
+            &upload.payload_sha256,
+            &stored_sha256,
+            &stored_path,
+            upload.truncated,
         );
     }
 
@@ -538,22 +595,29 @@ fn abs_path(cwd: &str, path: &str) -> String {
 }
 
 /// Write `data` to `<dir>/<sha256>` (deduplicating by content hash), creating
-/// `dir` if needed. Returns the stored file's path. Files are created
+/// `dir` if needed. Returns `(stored_path, newly_written_bytes)`. Files are created
 /// non-executable and owner-read/write only (`0600`) at creation time so a
 /// captured payload can never be run from the quarantine store and is never
 /// briefly world/group-readable between the write and a chmod.
-fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io::Result<String> {
+fn write_quarantine(
+    dir: &std::path::Path,
+    sha256: &str,
+    data: &[u8],
+) -> std::io::Result<(String, u64)> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(sha256);
     // Content-addressed store: identical payloads dedupe. `create_new` also
     // closes the exists()-then-write TOCTOU — if a concurrent session already
     // stored the same bytes, `AlreadyExists` is success, not an error.
-    match create_restricted(&path) {
-        Ok(mut file) => file.write_all(data)?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+    let newly_written = match create_restricted(&path) {
+        Ok(mut file) => {
+            file.write_all(data)?;
+            data.len() as u64
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => 0,
         Err(e) => return Err(e),
-    }
+    };
     let stored = path.to_string_lossy().into_owned();
     // `Path::join` appends a backslash on Windows, so a forward-slash
     // `quarantine_dir` from the config yields `C:/data\ab12…` — one logged
@@ -561,7 +625,7 @@ fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io
     // key. Windows-only: a backslash is a legal filename byte on Unix.
     #[cfg(windows)]
     let stored = stored.replace('\\', "/");
-    Ok(stored)
+    Ok((stored, newly_written))
 }
 
 /// Create `path` for writing with owner-only (`0600`) permissions set at
@@ -702,17 +766,25 @@ impl Handler for MimicHandler {
         Ok(())
     }
 
-    /// No subsystem (SFTP included) is emulated; report failure explicitly,
-    /// the same way a real sshd does for an unsupported subsystem, instead of
-    /// silently dropping the request.
+    /// SFTP subsystem is emulated for upload capture and file inspection;
+    /// other subsystems report failure explicitly, the same way a real sshd
+    /// does for an unsupported subsystem.
     async fn subsystem_request(
         &mut self,
         channel: ChannelId,
-        _name: &str,
+        name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_failure(channel)?;
-        Ok(())
+        if name == "sftp" {
+            event::subsystem_request(self.session_id, self.peer, "sftp", true);
+            self.sftp = Some(SftpSession::new());
+            session.channel_success(channel)?;
+            Ok(())
+        } else {
+            event::subsystem_request(self.session_id, self.peer, name, false);
+            session.channel_failure(channel)?;
+            Ok(())
+        }
     }
 
     /// Agent forwarding is not emulated.
@@ -809,6 +881,24 @@ impl Handler for MimicHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Route bytes to the SFTP subsystem when active.
+        if self.sftp.is_some() {
+            let _ = self.shell();
+            let (resp, uploads) = {
+                let max_bytes = self.config.max_upload_bytes;
+                let shell = self.shell.as_mut().unwrap();
+                let sftp = self.sftp.as_mut().expect("sftp active");
+                sftp.feed(data, shell, max_bytes)
+            };
+            for upload in uploads {
+                self.store_sftp_upload(upload);
+            }
+            if !resp.is_empty() {
+                session.data(channel, resp)?;
+            }
+            return Ok(());
+        }
+
         // Route bytes to the SCP sink when an upload is in progress.
         if self.scp.is_some() {
             let (acks, files) = self.scp.as_mut().expect("scp active").feed(data);
@@ -944,9 +1034,16 @@ impl Handler for MimicHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // An SCP client signals end-of-transfer by closing its half of the
+        // An SCP or SFTP client signals end-of-transfer by closing its half of the
         // channel; finish the exchange with a success status.
         if self.scp.take().is_some() {
+            self.end_channel(channel, session, 0)?;
+        } else if let Some(sftp) = self.sftp.take() {
+            let _ = self.shell();
+            let uploads = sftp.into_pending_uploads(self.shell.as_mut().unwrap());
+            for upload in uploads {
+                self.store_sftp_upload(upload);
+            }
             self.end_channel(channel, session, 0)?;
         } else if self.shell_started && self.active_channel == Some(channel.number()) {
             // The client closed stdin. That is end-of-input to the shell just
@@ -1037,6 +1134,7 @@ mod tests {
             shell: None,
             active_channel: None,
             scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
+            sftp: None,
             quarantine_bytes: 0,
             password_buf: None,
             _guard: guard,
@@ -1064,6 +1162,50 @@ mod tests {
                 rel_dir: String::new(),
                 mode: 0o644,
                 data: vec![i as u8; file_size], // distinct content per file
+                size: file_size as u64,
+                payload_sha256: String::new(),
+                truncated: false,
+            });
+        }
+
+        let total_on_disk: u64 = std::fs::read_dir(&dir)
+            .expect("quarantine dir created")
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().expect("metadata").len())
+            .sum();
+        assert!(
+            total_on_disk <= cap,
+            "quarantine disk usage {total_on_disk} exceeded session cap {cap}"
+        );
+        assert!(
+            handler.quarantine_bytes <= cap,
+            "tracked quarantine_bytes {} exceeded cap {cap}",
+            handler.quarantine_bytes
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sftp_quarantine_disk_writes_are_capped_per_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "mimic-sftp-quarantine-cap-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let max_upload_bytes = 1024u64;
+        let mut handler = test_handler(dir.clone(), max_upload_bytes);
+        let cap = max_upload_bytes * QUARANTINE_SESSION_MULTIPLIER;
+
+        let file_size: usize = 1000;
+        let num_files = (cap / file_size as u64) + 5;
+        for i in 0..num_files {
+            handler.store_sftp_upload(sftp::SftpCompletedUpload {
+                name: format!("sftp_f{i}"),
+                dest_path: format!("/tmp/sftp_f{i}"),
+                mode: 0o644,
+                data: vec![i as u8; file_size],
                 size: file_size as u64,
                 payload_sha256: String::new(),
                 truncated: false,
