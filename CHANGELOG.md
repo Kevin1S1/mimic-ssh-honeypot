@@ -67,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing dated in the future. `uptime`, `w`, `top` and `/proc/uptime` count
   from the same boot instant, so the uptime grows as MIMIC runs rather than
   reporting `up 2 days,  3:21` forever, and `wget`/`curl` stamp transfers with
-  the time they happened.
+  the time they happened. `ls -l` also gained real `ls`'s year form: a mtime
+  older than six months, or dated in the future, now shows the year instead of
+  a time of day.
 - The fake box's memory figures now tell one story. `free` and `/proc/meminfo`
   said ~2 GB while `df` showed tmpfs sizes implying 8 GB and `dmesg` implied
   4 GB; every tmpfs in `df` and `mount` is now the half or tenth of `MemTotal`
