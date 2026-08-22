@@ -32,6 +32,11 @@ use tokio::time::Instant;
 /// straight into the logs and parser.
 const MAX_COMMAND_LEN: usize = 4096;
 
+/// What a login shell prints when it reaches end-of-input, matching the `exit`
+/// builtin's own output. Sent with CRLF because the interactive channel is a
+/// PTY.
+const LOGOUT: &[u8] = b"logout\r\n";
+
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
     // Persist host keys so the server fingerprint stays stable across restarts.
@@ -110,6 +115,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             auth_attempts: 0,
             username: String::new(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
+            shell_started: false,
             shell: None,
             active_channel: None,
             scp: None,
@@ -218,6 +224,10 @@ struct MimicHandler {
     /// Interactive readline-style editor (cursor, history, completion) for the
     /// PTY session.
     editor: LineEditor,
+    /// Whether the active channel is running the interactive shell. A real
+    /// login shell reacts to end-of-input; an `exec` or SCP channel has no
+    /// shell to log out of, so the two must not be confused.
+    shell_started: bool,
     /// The emulated shell, created lazily once a session channel opens.
     shell: Option<Shell>,
     /// Only one channel may use the connection-scoped shell/editor state at a
@@ -261,7 +271,21 @@ impl MimicHandler {
             self.shell = None;
             self.scp = None;
             self.password_buf = None;
+            self.shell_started = false;
         }
+    }
+
+    /// Tear the channel down the way a finished session does: end-of-file,
+    /// close, and release the connection-scoped shell state for the next one.
+    fn end_channel(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        session.eof(channel)?;
+        session.close(channel)?;
+        self.close_channel(channel.number());
+        Ok(())
     }
 
     /// Apply the configured authentication policy to one attempt.
@@ -680,6 +704,7 @@ impl Handler for MimicHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
+        self.shell_started = true;
         let banner = self.motd();
         session.data(channel, banner.into_bytes())?;
         // PAM prints the previous login right before handing off to the shell.
@@ -729,9 +754,7 @@ impl Handler for MimicHandler {
                     let msg = format!("\x01scp: {path}: No such file or directory\n");
                     session.data(channel, msg.into_bytes())?;
                     session.exit_status_request(channel, 1)?;
-                    session.eof(channel)?;
-                    session.close(channel)?;
-                    self.close_channel(channel.number());
+                    self.end_channel(channel, session)?;
                     return Ok(());
                 }
             }
@@ -747,9 +770,7 @@ impl Handler for MimicHandler {
             session.data(channel, crlf(&result.text))?;
         }
         session.exit_status_request(channel, result.status as u32)?;
-        session.eof(channel)?;
-        session.close(channel)?;
-        self.close_channel(channel.number());
+        self.end_channel(channel, session)?;
         Ok(())
     }
 
@@ -790,9 +811,7 @@ impl Handler for MimicHandler {
                             session.data(channel, crlf(&output.text))?;
                         }
                         if output.exit {
-                            session.eof(channel)?;
-                            session.close(channel)?;
-                            self.close_channel(channel.number());
+                            self.end_channel(channel, session)?;
                             return Ok(());
                         }
                         let prompt = self.shell().prompt();
@@ -840,9 +859,12 @@ impl Handler for MimicHandler {
                     }
                 }
                 Reaction::Eof => {
-                    session.eof(channel)?;
-                    session.close(channel)?;
-                    self.close_channel(channel.number());
+                    // Ctrl-D on an empty line is end-of-input to a login
+                    // shell, which announces itself before exiting — printed
+                    // on the prompt line, exactly as `exit` does after its
+                    // echoed newline.
+                    session.data(channel, LOGOUT.to_vec())?;
+                    self.end_channel(channel, session)?;
                     return Ok(());
                 }
                 Reaction::Submit { echo, line } => {
@@ -865,9 +887,7 @@ impl Handler for MimicHandler {
                         session.data(channel, crlf(&result.text))?;
                     }
                     if result.exit {
-                        session.eof(channel)?;
-                        session.close(channel)?;
-                        self.close_channel(channel.number());
+                        self.end_channel(channel, session)?;
                         return Ok(());
                     }
                     // A command left an interactive prompt pending (e.g. `su`
@@ -895,9 +915,13 @@ impl Handler for MimicHandler {
         // channel; finish the exchange with a success status.
         if self.scp.take().is_some() {
             session.exit_status_request(channel, 0)?;
-            session.eof(channel)?;
-            session.close(channel)?;
-            self.close_channel(channel.number());
+            self.end_channel(channel, session)?;
+        } else if self.shell_started && self.active_channel == Some(channel.number()) {
+            // The client closed stdin. That is end-of-input to the shell just
+            // as Ctrl-D is, so it logs out immediately rather than holding the
+            // session — and its connection slot — until the idle timeout.
+            session.data(channel, LOGOUT.to_vec())?;
+            self.end_channel(channel, session)?;
         }
         Ok(())
     }
@@ -981,6 +1005,7 @@ mod tests {
             auth_attempts: 0,
             username: "root".to_string(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
+            shell_started: false,
             shell: None,
             active_channel: None,
             scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
@@ -1151,6 +1176,124 @@ mod tests {
             started.elapsed() >= Duration::from_secs(CAP_SECS).saturating_sub(Duration::from_millis(200)),
             "session ended after {:?}, before the {CAP_SECS}s cap — something other than the cap closed it",
             started.elapsed()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Start a honeypot on a free port with both timeouts far away, so only the
+    /// session ending on its own can close a channel, and open an interactive
+    /// shell on it. Returns the client handle (which must outlive the channel),
+    /// the channel, and the temp dir to clean up.
+    async fn shell_session(
+        tag: &str,
+    ) -> (
+        russh::client::Handle<TestClient>,
+        russh::Channel<russh::client::Msg>,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!("mimic-{tag}-test-{}", std::process::id()));
+        let probe = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("probe bind");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+
+        let config = Config {
+            listen_addr: "127.0.0.1".parse().expect("loopback"),
+            port,
+            // Long enough that neither timeout can be what ends the session.
+            idle_timeout_secs: 600,
+            max_session_secs: 1800,
+            host_key_dir: dir.join("host_keys"),
+            quarantine_dir: dir.join("quarantine"),
+            ..Config::default()
+        };
+        tokio::spawn(async move {
+            let _ = serve(Arc::new(config)).await;
+        });
+
+        let client_config = Arc::new(russh::client::Config::default());
+        let mut handle = loop {
+            match russh::client::connect(
+                Arc::clone(&client_config),
+                ("127.0.0.1", port),
+                TestClient,
+            )
+            .await
+            {
+                Ok(handle) => break handle,
+                // The listener may not have bound yet.
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
+        assert!(handle
+            .authenticate_password("root", "hunter2")
+            .await
+            .expect("auth request")
+            .success());
+
+        let channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("pty request");
+        channel.request_shell(true).await.expect("shell request");
+        (handle, channel, dir)
+    }
+
+    /// Read the channel until the server closes it, returning everything it
+    /// sent. Fails rather than hangs if the server never closes.
+    async fn drain_until_closed(channel: &mut russh::Channel<russh::client::Msg>) -> Vec<u8> {
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(msg) = channel.wait().await {
+                if let russh::ChannelMsg::Data { ref data } = msg {
+                    seen.extend_from_slice(data);
+                }
+            }
+        })
+        .await
+        .expect("server closed the session");
+        seen
+    }
+
+    /// Ctrl-D on an empty line ends the session, and a login shell says so
+    /// before it goes — silence there is the tell, since MIMIC's own `exit`
+    /// prints `logout`.
+    #[tokio::test]
+    async fn ctrl_d_logs_out_and_ends_the_session() {
+        let (_handle, mut channel, dir) = shell_session("ctrl-d").await;
+
+        channel.data(&b"\x04"[..]).await.expect("send ctrl-d");
+        let seen = drain_until_closed(&mut channel).await;
+
+        let tail = String::from_utf8_lossy(&seen);
+        assert!(
+            tail.ends_with("logout\r\n"),
+            "expected the session to end with a logout line, got {tail:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client closing stdin is end-of-input to the shell: a real sshd ends
+    /// the session right there. Lingering until the idle timeout both looks
+    /// wrong and holds a connection slot for every abandoned probe.
+    #[tokio::test]
+    async fn client_eof_ends_the_session() {
+        let (_handle, mut channel, dir) = shell_session("client-eof").await;
+
+        channel.eof().await.expect("send eof");
+        let seen = drain_until_closed(&mut channel).await;
+
+        let tail = String::from_utf8_lossy(&seen);
+        assert!(
+            tail.ends_with("logout\r\n"),
+            "expected the session to end with a logout line, got {tail:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
