@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by `Ctrl-U`, `Ctrl-K` or `Ctrl-W` was discarded instead of kept. The last kill
   is now reinserted at the cursor and survives the yank, so it can be pasted
   more than once, as readline does.
+- The `stored_path` in an `upload` event mixed `/` and `\` separators on Windows
+  (`C:/data/quarantine\a3f…`), so the one field pointing at the captured file
+  could not be matched or joined the way the README showed it. Quarantine paths
+  are now logged with `/` throughout, and the README's example shows the full
+  path it actually carries.
 
 ### Security
 - Ctrl-D on an empty line now prints `logout` before the session ends, the same
@@ -62,6 +67,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gone the moment stdin closes — `ssh -tt host < script` used to hang here until
   the idle timeout instead of returning, and every abandoned probe held a
   connection slot for `idle_timeout_secs`.
+- The interactive shell now reports an exit status when it ends. `exit`, Ctrl-D
+  and a client closing stdin all closed the channel without one, so `ssh host`
+  returned **255** — the code `ssh` uses for its own failures — where a real
+  server returns the shell's status. Any bot that checks `$?` after a session
+  saw every login fail. All three paths report it together, since a status on
+  one and not another is a tell in itself.
+- A one-shot `exec` no longer rewrites its output to CRLF. `ssh host 'uname -a'`
+  requests no terminal, and a real sshd sends the command's own bytes, so the
+  added carriage returns showed up in any byte-for-byte comparison against a
+  known-good host. Line endings now follow whether the channel asked for a PTY:
+  CRLF under `ssh -t`, bare LF without. The same rule covers the MOTD and the
+  `Last login:` line, and a `pty-req` no longer leaks from an interactive
+  channel into a later `exec` on the same connection (which also set `SSH_TTY`
+  on a session that has no terminal).
 - `cd` now needs a directory's execute (search) bit. An unprivileged session
   could `cd /root` and watch the prompt change while `ls /root` in that same
   directory answered `Permission denied` — a box that contradicts itself on two

@@ -33,9 +33,13 @@ use tokio::time::Instant;
 const MAX_COMMAND_LEN: usize = 4096;
 
 /// What a login shell prints when it reaches end-of-input, matching the `exit`
-/// builtin's own output. Sent with CRLF because the interactive channel is a
-/// PTY.
-const LOGOUT: &[u8] = b"logout\r\n";
+/// builtin's own output. Line endings are applied by [`MimicHandler::out`].
+const LOGOUT: &str = "logout\n";
+
+/// Status reported when the interactive shell ends. `exit`, Ctrl-D and a
+/// client EOF are all a login shell finishing normally, and all three have to
+/// agree: a status on one path but not another is a tell of its own.
+const SHELL_EXIT_STATUS: u32 = 0;
 
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
@@ -272,20 +276,40 @@ impl MimicHandler {
             self.scp = None;
             self.password_buf = None;
             self.shell_started = false;
+            // `pty-req` is per channel: a connection that runs an interactive
+            // session and then an `exec` must not carry the PTY's line endings
+            // (or `SSH_TTY`) into the second channel.
+            self.pty = false;
         }
     }
 
-    /// Tear the channel down the way a finished session does: end-of-file,
-    /// close, and release the connection-scoped shell state for the next one.
+    /// Tear the channel down the way a finished session does: report the
+    /// command's exit status, end-of-file, close, and release the
+    /// connection-scoped shell state for the next one. Every path that ends a
+    /// channel goes through here, so none of them can forget the status — a
+    /// channel closed without one makes `ssh` report 255.
     fn end_channel(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
+        status: u32,
     ) -> Result<(), russh::Error> {
+        session.exit_status_request(channel, status)?;
         session.eof(channel)?;
         session.close(channel)?;
         self.close_channel(channel.number());
         Ok(())
+    }
+
+    /// Encode server output for this channel. A PTY turns the shell's `\n`
+    /// into `\r\n`; without one, a real sshd passes the bytes through
+    /// unchanged, so `ssh host cmd` must not gain carriage returns.
+    fn out(&self, text: &str) -> Vec<u8> {
+        if self.pty {
+            text.replace('\n', "\r\n").into_bytes()
+        } else {
+            text.as_bytes().to_vec()
+        }
     }
 
     /// Apply the configured authentication policy to one attempt.
@@ -356,17 +380,18 @@ impl MimicHandler {
     }
 
     /// The message-of-the-day shown after a successful login. The leading
-    /// kernel line mirrors Debian's `/etc/update-motd.d/10-uname` output.
+    /// kernel line mirrors Debian's `/etc/update-motd.d/10-uname` output. Line
+    /// endings are applied by [`MimicHandler::out`], like any other output.
     fn motd(&self) -> String {
         format!(
-            "Linux {host} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64\r\n\
-             \r\n\
-             The programs included with the Debian GNU/Linux system are free software;\r\n\
-             the exact distribution terms for each program are described in the\r\n\
-             individual files in /usr/share/doc/*/copyright.\r\n\
-             \r\n\
-             Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\r\n\
-             permitted by applicable law.\r\n",
+            "Linux {host} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64\n\
+             \n\
+             The programs included with the Debian GNU/Linux system are free software;\n\
+             the exact distribution terms for each program are described in the\n\
+             individual files in /usr/share/doc/*/copyright.\n\
+             \n\
+             Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\n\
+             permitted by applicable law.\n",
             host = self.config.hostname,
         )
     }
@@ -534,7 +559,14 @@ fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    Ok(path.to_string_lossy().into_owned())
+    let stored = path.to_string_lossy().into_owned();
+    // `Path::join` appends a backslash on Windows, so a forward-slash
+    // `quarantine_dir` from the config yields `C:/data\ab12…` — one logged
+    // path in two separator styles. Normalise so `stored_path` is a usable
+    // key. Windows-only: a backslash is a legal filename byte on Unix.
+    #[cfg(windows)]
+    let stored = stored.replace('\\', "/");
+    Ok(stored)
 }
 
 /// Create `path` for writing with owner-only (`0600`) permissions set at
@@ -705,14 +737,12 @@ impl Handler for MimicHandler {
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
         self.shell_started = true;
-        let banner = self.motd();
-        session.data(channel, banner.into_bytes())?;
+        let banner = self.out(&self.motd());
+        session.data(channel, banner)?;
         // PAM prints the previous login right before handing off to the shell.
         // Kept in lockstep with the fabricated `last`/`w` session.
-        session.data(
-            channel,
-            b"Last login: Mon Jun 24 10:01:33 2024 from 10.0.0.5\r\n".to_vec(),
-        )?;
+        let last_login = self.out("Last login: Mon Jun 24 10:01:33 2024 from 10.0.0.5\n");
+        session.data(channel, last_login)?;
         let prompt = self.shell().prompt();
         self.editor.set_prompt(&prompt);
         session.data(channel, self.editor.render().to_vec())?;
@@ -753,8 +783,7 @@ impl Handler for MimicHandler {
                     // Download-from-honeypot is not emulated: report not found.
                     let msg = format!("\x01scp: {path}: No such file or directory\n");
                     session.data(channel, msg.into_bytes())?;
-                    session.exit_status_request(channel, 1)?;
-                    self.end_channel(channel, session)?;
+                    self.end_channel(channel, session, 1)?;
                     return Ok(());
                 }
             }
@@ -767,10 +796,10 @@ impl Handler for MimicHandler {
         self.drain_captures();
         jitter().await;
         if !result.text.is_empty() {
-            session.data(channel, crlf(&result.text))?;
+            let bytes = self.out(&result.text);
+            session.data(channel, bytes)?;
         }
-        session.exit_status_request(channel, result.status as u32)?;
-        self.end_channel(channel, session)?;
+        self.end_channel(channel, session, result.status as u32)?;
         Ok(())
     }
 
@@ -808,10 +837,11 @@ impl Handler for MimicHandler {
                         jitter().await;
 
                         if !output.text.is_empty() {
-                            session.data(channel, crlf(&output.text))?;
+                            let bytes = self.out(&output.text);
+                            session.data(channel, bytes)?;
                         }
                         if output.exit {
-                            self.end_channel(channel, session)?;
+                            self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
                             return Ok(());
                         }
                         let prompt = self.shell().prompt();
@@ -863,8 +893,9 @@ impl Handler for MimicHandler {
                     // shell, which announces itself before exiting — printed
                     // on the prompt line, exactly as `exit` does after its
                     // echoed newline.
-                    session.data(channel, LOGOUT.to_vec())?;
-                    self.end_channel(channel, session)?;
+                    let bytes = self.out(LOGOUT);
+                    session.data(channel, bytes)?;
+                    self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
                     return Ok(());
                 }
                 Reaction::Submit { echo, line } => {
@@ -884,10 +915,11 @@ impl Handler for MimicHandler {
                     jitter().await;
 
                     if !result.text.is_empty() {
-                        session.data(channel, crlf(&result.text))?;
+                        let bytes = self.out(&result.text);
+                        session.data(channel, bytes)?;
                     }
                     if result.exit {
-                        self.end_channel(channel, session)?;
+                        self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
                         return Ok(());
                     }
                     // A command left an interactive prompt pending (e.g. `su`
@@ -914,14 +946,14 @@ impl Handler for MimicHandler {
         // An SCP client signals end-of-transfer by closing its half of the
         // channel; finish the exchange with a success status.
         if self.scp.take().is_some() {
-            session.exit_status_request(channel, 0)?;
-            self.end_channel(channel, session)?;
+            self.end_channel(channel, session, 0)?;
         } else if self.shell_started && self.active_channel == Some(channel.number()) {
             // The client closed stdin. That is end-of-input to the shell just
             // as Ctrl-D is, so it logs out immediately rather than holding the
             // session — and its connection slot — until the idle timeout.
-            session.data(channel, LOGOUT.to_vec())?;
-            self.end_channel(channel, session)?;
+            let bytes = self.out(LOGOUT);
+            session.data(channel, bytes)?;
+            self.end_channel(channel, session, SHELL_EXIT_STATUS)?;
         }
         Ok(())
     }
@@ -947,12 +979,6 @@ impl Drop for MimicHandler {
 async fn jitter() {
     let ms = rand::random_range(2..=18);
     tokio::time::sleep(Duration::from_millis(ms)).await;
-}
-
-/// Convert LF line endings to CRLF for transmission over the SSH PTY. Command
-/// output uses bare `\n`; terminals expect `\r\n`.
-fn crlf(text: &str) -> Vec<u8> {
-    text.replace('\n', "\r\n").into_bytes()
 }
 
 /// Lay candidate strings out in newline-separated columns the way bash prints
@@ -1182,16 +1208,9 @@ mod tests {
     }
 
     /// Start a honeypot on a free port with both timeouts far away, so only the
-    /// session ending on its own can close a channel, and open an interactive
-    /// shell on it. Returns the client handle (which must outlive the channel),
-    /// the channel, and the temp dir to clean up.
-    async fn shell_session(
-        tag: &str,
-    ) -> (
-        russh::client::Handle<TestClient>,
-        russh::Channel<russh::client::Msg>,
-        std::path::PathBuf,
-    ) {
+    /// session ending on its own can close a channel, and authenticate against
+    /// it. Returns the client handle and the temp dir to clean up.
+    async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("mimic-{tag}-test-{}", std::process::id()));
         let probe = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1232,7 +1251,20 @@ mod tests {
             .await
             .expect("auth request")
             .success());
+        (handle, dir)
+    }
 
+    /// A honeypot plus an interactive shell channel with a PTY on it. Returns
+    /// the client handle (which must outlive the channel), the channel, and
+    /// the temp dir to clean up.
+    async fn shell_session(
+        tag: &str,
+    ) -> (
+        russh::client::Handle<TestClient>,
+        russh::Channel<russh::client::Msg>,
+        std::path::PathBuf,
+    ) {
+        let (handle, dir) = honeypot(tag).await;
         let channel = handle
             .channel_open_session()
             .await
@@ -1246,19 +1278,25 @@ mod tests {
     }
 
     /// Read the channel until the server closes it, returning everything it
-    /// sent. Fails rather than hangs if the server never closes.
-    async fn drain_until_closed(channel: &mut russh::Channel<russh::client::Msg>) -> Vec<u8> {
+    /// sent and the exit status it reported (`None` if it sent none). Fails
+    /// rather than hangs if the server never closes.
+    async fn drain_until_closed(
+        channel: &mut russh::Channel<russh::client::Msg>,
+    ) -> (Vec<u8>, Option<u32>) {
         let mut seen = Vec::new();
+        let mut status = None;
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(msg) = channel.wait().await {
-                if let russh::ChannelMsg::Data { ref data } = msg {
-                    seen.extend_from_slice(data);
+                match msg {
+                    russh::ChannelMsg::Data { ref data } => seen.extend_from_slice(data),
+                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    _ => {}
                 }
             }
         })
         .await
         .expect("server closed the session");
-        seen
+        (seen, status)
     }
 
     /// Ctrl-D on an empty line ends the session, and a login shell says so
@@ -1269,13 +1307,14 @@ mod tests {
         let (_handle, mut channel, dir) = shell_session("ctrl-d").await;
 
         channel.data(&b"\x04"[..]).await.expect("send ctrl-d");
-        let seen = drain_until_closed(&mut channel).await;
+        let (seen, status) = drain_until_closed(&mut channel).await;
 
         let tail = String::from_utf8_lossy(&seen);
         assert!(
             tail.ends_with("logout\r\n"),
             "expected the session to end with a logout line, got {tail:?}"
         );
+        assert_eq!(status, Some(SHELL_EXIT_STATUS), "missing exit status");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1288,13 +1327,107 @@ mod tests {
         let (_handle, mut channel, dir) = shell_session("client-eof").await;
 
         channel.eof().await.expect("send eof");
-        let seen = drain_until_closed(&mut channel).await;
+        let (seen, status) = drain_until_closed(&mut channel).await;
 
         let tail = String::from_utf8_lossy(&seen);
         assert!(
             tail.ends_with("logout\r\n"),
             "expected the session to end with a logout line, got {tail:?}"
         );
+        assert_eq!(status, Some(SHELL_EXIT_STATUS), "missing exit status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `exit` is the third way out of the shell, and all three have to report
+    /// the same status; without one `ssh` reports 255, which no real server
+    /// does for a shell that exited cleanly.
+    #[tokio::test]
+    async fn exit_reports_a_status() {
+        let (_handle, mut channel, dir) = shell_session("shell-exit").await;
+
+        channel.data(&b"exit\r"[..]).await.expect("send exit");
+        let (seen, status) = drain_until_closed(&mut channel).await;
+
+        let tail = String::from_utf8_lossy(&seen);
+        assert!(
+            tail.ends_with("logout\r\n"),
+            "expected the session to end with a logout line, got {tail:?}"
+        );
+        assert_eq!(status, Some(SHELL_EXIT_STATUS), "missing exit status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot `exec` has no PTY, so a real sshd sends the command's own
+    /// LF-terminated bytes. Rewriting them to CRLF is a byte-comparison tell
+    /// for anything that diffs output against a known-good host.
+    #[tokio::test]
+    async fn exec_without_a_pty_sends_bare_lf() {
+        let (handle, dir) = honeypot("exec-lf").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.exec(true, &b"echo hello"[..]).await.expect("exec");
+
+        let (seen, status) = drain_until_closed(&mut channel).await;
+
+        assert_eq!(seen, b"hello\n", "exec output should be LF-terminated");
+        assert_eq!(status, Some(0), "missing exit status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ssh -t host cmd` does ask for a PTY, and then CRLF is what a real
+    /// server sends — the rule is per channel, not per command path.
+    #[tokio::test]
+    async fn exec_with_a_pty_still_sends_crlf() {
+        let (handle, dir) = honeypot("exec-crlf").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("pty request");
+        channel.exec(true, &b"echo hello"[..]).await.expect("exec");
+
+        let (seen, _) = drain_until_closed(&mut channel).await;
+
+        assert_eq!(seen, b"hello\r\n", "a PTY exec should be CRLF-terminated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pty-req` is per channel. A connection that runs an interactive session
+    /// and then an `exec` — what an SSH ControlMaster does — must not carry the
+    /// first channel's line endings into the second.
+    #[tokio::test]
+    async fn a_later_exec_channel_does_not_inherit_the_pty() {
+        let (handle, dir) = honeypot("exec-after-shell").await;
+
+        let mut shell = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        shell
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("pty request");
+        shell.request_shell(true).await.expect("shell request");
+        shell.data(&b"\x04"[..]).await.expect("send ctrl-d");
+        drain_until_closed(&mut shell).await;
+
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("second session channel");
+        channel.exec(true, &b"echo hello"[..]).await.expect("exec");
+        let (seen, _) = drain_until_closed(&mut channel).await;
+
+        assert_eq!(seen, b"hello\n", "the PTY leaked into a later exec channel");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
