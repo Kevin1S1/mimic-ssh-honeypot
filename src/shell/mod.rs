@@ -6,6 +6,7 @@
 //! layered on top of this by the command registry; nothing here touches real
 //! I/O or runs a real process.
 
+pub mod arith;
 pub mod complete;
 pub mod env;
 pub mod line;
@@ -94,6 +95,20 @@ struct Sinks {
     stderr: Option<Sink>,
 }
 
+/// The session state a command substitution runs on a copy of, restored when
+/// its subshell ends. The filesystem is deliberately not in here: a real
+/// subshell shares it with its parent.
+struct Subshell {
+    env: Env,
+    cwd: NodeId,
+    prev_cwd: NodeId,
+    home: NodeId,
+    username: String,
+    uid: u32,
+    gid: u32,
+    pending: Option<Pending>,
+}
+
 /// Per-session shell.
 pub struct Shell {
     /// The in-memory Debian filesystem.
@@ -125,6 +140,9 @@ pub struct Shell {
     /// Current command-nesting depth (`sudo`, `sh -c`, ...), bounded by the
     /// command registry so a deeply nested line cannot overflow the stack.
     pub nesting: u32,
+    /// Bytes of command-substitution output the current line may still splice
+    /// into itself. Reset per top-level line; see [`Shell::substitute`].
+    subst_budget: usize,
     /// Standard input for the running command: the previous pipeline stage's
     /// output, or `None` outside a pipeline.
     pub stdin: Option<String>,
@@ -180,6 +198,7 @@ impl Shell {
             pid: 1337,
             login: crate::clock::now(),
             nesting: 0,
+            subst_budget: commands::MAX_COMMAND_OUTPUT_BYTES,
             stdin: None,
             stdout_is_tty: true,
             history: Vec::new(),
@@ -228,27 +247,46 @@ impl Shell {
     /// the command layer dispatches on. Expansion runs first so an unquoted
     /// `$VAR` value is still word-split by the tokenizer; the quoting in the
     /// value itself is escaped on the way through, so it stays data.
-    pub fn parse_line(&self, line: &str) -> Vec<String> {
-        parser::tokenize(&self.expand(line))
+    pub fn parse_line(&mut self, line: &str) -> Vec<String> {
+        let expanded = self.expand(line);
+        parser::tokenize(&expanded)
     }
 
-    /// Expand `$VAR`, `${VAR}`, `$?`, and `$$` in `line`, respecting the
-    /// quoting around each one: single quotes suppress expansion entirely,
-    /// double quotes suppress the word splitting the tokenizer would otherwise
-    /// do, and a backslash protects the character after it.
-    fn expand(&self, line: &str) -> String {
+    /// Expand `$VAR`, `${VAR}`, `$?`, `$$`, `$(…)`, `` `…` `` and `$((…))` in
+    /// `line`, respecting the quoting around each one: single quotes suppress
+    /// expansion entirely, double quotes suppress the word splitting the
+    /// tokenizer would otherwise do, and a backslash protects the character
+    /// after it.
+    fn expand(&mut self, line: &str) -> String {
         let mut out = String::new();
         let mut in_single = false;
         let mut in_double = false;
-        let mut chars = line.chars().peekable();
+        let mut chars = line.char_indices().peekable();
 
-        while let Some(c) = chars.next() {
+        while let Some((i, c)) = chars.next() {
+            // A substitution is one word however much it holds, so it is
+            // recognised before the character-by-character rules below.
+            if !in_single && (c == '$' || c == '`') {
+                if let Some(subst) = parser::substitution_at(line, i) {
+                    let body = &line[subst.body.0..subst.body.1];
+                    let value = if subst.arithmetic {
+                        self.arithmetic(body)
+                    } else {
+                        self.substitute(body)
+                    };
+                    push_value(&mut out, &value, in_double);
+                    while chars.peek().is_some_and(|(j, _)| *j < subst.end) {
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
             match c {
                 // The escape reaches the tokenizer intact, so whatever it
                 // protects stays data — including a `$` that would expand.
                 '\\' if !in_single => {
                     out.push(c);
-                    if let Some(next) = chars.next() {
+                    if let Some((_, next)) = chars.next() {
                         out.push(next);
                     }
                 }
@@ -260,7 +298,7 @@ impl Shell {
                     in_double = !in_double;
                     out.push(c);
                 }
-                '$' if !in_single => match chars.peek() {
+                '$' if !in_single => match chars.peek().map(|&(_, n)| n) {
                     Some('?') => {
                         chars.next();
                         push_value(&mut out, &self.last_status.to_string(), in_double);
@@ -272,7 +310,7 @@ impl Shell {
                     Some('{') => {
                         chars.next();
                         let mut name = String::new();
-                        for n in chars.by_ref() {
+                        for (_, n) in chars.by_ref() {
                             if n == '}' {
                                 break;
                             }
@@ -280,9 +318,9 @@ impl Shell {
                         }
                         push_value(&mut out, self.env.get(&name).unwrap_or(""), in_double);
                     }
-                    Some(&n) if n.is_alphabetic() || n == '_' => {
+                    Some(n) if n.is_alphabetic() || n == '_' => {
                         let mut name = String::new();
-                        while let Some(&n) = chars.peek() {
+                        while let Some(&(_, n)) = chars.peek() {
                             if n.is_alphanumeric() || n == '_' {
                                 name.push(n);
                                 chars.next();
@@ -298,6 +336,93 @@ impl Shell {
             }
         }
         out
+    }
+
+    /// Run a substitution's body and return the text bash would splice into the
+    /// line: the command's output with its trailing newlines stripped.
+    ///
+    /// The body is a command line of its own — `$(cd /tmp; ls | wc -l)` — so it
+    /// runs through [`Shell::execute`], in a subshell: what it changes about the
+    /// session itself (working directory, environment, identity) is discarded
+    /// when it ends, while what it writes to the filesystem stays, exactly as a
+    /// real subshell's fork boundary falls. It also cannot end the session
+    /// (bash's subshell exit does not log the parent out), whatever it captured
+    /// is added to the outer line's captures rather than replacing them, and
+    /// both the nesting depth and the per-line output budget bound what it can
+    /// spend.
+    fn substitute(&mut self, body: &str) -> String {
+        // Every level here is a stack frame that `dispatch`'s cap never sees:
+        // the descent runs through expansion, before any command is reached.
+        if self.nesting >= commands::MAX_NESTED_COMMANDS {
+            return String::new();
+        }
+        self.nesting += 1;
+        let session = Subshell {
+            env: self.env.clone(),
+            cwd: self.cwd,
+            prev_cwd: self.prev_cwd,
+            home: self.home,
+            username: self.username.clone(),
+            uid: self.uid,
+            gid: self.gid,
+            pending: self.pending.clone(),
+        };
+        let saved = std::mem::take(&mut self.captures);
+        let output = self.execute(body);
+        let inner = std::mem::replace(&mut self.captures, saved);
+        self.captures.extend(inner);
+        self.env = session.env;
+        self.cwd = session.cwd;
+        self.prev_cwd = session.prev_cwd;
+        self.home = session.home;
+        self.username = session.username;
+        self.uid = session.uid;
+        self.gid = session.gid;
+        self.pending = session.pending;
+        self.nesting -= 1;
+
+        let mut value = output.text;
+        if output.exit {
+            // `logout` is what an interactive shell prints on its way out; a
+            // subshell that exits prints nothing.
+            if let Some(rest) = value.strip_suffix(commands::LOGOUT) {
+                value.truncate(rest.len());
+            }
+        }
+        while value.ends_with('\n') {
+            value.pop();
+        }
+
+        // One command's output is already capped, but a line has room for
+        // hundreds of substitutions; the budget bounds their sum the way
+        // `execute` bounds a chained line's.
+        if value.len() > self.subst_budget {
+            let mut cut = self.subst_budget;
+            while cut > 0 && !value.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            value.truncate(cut);
+        }
+        self.subst_budget -= value.len();
+        value
+    }
+
+    /// Evaluate an `$((…))` body and return the number it comes to.
+    ///
+    /// The body is expanded first, so `$((x + $(echo 1)))` works, and bare
+    /// names resolve against the environment. A malformed expression or a
+    /// division by zero comes to zero rather than the syntax error bash prints,
+    /// because expansion has no channel to fail on.
+    // ponytail: no arithmetic syntax errors; upgrade when expansion can report
+    // a failure back to the command line.
+    fn arithmetic(&mut self, body: &str) -> String {
+        if self.nesting >= commands::MAX_NESTED_COMMANDS {
+            return "0".to_string();
+        }
+        self.nesting += 1;
+        let expanded = self.expand(body);
+        self.nesting -= 1;
+        arith::eval(&self.env, &expanded).unwrap_or(0).to_string()
     }
 
     /// Switch this session's effective identity to `user` (`su`), as if a
@@ -543,6 +668,11 @@ impl Shell {
     /// lines — and comment-only ones — are no-ops that leave `$?` alone.
     pub fn execute(&mut self, line: &str) -> Output {
         self.captures.clear();
+        // A substitution runs its body through here too; the budget belongs to
+        // the line the attacker typed, so only that one refills it.
+        if self.nesting == 0 {
+            self.subst_budget = commands::MAX_COMMAND_OUTPUT_BYTES;
+        }
 
         let mut text = String::new();
         let mut status = 0;
@@ -680,7 +810,7 @@ mod tests {
 
     #[test]
     fn single_quotes_suppress_expansion() {
-        let shell = Shell::new("root", "debian");
+        let mut shell = Shell::new("root", "debian");
         assert_eq!(shell.parse_line("echo '$USER'"), vec!["echo", "$USER"]);
     }
 
@@ -698,7 +828,7 @@ mod tests {
 
     #[test]
     fn a_backslash_protects_the_dollar_it_precedes() {
-        let shell = Shell::new("root", "debian");
+        let mut shell = Shell::new("root", "debian");
         assert_eq!(shell.parse_line(r"echo \$USER"), vec!["echo", "$USER"]);
         assert_eq!(shell.parse_line(r#"echo "\$USER""#), vec!["echo", "$USER"]);
         // An escaped backslash is data; the `$` after it still expands.
@@ -728,6 +858,112 @@ mod tests {
     }
 
     #[test]
+    fn command_substitution_runs_the_body() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(shell.execute("echo $(whoami)").text, "root\n");
+        assert_eq!(shell.execute("echo `whoami`").text, "root\n");
+        // The whole line the body holds runs, separators, pipes and all.
+        assert_eq!(shell.execute("echo $(cd /tmp; pwd)").text, "/tmp\n");
+        assert_eq!(shell.execute("echo $(echo a b c | wc -w)").text, "3\n");
+        // Trailing newlines go, inner ones stay.
+        assert_eq!(shell.execute(r#"echo "[$(echo hi)]""#).text, "[hi]\n");
+        assert_eq!(
+            shell.execute(r#"echo "[$(echo one; echo two)]""#).text,
+            "[one\ntwo]\n"
+        );
+        // Nested substitutions expand innermost first.
+        assert_eq!(shell.execute("echo $(echo $(whoami))").text, "root\n");
+        // Quoting suppresses it exactly as it suppresses `$VAR`.
+        assert_eq!(shell.execute("echo '$(whoami)'").text, "$(whoami)\n");
+        assert_eq!(shell.execute(r"echo \$(whoami)").text, "$(whoami)\n");
+        assert_eq!(shell.execute("echo '`whoami`'").text, "`whoami`\n");
+    }
+
+    #[test]
+    fn substitution_output_is_data_not_syntax() {
+        let mut shell = Shell::new("root", "debian");
+        // Separators arrive after the line was split, so they stay arguments:
+        // a substitution cannot smuggle in a second command.
+        assert_eq!(
+            shell.execute("echo $(echo 'a; touch /tmp/pwned')").text,
+            "a; touch /tmp/pwned\n"
+        );
+        assert!(shell.vfs.resolve(shell.vfs.root(), "/tmp/pwned").is_none());
+        // Nor a redirect, a pipe, a quote or a further expansion.
+        assert_eq!(
+            shell.execute("echo $(echo 'a > /tmp/out | b')").text,
+            "a > /tmp/out | b\n"
+        );
+        assert!(shell.vfs.resolve(shell.vfs.root(), "/tmp/out").is_none());
+        assert_eq!(shell.execute(r#"echo $(echo "it's")"#).text, "it's\n");
+        assert_eq!(shell.execute("echo $(echo '$USER')").text, "$USER\n");
+
+        // Word splitting is the one thing that still applies, and only unquoted.
+        assert_eq!(
+            shell.parse_line("echo $(echo 'a  b')"),
+            vec!["echo", "a", "b"]
+        );
+        assert_eq!(
+            shell.parse_line(r#"echo "$(echo 'a  b')""#),
+            vec!["echo", "a  b"]
+        );
+    }
+
+    #[test]
+    fn a_substitution_is_a_subshell_not_the_session() {
+        let mut shell = Shell::new("root", "debian");
+        // `exit` in a subshell ends the subshell, silently.
+        let out = shell.execute("echo $(exit)");
+        assert!(!out.exit);
+        assert_eq!(out.text, "\n");
+        // What it changes about the session goes with it; what it wrote stays.
+        shell.execute("echo $(cd /tmp; export MARK=1; touch /tmp/left-behind)");
+        assert_eq!(shell.cwd_path(), "/root");
+        assert_eq!(shell.execute("echo $MARK").text, "\n");
+        assert!(shell
+            .vfs
+            .resolve(shell.vfs.root(), "/tmp/left-behind")
+            .is_some());
+        // The outer command's status is what the line reports.
+        assert_eq!(shell.execute("echo $(false)").status, 0);
+        assert_eq!(shell.execute("echo $?").text, "0\n");
+    }
+
+    #[test]
+    fn a_substitution_keeps_the_captures_around_it() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("wget http://example.com/one -O /tmp/one; echo $(wget http://example.com/two -O /tmp/two)");
+        let urls: Vec<&str> = shell
+            .captures
+            .iter()
+            .filter_map(|capture| match capture {
+                Capture::Download { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["http://example.com/one", "http://example.com/two"]
+        );
+    }
+
+    #[test]
+    fn arithmetic_expansion_evaluates_the_expression() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(shell.execute("echo $((2+3*4))").text, "14\n");
+        assert_eq!(shell.execute("echo $(( (2+3)*4 ))").text, "20\n");
+        // A `>` inside it is a comparison, not a redirect.
+        assert_eq!(shell.execute("echo $((3>2))").text, "1\n");
+        assert!(shell.vfs.resolve(shell.vfs.root(), "/root/2").is_none());
+        // Names resolve with or without the `$`, and a substitution nests.
+        shell.execute("export N=20");
+        assert_eq!(shell.execute("echo $((N+$N))").text, "40\n");
+        assert_eq!(shell.execute("echo $((1+$(echo 2)))").text, "3\n");
+        // Quoting suppresses it, as it does every other expansion.
+        assert_eq!(shell.execute("echo '$((1+1))'").text, "$((1+1))\n");
+    }
+
+    #[test]
     fn escapes_in_a_value_reach_echo_e() {
         let mut shell = Shell::new("root", "debian");
         shell.execute(r"export T='a\tb'");
@@ -747,7 +983,7 @@ mod tests {
 
     #[test]
     fn parse_line_honours_quoting_and_escapes() {
-        let shell = Shell::new("root", "debian");
+        let mut shell = Shell::new("root", "debian");
         assert_eq!(
             shell.parse_line(r#"echo "a b"  c"#),
             vec!["echo", "a b", "c"]

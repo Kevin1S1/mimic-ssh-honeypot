@@ -48,6 +48,43 @@ fn cat_large_file_is_truncated() {
 }
 
 #[test]
+fn command_substitution_is_bounded_per_line() {
+    let mut shell = Shell::new("root", "debian");
+
+    // A 2 MiB file, and a line with room for hundreds of substitutions of it:
+    // each command's output is capped on its own, so only a per-line budget
+    // stops the expanded line from multiplying the cap by the substitution
+    // count.
+    let cwd = shell.cwd;
+    shell
+        .vfs
+        .add_file(cwd, "big.txt", vec![b'A'; 2 * 1024 * 1024], 0o644, 0, 0);
+
+    let line = format!("echo {}", "$(cat big.txt)".repeat(200));
+    let output = run(&mut shell, &line);
+
+    assert!(
+        output.len() <= MAX_COMMAND_OUTPUT_BYTES + 64,
+        "substitution output ({} bytes) exceeded the per-line budget",
+        output.len()
+    );
+}
+
+#[test]
+fn nested_substitution_is_depth_bounded() {
+    let mut shell = Shell::new("root", "debian");
+
+    // The recursion runs through expansion, before any command is dispatched,
+    // so it has to be bounded there — a deep enough nest would otherwise
+    // overflow the stack and take the whole process with it.
+    let depth = 5_000;
+    let line = format!("echo {}whoami{}", "$(".repeat(depth), ")".repeat(depth));
+    let output = run(&mut shell, &line);
+
+    assert_eq!(output, "\n");
+}
+
+#[test]
 fn small_output_is_not_truncated() {
     let mut shell = Shell::new("root", "debian");
     let output = run(&mut shell, "echo hello world");

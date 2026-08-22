@@ -94,8 +94,13 @@ impl CommandHandler {
 
 /// How deep commands that run other commands (`sudo`, `sh -c`) may nest before
 /// the shell refuses. Every level is a real stack frame, and a stack overflow
-/// aborts the whole process rather than one session.
-const MAX_NESTED_COMMANDS: u32 = 16;
+/// aborts the whole process rather than one session. Command substitution
+/// recurses before it ever reaches [`dispatch`], so the shell checks this too.
+pub const MAX_NESTED_COMMANDS: u32 = 16;
+
+/// What an interactive login shell prints as it exits. A subshell that exits
+/// prints nothing, so command substitution strips it back off.
+pub const LOGOUT: &str = "logout\n";
 
 /// Look up `argv[0]` and run the matching command.
 pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
@@ -188,7 +193,7 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
 
         "true" => return CommandResult::ok(""),
         "false" => return CommandResult::err("", 1),
-        "exit" | "logout" => return CommandResult::ok("logout\n").exiting(),
+        "exit" | "logout" => return CommandResult::ok(LOGOUT).exiting(),
 
         other => return CommandResult::err(format!("-bash: {other}: command not found\n"), 127),
     };
