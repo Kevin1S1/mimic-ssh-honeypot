@@ -371,10 +371,10 @@ mimic-ssh-honeypot/
 │   │   ├── scp.rs           SCP sink — upload capture protocol
 │   │   └── hostkey.rs       Persistent Ed25519 + RSA host keys
 │   ├── shell/
-│   │   ├── mod.rs           Shell state machine, command dispatch, history
+│   │   ├── mod.rs           Shell state machine, $VAR expansion, dispatch, history
 │   │   ├── line.rs          Readline-style line editor (cursor, history, Ctrl-R)
 │   │   ├── complete.rs      Tab completion (command names + VFS paths)
-│   │   ├── parser.rs        Tokenizer (quoting, $VAR expansion, pipes)
+│   │   ├── parser.rs        Tokenizer (quoting, separators, pipes, redirects)
 │   │   └── env.rs           Environment variables, $PS1
 │   ├── vfs/
 │   │   ├── mod.rs           Virtual filesystem tree (arena-based)
