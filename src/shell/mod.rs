@@ -189,6 +189,11 @@ pub struct Shell {
     /// stage whose output is piped onward — commands that format differently
     /// off a terminal (`ls`) check this.
     pub stdout_is_tty: bool,
+    /// Whether this is an interactive shell. False for a one-shot `exec` and
+    /// for a shell channel with no terminal — bash reads a pipe
+    /// non-interactively, and the difference is observable: only an
+    /// interactive login shell announces `logout` on its way out.
+    pub interactive: bool,
     /// Submitted command lines this session, exposed by the `history` builtin.
     /// Bounded to keep per-session memory predictable.
     pub history: Vec<String>,
@@ -241,6 +246,7 @@ impl Shell {
             subst_stderr: String::new(),
             stdin: None,
             stdout_is_tty: true,
+            interactive: true,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,
