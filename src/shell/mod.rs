@@ -307,6 +307,22 @@ impl Shell {
                         chars.next();
                         push_value(&mut out, &self.pid.to_string(), in_double);
                     }
+                    Some('#') => {
+                        chars.next();
+                        push_value(&mut out, "0", in_double);
+                    }
+                    Some('0') => {
+                        chars.next();
+                        push_value(&mut out, "-bash", in_double);
+                    }
+                    Some('*') | Some('@') => {
+                        chars.next();
+                        push_value(&mut out, "", in_double);
+                    }
+                    Some(d) if d.is_ascii_digit() => {
+                        chars.next();
+                        push_value(&mut out, "", in_double);
+                    }
                     Some('{') => {
                         chars.next();
                         let mut name = String::new();
@@ -316,7 +332,18 @@ impl Shell {
                             }
                             name.push(n);
                         }
-                        push_value(&mut out, self.env.get(&name).unwrap_or(""), in_double);
+                        let val = match name.as_str() {
+                            "#" => "0".to_string(),
+                            "0" => "-bash".to_string(),
+                            "?" => self.last_status.to_string(),
+                            "$" => self.pid.to_string(),
+                            "*" | "@" => String::new(),
+                            _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) => {
+                                String::new()
+                            }
+                            _ => self.env.get(&name).unwrap_or("").to_string(),
+                        };
+                        push_value(&mut out, &val, in_double);
                     }
                     Some(n) if n.is_alphabetic() || n == '_' => {
                         let mut name = String::new();
@@ -807,6 +834,13 @@ mod tests {
         assert_eq!(shell.parse_line("echo ${HOME}"), vec!["echo", "/root"]);
         assert_eq!(shell.parse_line("echo $?"), vec!["echo", "7"]);
         assert_eq!(shell.parse_line("echo $$"), vec!["echo", "1337"]);
+        assert_eq!(shell.parse_line("echo $#"), vec!["echo", "0"]);
+        assert_eq!(shell.parse_line("echo $0"), vec!["echo", "-bash"]);
+        assert_eq!(shell.parse_line("echo $1 $2"), vec!["echo"]);
+        assert_eq!(
+            shell.parse_line("echo ${#} ${0} ${1}"),
+            vec!["echo", "0", "-bash"]
+        );
         // Unset variables expand to nothing.
         assert_eq!(shell.parse_line("echo $NOPE end"), vec!["echo", "end"]);
     }
@@ -986,6 +1020,34 @@ mod tests {
         assert_eq!(shell.execute("true").status, 0);
         assert_eq!(shell.execute("false").status, 1);
         assert_eq!(shell.execute("missing-command").status, 127);
+
+        let mut fresh = Shell::new("root", "debian");
+        let exit_default = fresh.execute("exit");
+        assert_eq!(exit_default.status, 0);
+        assert!(exit_default.exit);
+        assert_eq!(exit_default.text, "logout\n");
+
+        let exit_code = shell.execute("exit 42");
+        assert_eq!(exit_code.status, 42);
+        assert!(exit_code.exit);
+        assert_eq!(exit_code.text, "logout\n");
+
+        let exit_chained = shell.execute("false; exit");
+        assert_eq!(exit_chained.status, 1);
+        assert!(exit_chained.exit);
+        assert_eq!(exit_chained.text, "logout\n");
+
+        let exit_nan = shell.execute("exit abc");
+        assert_eq!(exit_nan.status, 2);
+        assert!(exit_nan.exit);
+        assert!(exit_nan
+            .text
+            .contains("-bash: exit: abc: numeric argument required\nlogout\n"));
+
+        let exit_too_many = shell.execute("exit 1 2");
+        assert_eq!(exit_too_many.status, 1);
+        assert!(!exit_too_many.exit);
+        assert_eq!(exit_too_many.text, "-bash: exit: too many arguments\n");
     }
 
     #[test]

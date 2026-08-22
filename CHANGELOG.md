@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- Positional parameter expansion: `$#` now expands to `0`, `$0` to `-bash`,
+  `$1`..`$9` to empty string, and `${#}`/`${0}`/etc. behave consistently with
+  login shell semantics. Previously `echo $#` printed `$#`, advertising a fake
+  shell to automated scripts probing argument counts.
+- `exit [N]` and `logout [N]` now propagate their exit status and preserve the
+  preceding command's exit code (`shell.last_status`) when called with no
+  operand. Bare `exit` and `false; exit` previously both reported 0. Non-numeric
+  operands report bash's `numeric argument required` error with status 2.
 - `ls` now supports `-d` and `--directory` to list directories themselves rather
   than their contents. `ls -ld /tmp` previously failed with `ls: invalid option -- 'd'`,
   revealing the shell as fake to standard reconnaissance commands.

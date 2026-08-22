@@ -35,14 +35,13 @@ fn url_parts(url: &str) -> (String, String) {
         Some((a, p)) => (a, p),
         None => (without_scheme, ""),
     };
-    let host = authority.split(['@', ':']).next_back().unwrap_or(authority);
     let host = authority
         .rsplit('@')
         .next()
-        .unwrap_or(host)
+        .unwrap_or(authority)
         .split(':')
         .next()
-        .unwrap_or(host);
+        .unwrap_or(authority);
     let base = path
         .trim_end_matches('/')
         .rsplit('/')
