@@ -133,24 +133,33 @@ impl SftpSession {
 
         self.buf.extend_from_slice(data);
 
-        loop {
-            if self.buf.len() < 4 {
-                break;
-            }
-            let pkt_len =
-                u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        let mut read_pos = 0;
+        while self.buf.len() - read_pos >= 4 {
+            let pkt_len = u32::from_be_bytes([
+                self.buf[read_pos],
+                self.buf[read_pos + 1],
+                self.buf[read_pos + 2],
+                self.buf[read_pos + 3],
+            ]) as usize;
+
             if pkt_len > MAX_SFTP_PACKET_LEN {
                 self.buf.clear();
-                break;
+                return (out, completed);
             }
-            if self.buf.len() < 4 + pkt_len {
+
+            if self.buf.len() - read_pos < 4 + pkt_len {
                 break;
             }
 
-            let pkt = self.buf[4..4 + pkt_len].to_vec();
-            self.buf.drain(0..4 + pkt_len);
-
+            let pkt_start = read_pos + 4;
+            let pkt_end = pkt_start + pkt_len;
+            let pkt = self.buf[pkt_start..pkt_end].to_vec();
             self.handle_packet(&pkt, shell, max_upload_bytes, &mut out, &mut completed);
+            read_pos = pkt_end;
+        }
+
+        if read_pos > 0 {
+            self.buf.drain(0..read_pos);
         }
 
         (out, completed)
@@ -395,13 +404,14 @@ impl SftpSession {
             }
             SSH_FXP_READ => {
                 let handle = get_bytes(&mut cursor).unwrap_or(&[]);
-                let offset = get_u64(&mut cursor).unwrap_or(0) as usize;
+                let raw_offset = get_u64(&mut cursor).unwrap_or(0);
                 let len = get_u32(&mut cursor).unwrap_or(0) as usize;
 
                 if let Some(SftpHandle::ReadFile { data, .. }) = self.handles.get(handle) {
-                    if offset >= data.len() {
+                    if raw_offset > usize::MAX as u64 || (raw_offset as usize) >= data.len() {
                         put_status(out, id, SSH_FX_EOF, "End of file");
                     } else {
+                        let offset = raw_offset as usize;
                         let read_len = len.min(MAX_READ_CHUNK).min(data.len() - offset);
                         put_data(out, id, &data[offset..offset + read_len]);
                     }
@@ -411,7 +421,7 @@ impl SftpSession {
             }
             SSH_FXP_WRITE => {
                 let handle = get_bytes(&mut cursor).unwrap_or(&[]);
-                let offset = get_u64(&mut cursor).unwrap_or(0) as usize;
+                let raw_offset = get_u64(&mut cursor).unwrap_or(0);
                 let chunk = get_bytes(&mut cursor).unwrap_or(&[]);
 
                 if let Some(SftpHandle::WriteFile {
@@ -424,16 +434,22 @@ impl SftpSession {
                 {
                     hasher.update(chunk);
                     *size += chunk.len() as u64;
-                    let end = offset.saturating_add(chunk.len());
-                    if (end as u64) <= max_upload_bytes {
+
+                    let raw_end = raw_offset.saturating_add(chunk.len() as u64);
+                    if raw_end <= max_upload_bytes && raw_end <= usize::MAX as u64 {
+                        let offset = raw_offset as usize;
+                        let end = raw_end as usize;
                         if end > data.len() {
                             data.resize(end, 0);
                         }
                         data[offset..end].copy_from_slice(chunk);
                     } else {
                         *truncated = true;
-                        if (offset as u64) < max_upload_bytes {
-                            let allowed = (max_upload_bytes - offset as u64) as usize;
+                        if raw_offset < max_upload_bytes && raw_offset < usize::MAX as u64 {
+                            let offset = raw_offset as usize;
+                            let allowed = (max_upload_bytes - raw_offset)
+                                .min(usize::MAX as u64 - raw_offset)
+                                as usize;
                             let take = allowed.min(chunk.len());
                             let chunk_end = offset + take;
                             if chunk_end > data.len() {
@@ -1290,5 +1306,37 @@ mod tests {
         let _id = get_u32(&mut cur).unwrap();
         let code = get_u32(&mut cur).unwrap();
         assert_eq!(code, SSH_FX_FAILURE);
+    }
+
+    #[test]
+    fn sftp_read_and_write_huge_offset_does_not_overflow() {
+        let mut session = SftpSession::new();
+        let mut shell = test_shell();
+
+        // Open existing file for read
+        let open_pkt = make_pkt(SSH_FXP_OPEN, |p| {
+            put_u32(p, 1);
+            put_str(p, "/etc/hostname");
+            put_u32(p, SSH_FXF_READ);
+            put_u32(p, 0);
+        });
+        let (out1, _) = session.feed(&open_pkt, &mut shell, 1024);
+        let mut cur = &out1[5..];
+        let _id = get_u32(&mut cur).unwrap();
+        let handle = get_bytes(&mut cur).unwrap().to_vec();
+
+        // Read at offset u64::MAX returns EOF without wrapping
+        let read_pkt = make_pkt(SSH_FXP_READ, |p| {
+            put_u32(p, 2);
+            put_bytes(p, &handle);
+            put_u64(p, u64::MAX);
+            put_u32(p, 100);
+        });
+        let (out2, _) = session.feed(&read_pkt, &mut shell, 1024);
+        assert_eq!(out2[4], SSH_FXP_STATUS);
+        let mut cur = &out2[5..];
+        let _id = get_u32(&mut cur).unwrap();
+        let code = get_u32(&mut cur).unwrap();
+        assert_eq!(code, SSH_FX_EOF);
     }
 }

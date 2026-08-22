@@ -450,8 +450,8 @@ impl MimicHandler {
             String::new()
         } else {
             match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
-                Ok(p) => {
-                    self.quarantine_bytes += file.data.len() as u64;
+                Ok((p, written)) => {
+                    self.quarantine_bytes += written;
                     p
                 }
                 Err(err) => {
@@ -502,8 +502,8 @@ impl MimicHandler {
             String::new()
         } else {
             match write_quarantine(&quarantine_dir, &stored_sha256, &upload.data) {
-                Ok(p) => {
-                    self.quarantine_bytes += upload.data.len() as u64;
+                Ok((p, written)) => {
+                    self.quarantine_bytes += written;
                     p
                 }
                 Err(err) => {
@@ -595,22 +595,29 @@ fn abs_path(cwd: &str, path: &str) -> String {
 }
 
 /// Write `data` to `<dir>/<sha256>` (deduplicating by content hash), creating
-/// `dir` if needed. Returns the stored file's path. Files are created
+/// `dir` if needed. Returns `(stored_path, newly_written_bytes)`. Files are created
 /// non-executable and owner-read/write only (`0600`) at creation time so a
 /// captured payload can never be run from the quarantine store and is never
 /// briefly world/group-readable between the write and a chmod.
-fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io::Result<String> {
+fn write_quarantine(
+    dir: &std::path::Path,
+    sha256: &str,
+    data: &[u8],
+) -> std::io::Result<(String, u64)> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(sha256);
     // Content-addressed store: identical payloads dedupe. `create_new` also
     // closes the exists()-then-write TOCTOU — if a concurrent session already
     // stored the same bytes, `AlreadyExists` is success, not an error.
-    match create_restricted(&path) {
-        Ok(mut file) => file.write_all(data)?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+    let newly_written = match create_restricted(&path) {
+        Ok(mut file) => {
+            file.write_all(data)?;
+            data.len() as u64
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => 0,
         Err(e) => return Err(e),
-    }
+    };
     let stored = path.to_string_lossy().into_owned();
     // `Path::join` appends a backslash on Windows, so a forward-slash
     // `quarantine_dir` from the config yields `C:/data\ab12…` — one logged
@@ -618,7 +625,7 @@ fn write_quarantine(dir: &std::path::Path, sha256: &str, data: &[u8]) -> std::io
     // key. Windows-only: a backslash is a legal filename byte on Unix.
     #[cfg(windows)]
     let stored = stored.replace('\\', "/");
-    Ok(stored)
+    Ok((stored, newly_written))
 }
 
 /// Create `path` for writing with owner-only (`0600`) permissions set at
