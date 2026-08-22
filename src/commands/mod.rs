@@ -193,7 +193,7 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
 
         // Process-table emulation (no real process is ever signalled).
         "ps" => CommandHandler::Read(system::ps),
-        "top" => CommandHandler::Read(system::top),
+        "top" => CommandHandler::Mut(system::top),
         "kill" => CommandHandler::Read(system::kill),
         "pkill" => CommandHandler::Read(system::pkill),
         "free" => CommandHandler::Read(system::free),

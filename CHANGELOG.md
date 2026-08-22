@@ -50,6 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *interactive* login shell, so `ssh host exit` and a piped session now exit
   silently while still reporting their status. The MOTD still arrives on both
   paths, since it comes from the PAM session rather than the terminal.
+- `top` now holds the terminal and repaints every three seconds until `q`, the
+  way real `top` does, instead of printing one snapshot and returning to the
+  prompt. The header's clock and uptime advance with each repaint, and Ctrl-C
+  quits like any foreground job. Batch mode (`-b`), an iteration count (`-n`), a
+  pipe, a redirect, a command substitution, and any channel without a terminal
+  all still get the one-shot dump — the same cases real `top` prints once for.
+- A command substitution's stdout is a pipe, so commands that format differently
+  off a terminal now do so inside one: `$(ls)` gives one name per line, as bash
+  does, where it previously used the column layout.
 
 ## [0.4.0] - 2026-08-22
 

@@ -97,7 +97,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Privilege** | `sudo` (transient elevation for one command; `-i`/`-s` hand over a root shell for the session), `su` (identity switch; prompts a non-root user for a password) |
 | **Shells** | `bash`/`sh` (`-c LINE` runs the line; bare invocation acts as a subshell), `scp` (local copy; remote operands fail as unreachable) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
-| **Processes** | `ps` (`aux`/`-ef`), `top`, `kill`, `pkill`, `free`, `uptime` |
+| **Processes** | `ps` (`aux`/`-ef`), `top` (holds the screen and repaints until `q`; `-b`/`-n` dump once), `kill`, `pkill`, `free`, `uptime` |
 | **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip` |
 | **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
