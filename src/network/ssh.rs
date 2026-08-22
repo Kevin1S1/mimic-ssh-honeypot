@@ -408,11 +408,24 @@ impl MimicHandler {
     ) -> Result<bool, russh::Error> {
         let trimmed = line.trim().to_string();
         if !trimmed.is_empty() {
-            event::command(self.session_id, self.peer, &trimmed);
             self.shell().record_history(&trimmed);
         }
         let result = self.shell().execute(&trimmed);
+        // A line that only opened a here-document is logged when the document
+        // closes, with its body: the body is the payload, and a capture
+        // holding `cat << EOF > drop.sh` without the script is worth little.
+        let parked = self.shell().pending.as_ref().is_some_and(|p| p.echoes());
+        if !trimmed.is_empty() && !parked {
+            event::command(self.session_id, self.peer, &trimmed);
+        }
         self.deliver(channel, &result, session).await
+    }
+
+    /// Log a here-document that has just closed, as the single command it is.
+    fn log_closed_heredoc(&mut self) {
+        if let Some(text) = self.shell().heredoc_log.take() {
+            event::command(self.session_id, self.peer, &text);
+        }
     }
 
     /// Take over the terminal with a full-screen display, repainting it every
@@ -523,6 +536,7 @@ impl MimicHandler {
             // The prompt was written to the channel; with no terminal there is
             // no echo to suppress, so the next line is simply the answer.
             let output = self.shell().resume(line);
+            self.log_closed_heredoc();
             return self.deliver(channel, &output, session).await;
         }
         self.submit_line(channel, line, session).await
@@ -1092,7 +1106,14 @@ impl Handler for MimicHandler {
         // A one-shot `exec` is never interactive, whatever the previous channel
         // on this connection was.
         self.shell().interactive = false;
-        let result = self.shell().execute(&cmd);
+        let mut result = self.shell().execute(&cmd);
+        // A here-document opened by a one-shot command can never be fed, so it
+        // ends at end-of-input with bash's warning — what `bash -c` does with
+        // the same string.
+        if let Some(finished) = self.shell().finish_heredoc_at_eof() {
+            self.log_closed_heredoc();
+            result = finished;
+        }
         // A one-shot `exec` has no interactive stdin, so drop any prompt a
         // command left pending (e.g. `su` awaiting a password).
         self.shell().pending = None;
@@ -1236,7 +1257,17 @@ impl Handler for MimicHandler {
                 Reaction::Submit { echo, line } => {
                     session.data(channel, echo)?;
 
-                    if self.submit_line(channel, &line, session).await? {
+                    // A here-document body line is not a command: it answers
+                    // the line that opened the document, and only that line is
+                    // logged and run.
+                    let ended = if self.shell().pending.as_ref().is_some_and(|p| p.echoes()) {
+                        let output = self.shell().resume(&line);
+                        self.log_closed_heredoc();
+                        self.deliver(channel, &output, session).await?
+                    } else {
+                        self.submit_line(channel, &line, session).await?
+                    };
+                    if ended {
                         return Ok(());
                     }
                     // A command took the screen (`top`): it paints itself and
@@ -1247,13 +1278,21 @@ impl Handler for MimicHandler {
                         continue;
                     }
                     // A command left an interactive prompt pending (e.g. `su`
-                    // asking for a password): switch to no-echo collection
-                    // instead of drawing a new shell prompt.
-                    if self.shell().pending.is_some() {
-                        self.password_buf = Some(Vec::new());
-                        continue;
-                    }
-                    let prompt = self.shell().prompt();
+                    // asking for a password, `<< EOF` collecting a body): a
+                    // password is collected with echo suppressed, while a
+                    // here-document body is ordinary input under `PS2`.
+                    let continuation = match self.shell().pending.as_ref() {
+                        None => None,
+                        Some(pending) if !pending.echoes() => {
+                            self.password_buf = Some(Vec::new());
+                            continue;
+                        }
+                        Some(pending) => pending.prompt(),
+                    };
+                    let prompt = match continuation {
+                        Some(ps2) => ps2.to_string(),
+                        None => self.shell().prompt(),
+                    };
                     self.editor.set_prompt(&prompt);
                     session.data(channel, self.editor.render().to_vec())?;
                 }
@@ -1290,6 +1329,13 @@ impl Handler for MimicHandler {
                         .trim_end_matches('\r')
                         .to_string();
                     if self.run_no_tty_line(channel, &line, session).await? {
+                        return Ok(());
+                    }
+                }
+                // A script that stops mid-body still runs what it opened.
+                if let Some(output) = self.shell().finish_heredoc_at_eof() {
+                    self.log_closed_heredoc();
+                    if self.deliver(channel, &output, session).await? {
                         return Ok(());
                     }
                 }
@@ -1991,6 +2037,100 @@ mod tests {
             "expected one dump: {out:?}"
         );
         assert!(!out.contains(SCREEN_HOME), "exec should not paint a screen");
+        assert_eq!(status, Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A here-document spans lines, so the network layer has to collect them:
+    /// under a PTY behind bash's `PS2` continuation prompt, echoing as usual,
+    /// and over a pipe simply as the lines that follow. Dropping a script into
+    /// a file with `cat << EOF > file` is one of the most common things a bot
+    /// does, so the body has to reach the command and only the opening line may
+    /// be logged as a command.
+    #[tokio::test]
+    async fn a_heredoc_collects_its_body_under_a_pty() {
+        let (_handle, mut channel, dir) = shell_session("heredoc-pty").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel
+            .data(&b"cat << EOF > /tmp/x\r"[..])
+            .await
+            .expect("open");
+        let prompt = read_for(&mut channel, Duration::from_millis(400)).await;
+        let prompt = String::from_utf8_lossy(&prompt).into_owned();
+        assert!(prompt.contains("> "), "no PS2 continuation: {prompt:?}");
+        assert!(
+            !prompt.contains("root@debian"),
+            "drew PS1 mid-document: {prompt:?}"
+        );
+
+        channel
+            .data(&b"line one\rline two\rEOF\r"[..])
+            .await
+            .expect("body");
+        read_for(&mut channel, Duration::from_millis(400)).await;
+
+        channel.data(&b"cat /tmp/x\r"[..]).await.expect("read back");
+        let seen = read_for(&mut channel, Duration::from_millis(500)).await;
+        let seen = String::from_utf8_lossy(&seen).into_owned();
+        assert!(
+            seen.contains("line one\r\nline two\r\n"),
+            "body did not reach the file: {seen:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same document over a channel with no terminal, where the body is
+    /// simply the next lines of the script.
+    #[tokio::test]
+    async fn a_heredoc_collects_its_body_over_a_pipe() {
+        let (handle, dir) = honeypot("heredoc-pipe").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.request_shell(true).await.expect("shell request");
+        channel
+            .data(&b"cat << EOF\npayload\nEOF\necho after\n"[..])
+            .await
+            .expect("send script");
+        channel.eof().await.expect("send eof");
+
+        let (seen, _, status) = drain_streams(&mut channel).await;
+        let out = String::from_utf8_lossy(&seen);
+
+        assert!(out.ends_with("payload\nafter\n"), "unexpected: {out:?}");
+        assert!(
+            !out.contains("> "),
+            "a PS2 leaked onto a channel with no pty"
+        );
+        assert_eq!(status, Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot `exec` can never be fed a body, so the document ends at
+    /// end-of-input with bash's warning rather than hanging to the idle
+    /// timeout.
+    #[tokio::test]
+    async fn exec_heredoc_ends_at_end_of_input() {
+        let (handle, dir) = honeypot("heredoc-exec").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.exec(true, &b"cat << EOF"[..]).await.expect("exec");
+
+        let (seen, errs, status) = drain_streams(&mut channel).await;
+
+        assert_eq!(seen, b"", "an empty body wrote to stdout");
+        assert!(
+            String::from_utf8_lossy(&errs).contains("here-document delimited by end-of-file"),
+            "missing warning: {:?}",
+            String::from_utf8_lossy(&errs)
+        );
         assert_eq!(status, Some(0));
 
         let _ = std::fs::remove_dir_all(&dir);

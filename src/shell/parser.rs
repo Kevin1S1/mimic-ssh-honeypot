@@ -92,6 +92,120 @@ pub fn substitution_at(line: &str, i: usize) -> Option<Substitution> {
     }
 }
 
+/// A here-document a line opened: what ends the body, and how it is treated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heredoc {
+    /// The word that ends the body when a line holds it and nothing else.
+    pub delimiter: String,
+    /// `<<-`: leading tabs come off every body line and off the terminator, so
+    /// a heredoc inside an indented block can be indented with it.
+    pub strip_tabs: bool,
+    /// Whether `$VAR` and `$(…)` expand in the body. A quoted delimiter
+    /// (`<< 'EOF'`) turns expansion off and the body is taken literally.
+    pub expand: bool,
+}
+
+/// Find a here-document operator on `line`, returning it together with the line
+/// that remains once the operator and its delimiter are removed — the command
+/// that runs when the body has been collected.
+///
+/// Runs on the raw line, before expansion and before segment splitting, because
+/// `<<` is lexical: a `<<` arriving in a variable's value is data, and one
+/// inside `$((1 << 2))` is a shift. Only the first is taken — bash allows
+/// several per line, and one covers every payload seen in the wild.
+pub fn split_heredoc(line: &str) -> Option<(Heredoc, String)> {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        // `$((1 << 2))` is a shift, and a `<<` inside `$(…)` belongs to the
+        // command being substituted.
+        if !in_single {
+            if let Some(subst) = substitution_at(line, i) {
+                i = subst.end;
+                continue;
+            }
+        }
+        match bytes[i] {
+            b'\\' if !in_single => escaped = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'<' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'<') => {
+                // `<<<` is a here-string, which takes its word from the line
+                // itself rather than opening a body.
+                if bytes.get(i + 2) == Some(&b'<') {
+                    i += 3;
+                    continue;
+                }
+                let mut j = i + 2;
+                let strip_tabs = bytes.get(j) == Some(&b'-');
+                if strip_tabs {
+                    j += 1;
+                }
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let end = word_end(line, j);
+                if end == j {
+                    // `cat <<` with nothing after it is a syntax error, and
+                    // treating it as a plain argument is closer to the truth
+                    // than inventing an empty delimiter.
+                    return None;
+                }
+                let raw = &line[j..end];
+                let quoted = raw.starts_with('\'') || raw.starts_with('"') || raw.contains('\\');
+                let delimiter = unquote(raw);
+                let mut rest = String::with_capacity(line.len());
+                rest.push_str(&line[..i]);
+                rest.push_str(&line[end..]);
+                return Some((
+                    Heredoc {
+                        delimiter,
+                        strip_tabs,
+                        expand: !quoted,
+                    },
+                    rest,
+                ));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip the quoting from a here-document delimiter word. The delimiter is
+/// matched against a body line as plain text, so `'EOF'`, `"EOF"` and `\EOF`
+/// all end a body at `EOF`.
+fn unquote(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for c in word.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Cut a `#` comment off the end of `line`, returning what is left to run.
 ///
 /// Bash starts a comment at an unquoted, unescaped `#` that begins a word — so

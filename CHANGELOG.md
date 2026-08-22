@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A command substitution's stdout is a pipe, so commands that format differently
   off a terminal now do so inside one: `$(ls)` gives one name per line, as bash
   does, where it previously used the column layout.
+- Here-documents (`cat << EOF`) are now collected and fed to the command as its
+  stdin, instead of falling through as literal arguments. Dropping a script with
+  `cat << EOF > /tmp/x` is one of the most common things a bot does, and it
+  previously created nothing and lost the payload. `<<-` strips leading tabs, a
+  quoted delimiter (`<< 'EOF'`) takes the body literally while an unquoted one
+  expands it, and the rest of the line — redirects, pipes, chaining — still
+  applies. Under a PTY the body is collected behind bash's `>` continuation
+  prompt; over a pipe it is simply the lines that follow. A document that never
+  closes ends at end-of-input with bash's warning, so `ssh host 'cat << EOF'`
+  returns instead of hanging. The whole document, opening line and body
+  together, is recorded as one `command` event — the body is the payload, so a
+  capture holding only the `cat` would be worth little.
 
 ## [0.4.0] - 2026-08-22
 
