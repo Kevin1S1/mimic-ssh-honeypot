@@ -58,6 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path it actually carries.
 
 ### Security
+- Variable expansion now respects the quoting around it, and what a variable
+  holds is treated as data rather than as more shell source. `echo "it's
+  $USER"` printed `it's $USER`, because the apostrophe inside double quotes was
+  read as opening a single-quoted string that suppressed the expansion;
+  `echo \$USER` printed the username where bash prints `$USER`; and a value
+  containing a quote or a backslash was re-parsed as syntax, so a variable
+  holding `a'b` echoed as `ab`. Each is a two-command check against any real
+  shell. Values are now escaped on the way into the tokenizer, which only ever
+  adds a backslash in front of a quote or backslash — never whitespace and
+  never a `$` — so an expanded value still cannot introduce a word boundary, a
+  further expansion, or a command separator. Word splitting is unchanged: an
+  unquoted value still splits, a quoted one still does not. A side effect worth
+  knowing: a backslash escape in a value now survives to the command, so
+  `T='a\tb'; echo -e $T` prints a tab, as it does in bash.
 - Every fabricated timestamp now derives from the real clock instead of a date
   fixed at compile time. `date` returned the real year while `last`, `Last
   login`, `ps` and every file in the snapshot said 2024, and `ls -l` dated files

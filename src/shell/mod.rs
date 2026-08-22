@@ -225,33 +225,49 @@ impl Shell {
     }
 
     /// Expand variables in `line` and split it into argument words — the argv
-    /// the command layer dispatches on. Expansion runs first so `$VAR` values
-    /// are subject to quoting/word-splitting by the tokenizer.
+    /// the command layer dispatches on. Expansion runs first so an unquoted
+    /// `$VAR` value is still word-split by the tokenizer; the quoting in the
+    /// value itself is escaped on the way through, so it stays data.
     pub fn parse_line(&self, line: &str) -> Vec<String> {
         parser::tokenize(&self.expand(line))
     }
 
-    /// Expand `$VAR`, `${VAR}`, `$?`, and `$$` in `line`, respecting single
-    /// quotes (which suppress expansion).
+    /// Expand `$VAR`, `${VAR}`, `$?`, and `$$` in `line`, respecting the
+    /// quoting around each one: single quotes suppress expansion entirely,
+    /// double quotes suppress the word splitting the tokenizer would otherwise
+    /// do, and a backslash protects the character after it.
     fn expand(&self, line: &str) -> String {
         let mut out = String::new();
         let mut in_single = false;
+        let mut in_double = false;
         let mut chars = line.chars().peekable();
 
         while let Some(c) = chars.next() {
             match c {
-                '\'' => {
+                // The escape reaches the tokenizer intact, so whatever it
+                // protects stays data — including a `$` that would expand.
+                '\\' if !in_single => {
+                    out.push(c);
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                '\'' if !in_double => {
                     in_single = !in_single;
+                    out.push(c);
+                }
+                '"' if !in_single => {
+                    in_double = !in_double;
                     out.push(c);
                 }
                 '$' if !in_single => match chars.peek() {
                     Some('?') => {
                         chars.next();
-                        out.push_str(&self.last_status.to_string());
+                        push_value(&mut out, &self.last_status.to_string(), in_double);
                     }
                     Some('$') => {
                         chars.next();
-                        out.push_str(&self.pid.to_string());
+                        push_value(&mut out, &self.pid.to_string(), in_double);
                     }
                     Some('{') => {
                         chars.next();
@@ -262,7 +278,7 @@ impl Shell {
                             }
                             name.push(n);
                         }
-                        out.push_str(self.env.get(&name).unwrap_or(""));
+                        push_value(&mut out, self.env.get(&name).unwrap_or(""), in_double);
                     }
                     Some(&n) if n.is_alphabetic() || n == '_' => {
                         let mut name = String::new();
@@ -274,7 +290,7 @@ impl Shell {
                                 break;
                             }
                         }
-                        out.push_str(self.env.get(&name).unwrap_or(""));
+                        push_value(&mut out, self.env.get(&name).unwrap_or(""), in_double);
                     }
                     _ => out.push('$'),
                 },
@@ -590,6 +606,26 @@ impl Shell {
     }
 }
 
+/// Append an expansion's result to the line the tokenizer will read, escaping
+/// the characters it would otherwise take as syntax.
+///
+/// What a variable holds is data, not shell source: a quote or a backslash in
+/// a value is a character the command receives, never quoting that re-parses
+/// the rest of the line. Whitespace is deliberately left alone, so an unquoted
+/// value still splits into words and a quoted one does not — the one part of
+/// the value bash does act on. `in_double` only spares the single quote, which
+/// the tokenizer already treats as an ordinary character inside double quotes.
+fn push_value(out: &mut String, value: &str, in_double: bool) {
+    for c in value.chars() {
+        match c {
+            '\\' | '"' => out.push('\\'),
+            '\'' if !in_double => out.push('\\'),
+            _ => {}
+        }
+        out.push(c);
+    }
+}
+
 /// Ensure `home_path` exists in `vfs`, creating it with skeleton dotfiles if
 /// the account is one the snapshot does not ship. Returns the home node id.
 fn ensure_home(vfs: &mut Vfs, home_path: &str, uid: u32, gid: u32) -> NodeId {
@@ -646,6 +682,59 @@ mod tests {
     fn single_quotes_suppress_expansion() {
         let shell = Shell::new("root", "debian");
         assert_eq!(shell.parse_line("echo '$USER'"), vec!["echo", "$USER"]);
+    }
+
+    #[test]
+    fn double_quotes_expand_and_hold_a_single_quote() {
+        let mut shell = Shell::new("root", "debian");
+        // The apostrophe is an ordinary character inside double quotes, so it
+        // must not turn the rest of the line into a single-quoted string.
+        assert_eq!(
+            shell.parse_line(r#"echo "it's $USER""#),
+            vec!["echo", "it's root"]
+        );
+        assert_eq!(shell.execute(r#"echo "it's $USER""#).text, "it's root\n");
+    }
+
+    #[test]
+    fn a_backslash_protects_the_dollar_it_precedes() {
+        let shell = Shell::new("root", "debian");
+        assert_eq!(shell.parse_line(r"echo \$USER"), vec!["echo", "$USER"]);
+        assert_eq!(shell.parse_line(r#"echo "\$USER""#), vec!["echo", "$USER"]);
+        // An escaped backslash is data; the `$` after it still expands.
+        assert_eq!(shell.parse_line(r"echo \\$USER"), vec!["echo", r"\root"]);
+    }
+
+    #[test]
+    fn an_expanded_value_is_data_not_syntax() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute(r#"export Q="a'b""#);
+        shell.execute(r#"export D='a"b'"#);
+        shell.execute(r"export B='a\b'");
+        shell.execute("export S='a  b'");
+
+        // Quotes and backslashes arriving in a value are characters the
+        // command receives, not quoting that re-parses the word.
+        assert_eq!(shell.execute("echo $Q").text, "a'b\n");
+        assert_eq!(shell.execute(r#"echo "$D""#).text, "a\"b\n");
+        assert_eq!(shell.execute("echo $B").text, "a\\b\n");
+        // A value cannot open a quote that swallows what follows it.
+        assert_eq!(shell.execute("echo $D tail").text, "a\"b tail\n");
+
+        // Word splitting is the one thing that still applies to an unquoted
+        // value, and double quotes still suppress it.
+        assert_eq!(shell.parse_line("echo $S"), vec!["echo", "a", "b"]);
+        assert_eq!(shell.parse_line(r#"echo "$S""#), vec!["echo", "a  b"]);
+    }
+
+    #[test]
+    fn escapes_in_a_value_reach_echo_e() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute(r"export T='a\tb'");
+        // The backslash survives expansion, so `-e` has a `\t` to interpret
+        // and plain `echo` prints it as written.
+        assert_eq!(shell.execute("echo -e $T").text, "a\tb\n");
+        assert_eq!(shell.execute("echo $T").text, "a\\tb\n");
     }
 
     #[test]
