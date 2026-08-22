@@ -88,6 +88,36 @@ pub enum Pending {
         /// The account to become once a password is supplied.
         target: String,
     },
+    /// A here-document (`cat << EOF`) is collecting its body. The line that
+    /// opened it runs once a line holds the delimiter and nothing else.
+    Heredoc {
+        /// The command line with the `<<` operator and delimiter removed.
+        command: String,
+        /// The line exactly as it was typed, for the capture.
+        raw: String,
+        /// What ends the body, and how the body is treated.
+        doc: parser::Heredoc,
+        /// The lines collected so far, each newline-terminated.
+        body: String,
+    },
+}
+
+impl Pending {
+    /// Whether the client's answer is echoed back as it is typed. A password
+    /// is not; a here-document body is ordinary input and bash's readline
+    /// echoes it under its continuation prompt.
+    pub fn echoes(&self) -> bool {
+        matches!(self, Pending::Heredoc { .. })
+    }
+
+    /// The prompt shown while this is outstanding, if the shell draws one.
+    /// `su` writes its own; a here-document gets bash's `PS2`.
+    pub fn prompt(&self) -> Option<&'static str> {
+        match self {
+            Pending::SuPassword { .. } => None,
+            Pending::Heredoc { .. } => Some("> "),
+        }
+    }
 }
 
 /// Environment variables describing the SSH connection itself. The network
@@ -212,6 +242,11 @@ pub struct Shell {
     /// substitution captures its body's stdout through a pipe, so nothing
     /// inside one is writing to a terminal however the stage itself looks.
     subst_depth: u32,
+    /// A here-document body waiting to become the next pipeline's stdin.
+    heredoc_stdin: Option<String>,
+    /// A completed here-document, opening line and body together, waiting for
+    /// the network layer to log it as the one command it was.
+    pub heredoc_log: Option<String>,
 }
 
 impl Shell {
@@ -258,6 +293,8 @@ impl Shell {
             interactive: true,
             screen: None,
             subst_depth: 0,
+            heredoc_stdin: None,
+            heredoc_log: None,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,
@@ -315,9 +352,18 @@ impl Shell {
     /// tokenizer would otherwise do, and a backslash protects the character
     /// after it.
     fn expand(&mut self, line: &str) -> String {
+        self.expand_with(line, Expansion::Words)
+    }
+
+    /// The body of [`Shell::expand`], parameterised by what its result feeds.
+    fn expand_with(&mut self, line: &str, mode: Expansion) -> String {
         let mut out = String::new();
         let mut in_single = false;
         let mut in_double = false;
+        // A here-document body is a command's stdin, not shell source: quotes
+        // in it are ordinary characters, so the quote state never leaves
+        // `false` and every expanded value is emitted exactly as it is.
+        let words = mode == Expansion::Words;
         let mut chars = line.char_indices().peekable();
 
         while let Some((i, c)) = chars.next() {
@@ -331,7 +377,7 @@ impl Shell {
                     } else {
                         self.substitute(body)
                     };
-                    push_value(&mut out, &value, in_double);
+                    emit(&mut out, mode, &value, in_double);
                     while chars.peek().is_some_and(|(j, _)| *j < subst.end) {
                         chars.next();
                     }
@@ -339,46 +385,56 @@ impl Shell {
                 }
             }
             match c {
-                // The escape reaches the tokenizer intact, so whatever it
-                // protects stays data — including a `$` that would expand.
                 '\\' if !in_single => {
-                    out.push(c);
-                    if let Some((_, next)) = chars.next() {
+                    if words {
+                        // The escape reaches the tokenizer intact, so whatever
+                        // it protects stays data — including a `$` that would
+                        // expand.
+                        out.push(c);
+                        if let Some((_, next)) = chars.next() {
+                            out.push(next);
+                        }
+                    } else if matches!(chars.peek(), Some((_, '$' | '`' | '\\'))) {
+                        // In a body a backslash protects only what could still
+                        // expand; before anything else it is a plain character.
+                        let (_, next) = chars.next().expect("peeked");
                         out.push(next);
+                    } else {
+                        out.push(c);
                     }
                 }
-                '\'' if !in_double => {
+                '\'' if words && !in_double => {
                     in_single = !in_single;
                     out.push(c);
                 }
-                '"' if !in_single => {
+                '"' if words && !in_single => {
                     in_double = !in_double;
                     out.push(c);
                 }
                 '$' if !in_single => match chars.peek().map(|&(_, n)| n) {
                     Some('?') => {
                         chars.next();
-                        push_value(&mut out, &self.last_status.to_string(), in_double);
+                        emit(&mut out, mode, &self.last_status.to_string(), in_double);
                     }
                     Some('$') => {
                         chars.next();
-                        push_value(&mut out, &self.pid.to_string(), in_double);
+                        emit(&mut out, mode, &self.pid.to_string(), in_double);
                     }
                     Some('#') => {
                         chars.next();
-                        push_value(&mut out, "0", in_double);
+                        emit(&mut out, mode, "0", in_double);
                     }
                     Some('0') => {
                         chars.next();
-                        push_value(&mut out, "-bash", in_double);
+                        emit(&mut out, mode, "-bash", in_double);
                     }
                     Some('*') | Some('@') => {
                         chars.next();
-                        push_value(&mut out, "", in_double);
+                        emit(&mut out, mode, "", in_double);
                     }
                     Some(d) if d.is_ascii_digit() => {
                         chars.next();
-                        push_value(&mut out, "", in_double);
+                        emit(&mut out, mode, "", in_double);
                     }
                     Some('{') => {
                         chars.next();
@@ -400,7 +456,7 @@ impl Shell {
                             }
                             _ => self.env.get(&name).unwrap_or("").to_string(),
                         };
-                        push_value(&mut out, &val, in_double);
+                        emit(&mut out, mode, &val, in_double);
                     }
                     Some(n) if n.is_alphabetic() || n == '_' => {
                         let mut name = String::new();
@@ -412,7 +468,7 @@ impl Shell {
                                 break;
                             }
                         }
-                        push_value(&mut out, self.env.get(&name).unwrap_or(""), in_double);
+                        emit(&mut out, mode, self.env.get(&name).unwrap_or(""), in_double);
                     }
                     _ => out.push('$'),
                 },
@@ -570,8 +626,90 @@ impl Shell {
                 self.switch_user(&target);
                 Output::default()
             }
+            Some(Pending::Heredoc {
+                command,
+                raw,
+                doc,
+                mut body,
+            }) => {
+                let line = if doc.strip_tabs {
+                    input.trim_start_matches('\t')
+                } else {
+                    input
+                };
+                if line == doc.delimiter {
+                    return self.run_heredoc(&command, &raw, &doc, body);
+                }
+                body.push_str(line);
+                body.push('\n');
+                // The body grows a line at a time from the client, so it is
+                // capped like every other buffer an attacker can drive.
+                commands::truncate_stream(&mut body, commands::MAX_COMMAND_OUTPUT_BYTES);
+                self.pending = Some(Pending::Heredoc {
+                    command,
+                    raw,
+                    doc,
+                    body,
+                });
+                Output::default()
+            }
             None => Output::default(),
         }
+    }
+
+    /// End a here-document at end-of-input rather than at its delimiter.
+    ///
+    /// A script that stops mid-body still runs the command with what it has,
+    /// and bash warns on the way — so `ssh host 'cat << EOF'`, which can never
+    /// supply a body, behaves the way `bash -c` does with the same string.
+    pub fn finish_heredoc_at_eof(&mut self) -> Option<Output> {
+        let Some(Pending::Heredoc {
+            command,
+            raw,
+            doc,
+            body,
+        }) = self.pending.take()
+        else {
+            return None;
+        };
+        let mut out = self.run_heredoc(&command, &raw, &doc, body);
+        let warning = format!(
+            "-bash: warning: here-document delimited by end-of-file (wanted `{}')\n",
+            doc.delimiter
+        );
+        out.text.insert_str(0, &warning);
+        out.stderr.insert_str(0, &warning);
+        Some(out)
+    }
+
+    /// Run the line a here-document was opened on, with the collected body as
+    /// its stdin.
+    fn run_heredoc(
+        &mut self,
+        command: &str,
+        raw: &str,
+        doc: &parser::Heredoc,
+        body: String,
+    ) -> Output {
+        self.pending = None;
+        // The body *is* the payload — a dropped script, a crontab, a key — so
+        // the capture records the document whole rather than a bare `cat` with
+        // the interesting part missing. Logged here, once, when it closes:
+        // the body lines are not commands and are never logged as such.
+        self.heredoc_log = Some(format!("{raw}\n{body}{}", doc.delimiter));
+        // An unquoted delimiter leaves the body subject to expansion, which is
+        // how `cat << EOF` interpolates `$HOME`; a quoted one takes it as-is.
+        let text = if doc.expand {
+            self.expand_with(&body, Expansion::Literal)
+        } else {
+            body
+        };
+        self.heredoc_stdin = Some(text);
+        let out = self.execute(command);
+        // A command that ignored stdin leaves the body behind; it belongs to
+        // this line only.
+        self.heredoc_stdin = None;
+        out
     }
 
     /// Run one segment as a pipeline: each stage's *stdout* becomes the next
@@ -588,7 +726,9 @@ impl Shell {
     fn run_pipeline(&mut self, segment: &str) -> Option<commands::CommandResult> {
         let stages = parser::split_pipeline(segment);
         let last_stage = stages.len() - 1;
-        let mut piped: Option<String> = None;
+        // A here-document body is the first stage's stdin, exactly as a pipe
+        // from an upstream stage would be.
+        let mut piped: Option<String> = self.heredoc_stdin.take();
         let mut last: Option<commands::CommandResult> = None;
         let mut stderr = String::new();
 
@@ -830,6 +970,20 @@ impl Shell {
             // means a caller that expands outside a pipeline (a prompt, a
             // completion) cannot leave text to surface on the next line.
             self.subst_stderr.clear();
+
+            // A here-document needs the lines that follow, which only the
+            // network layer can read, so the line is parked and the body is
+            // collected through `resume`. Nested runs — a substitution, an
+            // `sh -c` — have no further input to read, so they never park.
+            if let Some((doc, command)) = parser::split_heredoc(parser::strip_comment(line)) {
+                self.pending = Some(Pending::Heredoc {
+                    command,
+                    raw: line.to_string(),
+                    doc,
+                    body: String::new(),
+                });
+                return Output::default();
+            }
         }
 
         let mut out = Output::default();
@@ -887,6 +1041,24 @@ impl Shell {
             out.status = status;
         }
         out
+    }
+}
+
+/// What an expansion's result feeds, which decides whether the characters a
+/// tokenizer would take as syntax have to be escaped on the way out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Expansion {
+    /// Argument words for the command layer.
+    Words,
+    /// A here-document body: a command's stdin, never shell source.
+    Literal,
+}
+
+/// Append an expanded value under the rules of `mode`.
+fn emit(out: &mut String, mode: Expansion, value: &str, in_double: bool) {
+    match mode {
+        Expansion::Words => push_value(out, value, in_double),
+        Expansion::Literal => out.push_str(value),
     }
 }
 
@@ -1336,6 +1508,116 @@ mod tests {
         // `> FILE` with no command still truncates the file.
         shell.execute("> /tmp/f");
         assert_eq!(shell.execute("cat /tmp/f").text, "");
+    }
+
+    /// Feed a heredoc's body to a shell that has parked one, a line at a time,
+    /// returning the output of the line that opened it.
+    fn feed(shell: &mut Shell, lines: &[&str]) -> Output {
+        let mut last = Output::default();
+        for line in lines {
+            assert!(
+                shell.pending.is_some(),
+                "shell stopped collecting at {line}"
+            );
+            last = shell.resume(line);
+        }
+        assert!(shell.pending.is_none(), "body never ended");
+        last
+    }
+
+    #[test]
+    fn a_heredoc_collects_its_body_and_feeds_it_as_stdin() {
+        let mut shell = Shell::new("root", "debian");
+
+        // The opening line runs nothing and prints nothing: it waits.
+        let opened = shell.execute("cat << EOF");
+        assert_eq!(opened.text, "");
+        assert!(shell.pending.is_some(), "no here-document was opened");
+
+        assert_eq!(
+            feed(&mut shell, &["one", "two", "EOF"]).stdout,
+            "one\ntwo\n"
+        );
+
+        // The capture gets the document whole — the body is the payload — and
+        // gets it once, when the document closes.
+        assert_eq!(
+            shell
+                .heredoc_log
+                .take()
+                .expect("nothing left for the capture"),
+            "cat << EOF\none\ntwo\nEOF"
+        );
+
+        // The rest of the line still applies: redirects, pipes and chaining.
+        shell.execute("cat << EOF > /tmp/f");
+        feed(&mut shell, &["written", "EOF"]);
+        assert_eq!(shell.execute("cat /tmp/f").stdout, "written\n");
+
+        shell.execute("cat << EOF | wc -l");
+        assert_eq!(feed(&mut shell, &["a", "b", "c", "EOF"]).stdout, "3\n");
+
+        // An unquoted delimiter expands the body; a quoted one does not, and
+        // the quotes are not part of the delimiter either way.
+        shell.execute("export NAME=world");
+        shell.execute("cat << EOF");
+        assert_eq!(feed(&mut shell, &["hi $NAME", "EOF"]).stdout, "hi world\n");
+        shell.execute("cat << 'EOF'");
+        assert_eq!(feed(&mut shell, &["hi $NAME", "EOF"]).stdout, "hi $NAME\n");
+
+        // A body is stdin, not shell source: its quotes are ordinary bytes.
+        shell.execute("cat << 'EOF'");
+        assert_eq!(
+            feed(&mut shell, &[r#"a "b" 'c' \d"#, "EOF"]).stdout,
+            "a \"b\" 'c' \\d\n"
+        );
+
+        // `<<-` strips leading tabs from the body and from the terminator.
+        shell.execute("cat <<- EOF");
+        assert_eq!(
+            feed(&mut shell, &["\tindented", "\tEOF"]).stdout,
+            "indented\n"
+        );
+
+        // A line that merely contains the delimiter does not end the body.
+        shell.execute("cat << EOF");
+        assert_eq!(
+            feed(&mut shell, &["EOF and more", "EOF"]).stdout,
+            "EOF and more\n"
+        );
+    }
+
+    #[test]
+    fn a_heredoc_operator_is_only_one_where_bash_sees_one() {
+        let mut shell = Shell::new("root", "debian");
+
+        // A shift is not a here-document: the line runs rather than parking to
+        // collect a body. (What `$((…))` makes of `<<` is the arithmetic
+        // evaluator's business, and it does not implement shifts.)
+        shell.execute("echo $((1 << 4))");
+        assert!(shell.pending.is_none(), "a shift opened a here-document");
+
+        // Nor is one inside quotes, or arriving in a value.
+        assert_eq!(shell.execute("echo 'a << b'").stdout, "a << b\n");
+        assert!(shell.pending.is_none());
+        shell.execute("export EVIL='x << EOF'");
+        assert_eq!(shell.execute("echo $EVIL").stdout, "x << EOF\n");
+        assert!(shell.pending.is_none());
+
+        // A body that never ends is closed at end-of-input, with the command
+        // run on what arrived and bash's warning on stderr.
+        shell.execute("cat << EOF");
+        shell.resume("half a body");
+        let out = shell.finish_heredoc_at_eof().expect("a document was open");
+        assert_eq!(out.stdout, "half a body\n");
+        assert!(
+            out.stderr
+                .contains("here-document delimited by end-of-file"),
+            "missing warning: {:?}",
+            out.stderr
+        );
+        assert!(shell.pending.is_none());
+        assert!(shell.finish_heredoc_at_eof().is_none(), "closed twice");
     }
 
     #[test]

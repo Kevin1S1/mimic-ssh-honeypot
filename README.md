@@ -102,7 +102,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
 | **Shell built-ins** | `exit` (`[N]`), `logout` (`[N]`), `true`, `false`, `cd`, `export`, `unset` |
-| **Line syntax** | `;`, `&&`, `||` chaining, `|` pipelines, and `>`/`>>`/`2>`/`&>`/`2>&1` output redirection (all quoting-aware), `#` comments, `$VAR`/`${VAR}`/`$?`/`$$`/`$#`/`$0` expansion, `$(…)`/`` `…` `` command substitution and `$((…))` integer arithmetic, single/double quotes, backslash escapes |
+| **Line syntax** | `;`, `&&`, `||` chaining, `|` pipelines, and `>`/`>>`/`2>`/`&>`/`2>&1` output redirection (all quoting-aware), `#` comments, `$VAR`/`${VAR}`/`$?`/`$$`/`$#`/`$0` expansion, `$(…)`/`` `…` `` command substitution and `$((…))` integer arithmetic, here-documents (`<<`, `<<-`, quoted delimiters), single/double quotes, backslash escapes |
 
 A session behaves according to whether it asked for a terminal. With a PTY it is an interactive login shell: prompt, readline editing, and `logout` on the way out. Without one (`ssh -T host < script`, or a one-shot `ssh host cmd`) it is non-interactive, exactly as bash is when it finds a pipe on stdin — no prompt, no echo, no erase sequences, and no `logout` — while the MOTD, which comes from the PAM session rather than the terminal, arrives either way.
 
