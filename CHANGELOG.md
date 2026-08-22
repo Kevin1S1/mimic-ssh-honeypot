@@ -73,7 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 GB; every tmpfs in `df` and `mount` is now the half or tenth of `MemTotal`
   the kernel and systemd actually size them to. `free`'s columns also did not
   add up (`total` ≠ `used + free + buff/cache`) and disagreed with `top`'s
-  header — arithmetic anyone can check in two commands.
+  header — arithmetic anyone can check in two commands. `free -h` also printed
+  `992.0Ki` and `346.0Mi` where procps spends a decimal place only below 10
+  (`1.9Gi`, but `992Ki`).
 - `top` no longer reports `ps aux` as the running process. Every process table
   includes the command that asked for it, so naming a different one said the
   output came from somewhere else. System daemons' `ps` START column is now the

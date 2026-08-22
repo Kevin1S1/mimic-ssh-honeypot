@@ -985,8 +985,12 @@ fn human_kib(kb: u64) -> String {
     }
     if unit == 0 {
         format!("{}B", value as u64)
-    } else {
+    } else if value < 10.0 {
+        // procps only spends a decimal place where it buys precision: `1.9Gi`,
+        // but `992Ki` and `346Mi`. `992.0Ki` is a byte-for-byte mismatch.
         format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
     }
 }
 
@@ -1480,7 +1484,12 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert!(run(&mut shell, "top").contains("Tasks:"));
         assert!(run(&mut shell, "free").contains("Mem:"));
-        assert!(run(&mut shell, "free -h").contains("Mi"));
+        // procps' scaling: a decimal place only below 10, so `1.9Gi` but
+        // `346Mi` — never `346.0Mi`.
+        let human = run(&mut shell, "free -h");
+        assert!(human.contains("1.9Gi"), "unexpected `free -h`: {human}");
+        assert!(human.contains("346Mi"), "unexpected `free -h`: {human}");
+        assert!(!human.contains(".0Mi"), "unexpected `free -h`: {human}");
     }
 
     #[test]
