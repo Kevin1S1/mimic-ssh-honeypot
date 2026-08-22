@@ -6,11 +6,6 @@
 
 use std::collections::BTreeMap;
 
-/// Default modification time for snapshot nodes: 2024-05-03 (a plausible
-/// Debian 12 point-release build date). Kept fixed so `ls -l` output is
-/// deterministic and free of "freshly created" tells.
-pub const DEFAULT_MTIME: i64 = 1_714_694_400;
-
 /// File-type bit (`S_IFDIR`) for a directory.
 pub const S_IFDIR: u32 = 0o040000;
 /// File-type bit (`S_IFREG`) for a regular file.
@@ -38,13 +33,16 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Build metadata, OR-ing the file-type bits into `perms`.
+    /// Build metadata, OR-ing the file-type bits into `perms`. A new node is
+    /// stamped with the current time, which is what an attacker's `mkdir` or
+    /// `>` should show; [`super::snapshot::build`] restamps the boot snapshot
+    /// with the box's install date afterwards.
     pub fn new(file_type: u32, perms: u32, uid: u32, gid: u32) -> Self {
         Self {
             mode: file_type | (perms & 0o7777),
             uid,
             gid,
-            mtime: DEFAULT_MTIME,
+            mtime: crate::clock::now(),
         }
     }
 

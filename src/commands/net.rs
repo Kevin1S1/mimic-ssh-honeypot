@@ -153,7 +153,8 @@ pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
 
         if !quiet {
             let port = if url.starts_with("https://") { 443 } else { 80 };
-            out.push_str(&format!("--2024-05-03 10:15:42--  {url}\n"));
+            let stamp = crate::clock::format(crate::clock::now(), "%F %T");
+            out.push_str(&format!("--{stamp}--  {url}\n"));
             out.push_str(&format!("Resolving {host} ({host})... {ip}\n"));
             out.push_str(&format!(
                 "Connecting to {host} ({host})|{ip}|:{port}... connected.\n"
@@ -170,7 +171,7 @@ pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
                 human(size)
             ));
             out.push_str(&format!(
-                "2024-05-03 10:15:42 (12.4 MB/s) - '{base}' saved [{size}/{size}]\n\n"
+                "{stamp} (12.4 MB/s) - '{base}' saved [{size}/{size}]\n\n"
             ));
         }
     }
@@ -232,7 +233,10 @@ pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
         if show_headers {
             out.push_str("HTTP/1.1 200 OK\r\n");
             out.push_str("Server: nginx/1.22.1\r\n");
-            out.push_str("Date: Fri, 03 May 2024 10:15:42 GMT\r\n");
+            out.push_str(&format!(
+                "Date: {}\r\n",
+                crate::clock::format(crate::clock::now(), "%a, %d %b %Y %H:%M:%S GMT")
+            ));
             out.push_str("Content-Type: application/octet-stream\r\n");
             out.push_str(&format!("Content-Length: {size}\r\n"));
             out.push_str("Connection: keep-alive\r\n\r\n");

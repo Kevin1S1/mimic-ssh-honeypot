@@ -58,6 +58,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path it actually carries.
 
 ### Security
+- Every fabricated timestamp now derives from the real clock instead of a date
+  fixed at compile time. `date` returned the real year while `last`, `Last
+  login`, `ps` and every file in the snapshot said 2024, and `ls -l` dated files
+  the attacker had just created to 2024-05-03 — comparing any two of those
+  identified the honeypot in one command. The box now reports one timeline:
+  installed some months before it booted, booted before the previous login, and
+  nothing dated in the future. `uptime`, `w`, `top` and `/proc/uptime` count
+  from the same boot instant, so the uptime grows as MIMIC runs rather than
+  reporting `up 2 days,  3:21` forever, and `wget`/`curl` stamp transfers with
+  the time they happened.
+- The fake box's memory figures now tell one story. `free` and `/proc/meminfo`
+  said ~2 GB while `df` showed tmpfs sizes implying 8 GB and `dmesg` implied
+  4 GB; every tmpfs in `df` and `mount` is now the half or tenth of `MemTotal`
+  the kernel and systemd actually size them to. `free`'s columns also did not
+  add up (`total` ≠ `used + free + buff/cache`) and disagreed with `top`'s
+  header — arithmetic anyone can check in two commands.
+- `top` no longer reports `ps aux` as the running process. Every process table
+  includes the command that asked for it, so naming a different one said the
+  output came from somewhere else. System daemons' `ps` START column is now the
+  boot date rather than a fixed date that a long-running honeypot eventually
+  reports as older than its own uptime.
 - Ctrl-D on an empty line now prints `logout` before the session ends, the same
   line MIMIC's own `exit` prints. Ending in silence where a real login shell
   announces itself is a one-keystroke tell, and it is the first thing a session

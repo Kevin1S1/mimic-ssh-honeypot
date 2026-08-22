@@ -205,7 +205,9 @@ Writeback:             0 kB\n\
 AnonPages:        131800 kB\n\
 Mapped:            73548 kB\n\
 Shmem:               992 kB\n\
-Slab:              58420 kB\n";
+Slab:              58420 kB\n\
+SReclaimable:      41232 kB\n\
+SUnreclaim:        17188 kB\n";
 
 /// `/proc/version`.
 const VERSION: &str = "Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n";
@@ -309,9 +311,22 @@ pub fn build(hostname: &str) -> Vfs {
     fs.add_file(proc, "cpuinfo", CPUINFO, 0o444, 0, 0);
     fs.add_file(proc, "meminfo", MEMINFO, 0o444, 0, 0);
     fs.add_file(proc, "version", VERSION, 0o444, 0, 0);
-    // 184860 s = 2 days, 3:21 — kept in lockstep with the `uptime`/`top`/`w`
-    // banners so `cat /proc/uptime` can't contradict them.
-    fs.add_file(proc, "uptime", "184860.42 182013.12\n", 0o444, 0, 0);
+    // Derived from the same boot anchor as the `uptime`/`top`/`w` banners so
+    // `cat /proc/uptime` can't contradict them. The idle field is the busier
+    // "0.98 of one core idle" ratio a mostly-quiet single-core box shows.
+    //
+    // ponytail: a snapshot file is a fixed string, so this is the uptime at
+    // session start and does not tick within a session the way the banners do;
+    // upgrade when the VFS grows generated files.
+    let up = crate::clock::uptime_secs();
+    fs.add_file(
+        proc,
+        "uptime",
+        format!("{up}.42 {:.2}\n", up as f64 * 0.9846),
+        0o444,
+        0,
+        0,
+    );
     fs.add_file(proc, "loadavg", "0.08 0.03 0.01 1/128 9241\n", 0o444, 0, 0);
 
     // /var subtree.
@@ -348,6 +363,10 @@ pub fn build(hostname: &str) -> Vfs {
         1000,
     );
 
+    // Everything above is part of the box as installed, so it carries the
+    // install date rather than the moment this session opened. Nodes the
+    // attacker creates later keep the current time `Metadata::new` stamps.
+    fs.set_all_mtimes(crate::clock::install_time());
     fs
 }
 
@@ -414,9 +433,33 @@ mod tests {
             .next()
             .and_then(|s| s.parse().ok())
             .expect("/proc/uptime first field should be a number");
-        let s = secs as u64;
-        // Must decode to the "up 2 days,  3:21" the system commands print.
-        assert_eq!((s / 86400, (s % 86400) / 3600, (s % 3600) / 60), (2, 3, 21));
+        // Must decode to the same phrase the `uptime`/`top`/`w` banners print.
+        assert_eq!(
+            crate::clock::uptime_phrase(secs as i64),
+            crate::clock::uptime_phrase(crate::clock::uptime_secs())
+        );
+        // The idle field can never exceed the uptime on a single-core box.
+        let idle: f64 = first
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .expect("/proc/uptime second field should be a number");
+        assert!(idle < secs, "idle {idle} should be below uptime {secs}");
+    }
+
+    /// The snapshot is the box as installed: dated before this process
+    /// started, and — unlike a file the attacker creates — never "now".
+    #[test]
+    fn snapshot_files_carry_the_install_date() {
+        let mut fs = build("srv1");
+        let etc = fs.resolve(fs.root(), "/etc/passwd").expect("/etc/passwd");
+        assert_eq!(fs.node(etc).meta.mtime, crate::clock::install_time());
+        assert!(fs.node(etc).meta.mtime < crate::clock::now());
+
+        let tmp = fs.resolve(fs.root(), "/tmp").expect("/tmp");
+        let fresh = fs.mkdir(tmp, "new", 0o755, 0, 0);
+        assert!(fs.node(fresh).meta.mtime >= crate::clock::install_time());
+        assert!(fs.node(fresh).meta.mtime > fs.node(etc).meta.mtime);
     }
 
     #[test]

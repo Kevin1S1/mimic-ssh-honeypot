@@ -8,6 +8,7 @@
 //! a real shell would.
 
 use super::CommandResult;
+use crate::clock;
 use crate::shell::complete::COMMANDS;
 use crate::shell::{Pending, Shell};
 
@@ -494,12 +495,17 @@ struct Proc {
     /// Resident set size in KiB.
     rss: u32,
     time: &'static str,
-    start: &'static str,
+    /// `ps`'s START column: the boot date for daemons, `HH:MM` for anything
+    /// started in the last day.
+    start: String,
     cmd: String,
 }
 
-/// The static system processes a freshly booted Debian 12 VM shows.
+/// The system processes a Debian 12 VM shows, all started at boot — so their
+/// START column is the boot date, not a date fixed at compile time that a
+/// long-running honeypot eventually reports as older than its own uptime.
 fn base_table() -> Vec<Proc> {
+    let boot = clock::format(clock::boot_time(), "%b%d");
     vec![
         Proc {
             pid: 1,
@@ -512,7 +518,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 167404,
             rss: 13072,
             time: "0:02",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/sbin/init".to_string(),
         },
         Proc {
@@ -526,7 +532,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 0,
             rss: 0,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "[kthreadd]".to_string(),
         },
         Proc {
@@ -540,7 +546,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 24684,
             rss: 9216,
             time: "0:01",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/lib/systemd/systemd-journald".to_string(),
         },
         Proc {
@@ -554,7 +560,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 21916,
             rss: 6400,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/lib/systemd/systemd-udevd".to_string(),
         },
         Proc {
@@ -568,7 +574,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 90264,
             rss: 9088,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/lib/systemd/systemd-resolved".to_string(),
         },
         Proc {
@@ -582,7 +588,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 6892,
             rss: 4992,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/usr/sbin/cron -f".to_string(),
         },
         Proc {
@@ -596,7 +602,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 8460,
             rss: 4736,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/usr/bin/dbus-daemon --system".to_string(),
         },
         Proc {
@@ -610,7 +616,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 15420,
             rss: 9472,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups".to_string(),
         },
         Proc {
@@ -624,7 +630,7 @@ fn base_table() -> Vec<Proc> {
             vsz: 313196,
             rss: 12544,
             time: "0:01",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/usr/lib/systemd/systemd-logind".to_string(),
         },
         Proc {
@@ -638,19 +644,33 @@ fn base_table() -> Vec<Proc> {
             vsz: 5612,
             rss: 3200,
             time: "0:00",
-            start: "May03",
+            start: boot.clone(),
             cmd: "/sbin/agetty -o -p -- \\u --noclear tty1 linux".to_string(),
         },
     ]
 }
 
-/// Build the full table including this session's own login chain.
-fn session_table(shell: &Shell) -> Vec<Proc> {
+/// The command line as typed, which is what `ps`/`top` show for the process
+/// doing the asking.
+fn invocation(name: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {}", args.join(" "))
+    }
+}
+
+/// Build the full table including this session's own login chain. `running` is
+/// the command asking for the table: it is itself in the process list it
+/// prints, so `top` must not report `ps aux` as the process at the top.
+fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
     let mut table = base_table();
     let user = shell.username.clone();
     let sshd_pid = shell.pid.saturating_sub(2).max(1000);
     let bash_pid = shell.pid;
     let ps_pid = shell.pid + 1;
+    let login = clock::format(shell.login, "%H:%M");
+    let now = clock::format(clock::now(), "%H:%M");
 
     table.push(Proc {
         pid: sshd_pid,
@@ -663,7 +683,7 @@ fn session_table(shell: &Shell) -> Vec<Proc> {
         vsz: 17668,
         rss: 10880,
         time: "0:00",
-        start: "10:14",
+        start: login.clone(),
         cmd: format!("sshd: {}@pts/0", shell.username),
     });
     table.push(Proc {
@@ -677,7 +697,7 @@ fn session_table(shell: &Shell) -> Vec<Proc> {
         vsz: 8228,
         rss: 5376,
         time: "0:00",
-        start: "10:14",
+        start: login.clone(),
         cmd: "-bash".to_string(),
     });
     table.push(Proc {
@@ -691,8 +711,8 @@ fn session_table(shell: &Shell) -> Vec<Proc> {
         vsz: 10072,
         rss: 3200,
         time: "0:00",
-        start: "10:15",
-        cmd: "ps aux".to_string(),
+        start: now,
+        cmd: running.to_string(),
     });
     table
 }
@@ -700,7 +720,7 @@ fn session_table(shell: &Shell) -> Vec<Proc> {
 /// `ps [aux|-ef|...]`
 pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
     let joined: String = args.join("");
-    let table = session_table(shell);
+    let table = session_table(shell, &invocation("ps", args));
 
     // `ps aux` / `ps -ef` style: show every process. Bare `ps` shows only this
     // session's processes on its tty.
@@ -755,13 +775,13 @@ pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
 }
 
 /// `top` (batch-mode snapshot; the interactive UI is not emulated).
-pub fn top(shell: &Shell, _args: &[String]) -> CommandResult {
-    let table = session_table(shell);
+pub fn top(shell: &Shell, args: &[String]) -> CommandResult {
+    let table = session_table(shell, &invocation("top", args));
     let running = table.iter().filter(|p| p.stat.starts_with('R')).count();
     let sleeping = table.len() - running;
 
     let mut out = String::new();
-    out.push_str("top - 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n");
+    out.push_str(&format!("top - {}\n", clock::uptime_banner()));
     out.push_str(&format!(
         "Tasks: {:>3} total,   {} running, {:>3} sleeping,   0 stopped,   0 zombie\n",
         table.len(),
@@ -771,7 +791,7 @@ pub fn top(shell: &Shell, _args: &[String]) -> CommandResult {
     out.push_str(
         "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n",
     );
-    out.push_str("MiB Mem :   1993.4 total,   1468.3 free,    128.7 used,    396.4 buff/cache\n");
+    out.push_str("MiB Mem :   1993.4 total,   1468.3 free,    179.0 used,    346.0 buff/cache\n");
     out.push_str("MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1723.6 avail Mem\n");
     out.push('\n');
     out.push_str(
@@ -823,7 +843,7 @@ pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
         );
     }
 
-    let table = session_table(shell);
+    let table = session_table(shell, &invocation("kill", args));
     let mut out = String::new();
     let mut status = 0;
     for pid_str in pids {
@@ -877,7 +897,7 @@ pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
         );
     }
 
-    let table = session_table(shell);
+    let table = session_table(shell, &invocation("pkill", args));
     let mut out = String::new();
     let mut matched_any = false;
     let mut denied = false;
@@ -910,9 +930,14 @@ pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
     let mega = args.iter().any(|a| a == "-m");
     let giga = args.iter().any(|a| a == "-g");
 
-    // Base figures in KiB.
+    // Base figures in KiB, matching `/proc/meminfo` and `top`'s header. The
+    // columns must add up — `total = used + free + buff/cache` is what a real
+    // `free` prints, and a row that doesn't balance is arithmetic anyone can
+    // check in one command.
+    // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
+    // left, exactly as procps derives them from `/proc/meminfo`.
     let (total, used, free_mem, shared, buff, available) =
-        (2041208u64, 131800, 1503544, 992, 313072, 1764920);
+        (2041208u64, 183336, 1503544, 992, 354328, 1764920);
 
     let fmt = |kb: u64| -> String {
         if human {
@@ -967,7 +992,7 @@ fn human_kib(kb: u64) -> String {
 
 /// `uptime`
 pub fn uptime(_shell: &Shell, _args: &[String]) -> CommandResult {
-    CommandResult::ok(" 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n")
+    CommandResult::ok(format!(" {}\n", clock::uptime_banner()))
 }
 
 // --- Reconnaissance commands ---------------------------------------------
@@ -1030,23 +1055,39 @@ fn binary_path(name: &str) -> Option<String> {
 /// `w` — who is logged on and what they are doing. A single fabricated session
 /// for the current user; other connections are never revealed.
 pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
-    let header = " 10:15:42 up 2 days,  3:21,  1 user,  load average: 0.08, 0.03, 0.01\n";
+    let header = format!(" {}\n", clock::uptime_banner());
     let cols = "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n";
     let row = format!(
-        "{user:<8} pts/0    10.0.0.5         10:01    0.00s  0.02s  0.00s w\n",
+        "{user:<8} pts/0    {from:<16} {login}    0.00s  0.02s  0.00s w\n",
         user = truncate(&shell.username, 8),
+        from = clock::PREV_LOGIN_FROM,
+        login = clock::format(shell.login, "%H:%M"),
     );
     CommandResult::ok(format!("{header}{cols}{row}"))
 }
 
-/// `last` — listing of last logged-in users. Fabricated and static.
+/// `last` — listing of recent logins. Fabricated, but anchored to the same
+/// boot and previous-login instants PAM's `Last login` banner reports, so the
+/// two cannot contradict each other.
 pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
+    let (prev, prev_end) = clock::prev_login();
+    let boot = clock::boot_time();
+    let user = truncate(&shell.username, 8);
+    let from = clock::PREV_LOGIN_FROM;
+    let span = prev_end - prev;
     let out = format!(
-        "{user:<8} pts/0        10.0.0.5         Mon Jun 24 10:01   still logged in\n\
-         reboot   system boot  6.1.0-21-amd64   Mon Jun 24 07:00   still running\n\
+        "{user:<8} pts/0        {from:<16} {this}   still logged in\n\
+         {user:<8} pts/0        {from:<16} {prev} - {prev_end} ({hours:02}:{mins:02})\n\
+         reboot   system boot  6.1.0-21-amd64   {boot}   still running\n\
          \n\
-         wtmp begins Mon Jun 24 07:00:00 2024\n",
-        user = truncate(&shell.username, 8),
+         wtmp begins {wtmp}\n",
+        this = clock::format(shell.login, "%a %b %e %H:%M"),
+        prev = clock::format(prev, "%a %b %e %H:%M"),
+        prev_end = clock::format(prev_end, "%H:%M"),
+        hours = span / 3600,
+        mins = (span % 3600) / 60,
+        boot = clock::format(boot, "%a %b %e %H:%M"),
+        wtmp = clock::format(boot, "%a %b %e %H:%M:%S %Y"),
     );
     CommandResult::ok(out)
 }
@@ -1054,22 +1095,26 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
 /// `df [-h]`
 pub fn df(_shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
+    // Every tmpfs size here is derivable from `MemTotal` (2041208 kB) the way
+    // the kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
+    // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
+    // `free` reports is a two-command honeypot check.
     let out = if human {
         "Filesystem      Size  Used Avail Use% Mounted on\n\
-         udev            3.9G     0  3.9G   0% /dev\n\
-         tmpfs           789M  960K  788M   1% /run\n\
+         udev            992M     0  992M   0% /dev\n\
+         tmpfs           200M  960K  199M   1% /run\n\
          /dev/sda1        40G  6.3G   31G  17% /\n\
-         tmpfs           3.9G     0  3.9G   0% /dev/shm\n\
+         tmpfs           997M     0  997M   0% /dev/shm\n\
          tmpfs           5.0M     0  5.0M   0% /run/lock\n\
-         tmpfs           789M     0  789M   0% /run/user/0\n"
+         tmpfs           200M     0  200M   0% /run/user/0\n"
     } else {
         "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
-         udev             4019216       0   4019216   0% /dev\n\
-         tmpfs             807868     960    806908   1% /run\n\
+         udev             1015532       0   1015532   0% /dev\n\
+         tmpfs             204120     960    203160   1% /run\n\
          /dev/sda1       41019672 6552432  32352140  17% /\n\
-         tmpfs            4039332       0   4039332   0% /dev/shm\n\
+         tmpfs            1020604       0   1020604   0% /dev/shm\n\
          tmpfs               5120       0      5120   0% /run/lock\n\
-         tmpfs             807864       0    807864   0% /run/user/0\n"
+         tmpfs             204116       0    204116   0% /run/user/0\n"
     };
     CommandResult::ok(out)
 }
@@ -1078,9 +1123,9 @@ pub fn df(_shell: &Shell, args: &[String]) -> CommandResult {
 pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
         proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
-        udev on /dev type devtmpfs (rw,nosuid,relatime,size=4019216k,nr_inodes=1004804,mode=755)\n\
+        udev on /dev type devtmpfs (rw,nosuid,relatime,size=1015532k,nr_inodes=253883,mode=755)\n\
         devpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000)\n\
-        tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,size=807868k,mode=755)\n\
+        tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,size=204120k,mode=755)\n\
         /dev/sda1 on / type ext4 (rw,relatime,errors=remount-ro)\n\
         tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev,inode64)\n\
         tmpfs on /run/lock type tmpfs (rw,nosuid,nodev,noexec,relatime,size=5120k,inode64)\n";
@@ -1200,7 +1245,7 @@ const DMESG_BUFFER: &str = "\
 [    0.000000] KVM: setup async PF for cpu 0\n\
 [    0.008000] Hypervisor detected: KVM\n\
 [    0.020000] CPU0: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz (family: 0x6, model: 0x55, stepping: 0x7)\n\
-[    0.130000] Memory: 4019216K/4194304K available\n\
+[    0.130000] Memory: 2041208K/2097152K available\n\
 [    0.410000] pci 0000:00:00.0: [8086:1237] type 00 class 0x060000\n\
 [    0.512000] virtio_blk virtio1: [vda] 83886080 512-byte logical blocks (42.9 GB/40.0 GiB)\n\
 [    0.640000] ata1.00: ATA-8: QEMU HARDDISK, 2.5+, max UDMA/100\n\
@@ -1225,140 +1270,6 @@ pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(DMESG_BUFFER)
 }
 
-/// Current wall-clock time in unix seconds.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// A broken-down UTC timestamp.
-struct Tm {
-    year: i64,
-    month: u32,
-    day: u32,
-    hour: u32,
-    min: u32,
-    sec: u32,
-    /// Days since Sunday, `0..=6`.
-    wday: u32,
-    /// Days since Jan 1, `0..=365`.
-    yday: u32,
-}
-
-/// Convert unix seconds to broken-down UTC using Howard Hinnant's civil-date
-/// algorithm (valid across the full `i64` range, no external crate).
-fn gmtime(secs: i64) -> Tm {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let hour = (rem / 3600) as u32;
-    let min = ((rem % 3600) / 60) as u32;
-    let sec = (rem % 60) as u32;
-    // 1970-01-01 was a Thursday (index 4 with Sunday = 0).
-    let wday = ((days.rem_euclid(7) + 4) % 7) as u32;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    let year = if month <= 2 { y + 1 } else { y };
-
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    const CUM: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let mut yday = CUM[(month - 1) as usize] + (day - 1);
-    if leap && month > 2 {
-        yday += 1;
-    }
-
-    Tm {
-        year,
-        month,
-        day,
-        hour,
-        min,
-        sec,
-        wday,
-        yday,
-    }
-}
-
-const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const WDAY_FULL: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
-const MON: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const MON_FULL: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-
-/// Render a `date` `+FORMAT` string against a broken-down time. Supports the
-/// specifiers that appear in real-world recon (`%Y %m %d %H %M %S %s %a %A %b
-/// %B %e %j %y %p %F %T %Z %n %t %%`); unknown specifiers pass through verbatim.
-fn strftime(tm: &Tm, epoch: i64, fmt: &str) -> String {
-    let mut out = String::new();
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('Y') => out.push_str(&tm.year.to_string()),
-            Some('y') => out.push_str(&format!("{:02}", tm.year.rem_euclid(100))),
-            Some('m') => out.push_str(&format!("{:02}", tm.month)),
-            Some('d') => out.push_str(&format!("{:02}", tm.day)),
-            Some('e') => out.push_str(&format!("{:2}", tm.day)),
-            Some('H') => out.push_str(&format!("{:02}", tm.hour)),
-            Some('M') => out.push_str(&format!("{:02}", tm.min)),
-            Some('S') => out.push_str(&format!("{:02}", tm.sec)),
-            Some('s') => out.push_str(&epoch.to_string()),
-            Some('j') => out.push_str(&format!("{:03}", tm.yday + 1)),
-            Some('a') => out.push_str(WDAY[tm.wday as usize]),
-            Some('A') => out.push_str(WDAY_FULL[tm.wday as usize]),
-            Some('b') | Some('h') => out.push_str(MON[(tm.month - 1) as usize]),
-            Some('B') => out.push_str(MON_FULL[(tm.month - 1) as usize]),
-            Some('p') => out.push_str(if tm.hour < 12 { "AM" } else { "PM" }),
-            Some('Z') => out.push_str("UTC"),
-            Some('F') => out.push_str(&format!("{}-{:02}-{:02}", tm.year, tm.month, tm.day)),
-            Some('T') => out.push_str(&format!("{:02}:{:02}:{:02}", tm.hour, tm.min, tm.sec)),
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('%') => out.push('%'),
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
-            None => out.push('%'),
-        }
-    }
-    out
-}
-
 /// `date [-u] [+FORMAT]` — the current UTC time.
 ///
 /// The emulated host runs in UTC, so the `-u` flag is a no-op. Setting the
@@ -1368,20 +1279,18 @@ fn strftime(tm: &Tm, epoch: i64, fmt: &str) -> String {
 /// ponytail: read-only clock (uses the real host time, which is realistic for a
 /// live box); does not honour a `date STRING` set operand beyond echoing.
 pub fn date(_shell: &Shell, args: &[String]) -> CommandResult {
-    let epoch = now_unix();
-    let tm = gmtime(epoch);
-    let fmt = args.iter().find_map(|a| a.strip_prefix('+'));
-    let out = match fmt {
-        Some(f) => strftime(&tm, epoch, f),
+    let epoch = clock::now();
+    let fmt = args
+        .iter()
+        .find_map(|a| a.strip_prefix('+'))
         // Default C-locale form: `Wed Jul  8 12:34:56 UTC 2026`.
-        None => strftime(&tm, epoch, "%a %b %e %H:%M:%S %Z %Y"),
-    };
-    CommandResult::ok(format!("{out}\n"))
+        .unwrap_or("%a %b %e %H:%M:%S %Z %Y");
+    CommandResult::ok(format!("{}\n", clock::format(epoch, fmt)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{gmtime, strftime, WDAY};
+    use crate::clock;
     use crate::shell::Shell;
 
     fn run(shell: &mut Shell, line: &str) -> String {
@@ -1742,16 +1651,76 @@ mod tests {
         assert_eq!(run(&mut shell, "date +%%"), "%\n");
     }
 
+    /// `date`, `uptime`, `w`, `last` and `ps` all describe the same box. An
+    /// attacker comparing any two of them must not find a contradiction — a
+    /// login dated before the boot, or a daemon older than the uptime.
     #[test]
-    fn gmtime_matches_known_epoch() {
-        // 1_714_694_400 = 2024-05-03 00:00:00 UTC (a Friday).
-        let tm = gmtime(1_714_694_400);
-        assert_eq!((tm.year, tm.month, tm.day), (2024, 5, 3));
-        assert_eq!((tm.hour, tm.min, tm.sec), (0, 0, 0));
-        assert_eq!(WDAY[tm.wday as usize], "Fri");
-        assert_eq!(
-            strftime(&tm, 1_714_694_400, "%a %b %e %H:%M:%S %Z %Y"),
-            "Fri May  3 00:00:00 UTC 2024"
-        );
+    fn the_recon_commands_agree_on_one_timeline() {
+        let mut shell = Shell::new("root", "debian");
+        let year = clock::format(clock::now(), "%Y");
+
+        // `date` and the `uptime`/`w`/`top` banners share a clock.
+        assert!(run(&mut shell, "date").contains(&year));
+        let banner = clock::uptime_banner();
+        assert!(run(&mut shell, "uptime").contains(&banner));
+        assert!(run(&mut shell, "w").contains(&banner));
+        assert!(run(&mut shell, "top").contains(&banner));
+
+        // `last` reports this year's boot, not a date frozen at compile time.
+        let last = run(&mut shell, "last");
+        assert!(last.contains(&year), "last should be in {year}: {last}");
+        assert!(last.contains("still logged in"));
+        assert!(last.contains("wtmp begins"));
+        // The previous login `last` lists is the one PAM's banner announces.
+        let (prev, _) = clock::prev_login();
+        assert!(last.contains(&clock::format(prev, "%a %b %e %H:%M")));
+
+        // Daemons started at boot; nothing claims to predate the box.
+        let ps = run(&mut shell, "ps aux");
+        assert!(ps.contains(&clock::format(clock::boot_time(), "%b%d")));
+        // Snapshot files carry the install date, which is older still.
+        let ls = run(&mut shell, "ls -l /etc/passwd");
+        assert!(ls.contains(&clock::format(clock::install_time(), "%b %e")));
+    }
+
+    /// Real `top` is in its own process list; showing `ps aux` as the running
+    /// process says the output came from somewhere else.
+    #[test]
+    fn top_and_ps_list_themselves_not_each_other() {
+        let mut shell = Shell::new("root", "debian");
+        let top = run(&mut shell, "top");
+        assert!(top.contains(" top\n"), "top should list itself: {top}");
+        assert!(!top.contains("ps aux"));
+        assert!(run(&mut shell, "ps aux").contains("ps aux"));
+    }
+
+    /// `free`'s columns must add up the way procps derives them, and agree
+    /// with both `/proc/meminfo` and `top`'s header.
+    #[test]
+    fn the_memory_figures_agree_across_commands() {
+        let mut shell = Shell::new("root", "debian");
+        let free = run(&mut shell, "free");
+        let row = free
+            .lines()
+            .find(|l| l.starts_with("Mem:"))
+            .expect("free should print a Mem: row");
+        let cols: Vec<u64> = row
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        let (total, used, free_mem, buff) = (cols[0], cols[1], cols[2], cols[4]);
+        assert_eq!(total, used + free_mem + buff);
+
+        // MemTotal is where every other figure comes from.
+        let meminfo = run(&mut shell, "cat /proc/meminfo");
+        assert!(meminfo.contains(&format!("MemTotal:        {total} kB")));
+        // `df`'s tmpfs sizes are halves and tenths of it, so a `df` that
+        // implies more RAM than `free` reports cannot happen.
+        let df = run(&mut shell, "df");
+        assert!(df.contains(&format!("{}", total / 2)), "/dev/shm is RAM/2");
+        assert!(df.contains(&format!("{}", total / 10)), "/run is RAM/10");
+        // `top`'s header is the same total in MiB.
+        assert!(run(&mut shell, "top").contains(&format!("{:.1} total", total as f64 / 1024.0)));
     }
 }

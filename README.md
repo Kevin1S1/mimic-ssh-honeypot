@@ -78,8 +78,8 @@ A Debian 12 filesystem snapshot is loaded at startup into the in-memory VFS:
 | `/etc/os-release` | Debian 12 Bookworm |
 | `/etc/passwd`, `/etc/group` | Realistic user/group database |
 | `/etc/hostname`, `/etc/hosts` | Tracks the configured `hostname` |
-| `/proc/cpuinfo` | 4-core Intel Xeon (fake) |
-| `/proc/meminfo` | 8 GB RAM (fake) |
+| `/proc/cpuinfo` | Single-core Intel Xeon (fake) |
+| `/proc/meminfo` | 2 GB RAM (fake), matching `free`, `df` and `top` |
 | `/proc/version`, `/proc/uptime`, `/proc/loadavg` | Realistic kernel / load |
 | `/var/log/`, `/usr/bin/`, `/home/`, `/root/` | Standard Debian layout |
 | `/tmp/` | Writable scratch space |
@@ -114,8 +114,10 @@ Linux debian 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) 
 
 The programs included with the Debian GNU/Linux system are free software;
 ...
-Last login: Mon Jun 10 03:22:41 2024 from 192.168.1.50
+Last login: Wed Aug 20 11:03:33 2026 from 10.0.0.5
 ```
+
+The `Last login` timestamp is derived from the fake box's boot time at startup, as are the snapshot's file mtimes and everything `uptime`, `w`, `last` and `ps` report — so `date` can never contradict them.
 
 ---
 

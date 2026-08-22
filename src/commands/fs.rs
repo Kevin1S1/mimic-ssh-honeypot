@@ -2329,7 +2329,7 @@ mod tests {
 
     #[test]
     fn format_time_matches_default_mtime() {
-        // DEFAULT_MTIME = 1_714_694_400 = 2024-05-03 00:00:00 UTC.
+        // 1_714_694_400 = 2024-05-03 00:00:00 UTC.
         assert_eq!(format_time(1_714_694_400), "May  3 00:00");
         // A timestamp with non-zero time-of-day and a two-digit day.
         assert_eq!(
@@ -2694,13 +2694,16 @@ mod tests {
 
         // Byte-for-byte the shape GNU tar 1.35 prints: the joined owner/group
         // and the size share an 18-column field, then a UTC `YYYY-MM-DD HH:MM`.
+        // The members were created during this session, so they carry the
+        // current time — not the install date the snapshot carries.
+        let now = crate::clock::format(crate::clock::now(), "%F %H:%M");
         let long = run(&mut shell, "tar tvf out.tar");
         assert!(
-            long.contains("drwxr-xr-x root/root         0 2024-05-03 00:00 d/\n"),
+            long.contains(&format!("drwxr-xr-x root/root         0 {now} d/\n")),
             "unexpected listing: {long}"
         );
         assert!(
-            long.contains("-rw-r--r-- root/root         6 2024-05-03 00:00 d/one\n"),
+            long.contains(&format!("-rw-r--r-- root/root         6 {now} d/one\n")),
             "unexpected listing: {long}"
         );
 
