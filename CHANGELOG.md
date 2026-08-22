@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-22
+
 ### Added
 - Output redirection. `echo '#!/bin/sh' > /tmp/x`, `>>`, `2>`, `&>`, and `2>&1`
   now write the command's output into the virtual filesystem instead of handing
@@ -34,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first segment was ever captured. Operators inside quotes, or escaped, stay
   literal, and splitting happens before variable expansion — so a `;` arriving
   in a variable's value is data, not an extra command.
+- `bash`/`sh`: `-c LINE` runs the line (how bot payloads usually arrive), and a
+  bare invocation behaves like an interactive subshell. `scp` as an interactive
+  command: local copies work, and a `host:path` operand fails the way an
+  unreachable peer would — the binary has to exist, since SCP uploads to this
+  host succeed.
+- Nested commands (`sudo`, `sh -c`) are capped at 16 levels, so a deeply nested
+  line is refused with bash's `fork: retry` error instead of recursing toward a
+  stack overflow that would abort the whole daemon.
 
 ### Fixed
 - `README.md` described `accept_after` off by one — it said the first N attempts
@@ -203,8 +213,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `su` password prompt keeps them too — a non-ASCII credential is recorded the
   way it was entered — and Tab completion no longer panics on two names that
   share part of a multi-byte character.
-
-### Security
 - `/usr/bin` listed binaries the shell could not run — `ls /usr/bin` showed
   `python3`, `sed`, `awk`, `perl`, `vi`, `nano`, `gzip`, `ssh`, and `bash`, all
   of which answered `command not found`, and `-bash: bash: command not found` on
@@ -212,17 +220,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listing is now exactly the set of commands the registry serves, `/usr/sbin`
   holds `ip`/`ss` to match what `which` reports, and a test fails the build if
   the two ever drift apart again.
-
-### Added
-- `bash`/`sh`: `-c LINE` runs the line (how bot payloads usually arrive), and a
-  bare invocation behaves like an interactive subshell. `scp` as an interactive
-  command: local copies work, and a `host:path` operand fails the way an
-  unreachable peer would — the binary has to exist, since SCP uploads to this
-  host succeed.
-- Nested commands (`sudo`, `sh -c`) are capped at 16 levels, so a deeply nested
-  line is refused with bash's `fork: retry` error instead of recursing toward a
-  stack overflow that would abort the whole daemon.
-
 - `wget`/`curl` no longer contradict themselves: the transfer announced a size
   (`Length: 1394 … saved [1394/1394]`) but left a 0-byte file, so one `ls -l`
   after a download exposed the emulation. The placeholder is now written at the
@@ -408,7 +405,8 @@ Initial release.
 - CI: clippy (`-D warnings`), full test suite, cargo-deny supply-chain
   audit with weekly scheduled run.
 
-[Unreleased]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/releases/tag/v0.1.0
