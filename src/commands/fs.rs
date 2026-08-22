@@ -12,6 +12,7 @@ use crate::vfs::{NodeId, Vfs};
 struct LsFlags {
     all: bool,        // -a: include entries starting with '.'
     almost_all: bool, // -A: like -a but skip '.' and '..'
+    directory: bool,  // -d: list directories themselves, not their contents
     long: bool,       // -l: long listing format
     human: bool,      // -h: human-readable sizes (with -l)
     one: bool,        // -1: one entry per line
@@ -34,6 +35,7 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
                 match ch {
                     'a' => flags.all = true,
                     'A' => flags.almost_all = true,
+                    'd' => flags.directory = true,
                     'l' => flags.long = true,
                     'h' => flags.human = true,
                     '1' => flags.one = true,
@@ -52,6 +54,8 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
             flags.all = true;
         } else if arg == "--almost-all" {
             flags.almost_all = true;
+        } else if arg == "--directory" {
+            flags.directory = true;
         } else {
             paths.push(arg);
         }
@@ -75,8 +79,8 @@ pub fn ls(shell: &Shell, args: &[String]) -> CommandResult {
         };
 
         let node = shell.vfs.node(target);
-        if !node.meta.is_dir() {
-            // A file operand: list the operand itself.
+        if flags.directory || !node.meta.is_dir() {
+            // A file operand or -d directory: list the operand itself.
             out.push_str(&format_single(&shell.vfs, target, path, &flags));
             continue;
         }
@@ -2457,6 +2461,27 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         let out = run(&mut shell, "ls /nope");
         assert!(out.contains("cannot access '/nope': No such file or directory"));
+    }
+
+    #[test]
+    fn ls_directory_flag_lists_dirs_without_descending() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(run(&mut shell, "ls -d /tmp"), "/tmp\n");
+        assert_eq!(run(&mut shell, "ls --directory /tmp"), "/tmp\n");
+        assert_eq!(run(&mut shell, "ls -d"), ".\n");
+
+        // -ld lists the directory itself in long form without descending or printing total
+        let ld_tmp = run(&mut shell, "ls -ld /tmp");
+        assert!(ld_tmp.starts_with("drwxrwxrwx") || ld_tmp.starts_with("drwxrwxrwt"));
+        assert!(ld_tmp.ends_with("/tmp\n"));
+        assert!(!ld_tmp.contains("total"));
+
+        // -ld on unreadable directory lists the directory itself without permission error
+        let mut user = Shell::new("attacker", "debian");
+        let ld_root = run(&mut user, "ls -ld /root");
+        assert!(ld_root.starts_with("drwx------"));
+        assert!(ld_root.ends_with("/root\n"));
+        assert!(!ld_root.contains("Permission denied"));
     }
 
     #[test]

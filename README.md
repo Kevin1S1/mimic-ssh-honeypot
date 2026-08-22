@@ -90,7 +90,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 
 | Category | Commands |
 |---|---|
-| **Navigation** | `ls` (`-a`/`-A`/`-l`/`-h`/`-1`), `cd` (`~`/`-`/`..`), `pwd` |
+| **Navigation** | `ls` (`-a`/`-A`/`-d`/`-l`/`-h`/`-1`), `cd` (`~`/`-`/`..`), `pwd` |
 | **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`/`-v`, dashless bundled flags) |
 | **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
 | **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |

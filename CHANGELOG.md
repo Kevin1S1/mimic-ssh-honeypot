@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `ls` now supports `-d` and `--directory` to list directories themselves rather
+  than their contents. `ls -ld /tmp` previously failed with `ls: invalid option -- 'd'`,
+  revealing the shell as fake to standard reconnaissance commands.
+
 ## [0.4.0] - 2026-08-22
 
 ### Added
