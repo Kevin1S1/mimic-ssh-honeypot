@@ -125,6 +125,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             sftp: None,
             quarantine_bytes: 0,
             password_buf: None,
+            line_buf: Vec::new(),
             _guard: guard,
         };
 
@@ -249,6 +250,10 @@ struct MimicHandler {
     /// input bytes are collected here with echo suppressed until Enter, then
     /// handed to [`Shell::resume`].
     password_buf: Option<Vec<u8>>,
+    /// Input collected on a shell channel with no PTY, where there is no line
+    /// editor to hold it. Bounded by [`MAX_COMMAND_LEN`] like every other path
+    /// that accepts a command line.
+    line_buf: Vec<u8>,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
@@ -340,6 +345,99 @@ impl MimicHandler {
             session.extended_data(channel, SSH_EXTENDED_DATA_STDERR, self.out(&output.stderr))?;
         }
         Ok(())
+    }
+
+    /// Emit what one completed line produced and end the channel if the line
+    /// finished the session. Returns whether the session ended.
+    async fn deliver(
+        &mut self,
+        channel: ChannelId,
+        output: &Output,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        self.drain_captures();
+        // Small randomised delay so response latency is not perfectly uniform
+        // (a passive timing tell).
+        jitter().await;
+        self.write_output(channel, output, session)?;
+        if output.exit {
+            self.end_channel(channel, session, output.status as u32)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Run one submitted command line, logging it as the session's next
+    /// command. Returns whether the session ended.
+    async fn submit_line(
+        &mut self,
+        channel: ChannelId,
+        line: &str,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        let trimmed = line.trim().to_string();
+        if !trimmed.is_empty() {
+            event::command(self.session_id, self.peer, &trimmed);
+            self.shell().record_history(&trimmed);
+        }
+        let result = self.shell().execute(&trimmed);
+        self.deliver(channel, &result, session).await
+    }
+
+    /// Feed input to a shell channel that never asked for a PTY.
+    ///
+    /// Real bash checks whether its input is a terminal and, finding a pipe,
+    /// runs non-interactively: no readline, so no prompt, no echo of what was
+    /// typed, and none of the `\x1b[K` erase sequences redrawing a line needs.
+    /// It simply reads a line and runs it. Sending any of that to a client that
+    /// asked for no terminal is a tell on its own.
+    async fn feed_no_tty(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        for &byte in data {
+            match byte {
+                // A client piping a file sends bare LF; tolerate a CRLF one.
+                b'\r' => {}
+                b'\n' => {
+                    let line = String::from_utf8_lossy(&std::mem::take(&mut self.line_buf))
+                        .trim_end_matches('\r')
+                        .to_string();
+                    if self.run_no_tty_line(channel, &line, session).await? {
+                        return Ok(());
+                    }
+                }
+                // Bounded like every other path that accepts a command line;
+                // past the cap the rest of the line is dropped, exactly as an
+                // oversized `exec` request is truncated.
+                _ => {
+                    if self.line_buf.len() < MAX_COMMAND_LEN {
+                        self.line_buf.push(byte);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one line read without a terminal, routing it to a pending prompt
+    /// (e.g. `su` waiting on a password) when there is one. Returns whether the
+    /// session ended.
+    async fn run_no_tty_line(
+        &mut self,
+        channel: ChannelId,
+        line: &str,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        if self.shell().pending.is_some() {
+            // The prompt was written to the channel; with no terminal there is
+            // no echo to suppress, so the next line is simply the answer.
+            let output = self.shell().resume(line);
+            return self.deliver(channel, &output, session).await;
+        }
+        self.submit_line(channel, line, session).await
     }
 
     /// Apply the configured authentication policy to one attempt.
@@ -834,8 +932,20 @@ impl Handler for MimicHandler {
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
         self.shell_started = true;
+        // Set per channel, not once when the shell is built: the shell outlives
+        // the channel that created it, and the next one may be an `exec`.
+        let pty = self.pty;
+        self.shell().interactive = pty;
+        // The MOTD comes from the PAM session, which opens whether or not a
+        // terminal was allocated, so it is printed either way.
         let banner = self.out(&self.motd());
         session.data(channel, banner)?;
+        if !self.pty {
+            // Everything below belongs to a terminal. sshd prints the previous
+            // login from the branch that allocated the pty, and the prompt is
+            // the line editor's — bash runs no readline over a pipe.
+            return Ok(());
+        }
         // PAM prints the previous login right before handing off to the shell.
         // Kept in lockstep with the session `last` lists as the previous one.
         let (prev, _) = crate::clock::prev_login();
@@ -891,6 +1001,9 @@ impl Handler for MimicHandler {
             }
         }
 
+        // A one-shot `exec` is never interactive, whatever the previous channel
+        // on this connection was.
+        self.shell().interactive = false;
         let result = self.shell().execute(&cmd);
         // A one-shot `exec` has no interactive stdin, so drop any prompt a
         // command left pending (e.g. `su` awaiting a password).
@@ -938,6 +1051,12 @@ impl Handler for MimicHandler {
             return Ok(());
         }
 
+        // A shell channel that asked for no terminal reads lines rather than
+        // running a line editor over them.
+        if !self.pty {
+            return self.feed_no_tty(channel, data, session).await;
+        }
+
         for &byte in data {
             // A command (e.g. `su`) is waiting for a password line: collect
             // bytes with echo suppressed until Enter, then resume the shell.
@@ -950,12 +1069,7 @@ impl Handler for MimicHandler {
                         session.data(channel, b"\r\n".to_vec())?;
 
                         let output = self.shell().resume(&password);
-                        self.drain_captures();
-                        jitter().await;
-
-                        self.write_output(channel, &output, session)?;
-                        if output.exit {
-                            self.end_channel(channel, session, output.status as u32)?;
+                        if self.deliver(channel, &output, session).await? {
                             return Ok(());
                         }
                         let prompt = self.shell().prompt();
@@ -1016,22 +1130,7 @@ impl Handler for MimicHandler {
                 Reaction::Submit { echo, line } => {
                     session.data(channel, echo)?;
 
-                    let trimmed = line.trim().to_string();
-                    if !trimmed.is_empty() {
-                        event::command(self.session_id, self.peer, &trimmed);
-                        self.shell().record_history(&trimmed);
-                    }
-
-                    let result = self.shell().execute(&trimmed);
-                    self.drain_captures();
-
-                    // Small randomised delay so response latency is not
-                    // perfectly uniform (a passive timing tell).
-                    jitter().await;
-
-                    self.write_output(channel, &result, session)?;
-                    if result.exit {
-                        self.end_channel(channel, session, result.status as u32)?;
+                    if self.submit_line(channel, &line, session).await? {
                         return Ok(());
                     }
                     // A command left an interactive prompt pending (e.g. `su`
@@ -1068,8 +1167,25 @@ impl Handler for MimicHandler {
             self.end_channel(channel, session, 0)?;
         } else if self.shell_started && self.active_channel == Some(channel.number()) {
             // The client closed stdin. That is end-of-input to the shell just
-            // as Ctrl-D is, so it logs out immediately rather than holding the
+            // as Ctrl-D is, so it ends immediately rather than holding the
             // session — and its connection slot — until the idle timeout.
+            if !self.pty {
+                // A script whose last line has no newline still runs, the way
+                // bash runs what it has when the pipe reaches EOF.
+                if !self.line_buf.is_empty() {
+                    let line = String::from_utf8_lossy(&std::mem::take(&mut self.line_buf))
+                        .trim_end_matches('\r')
+                        .to_string();
+                    if self.run_no_tty_line(channel, &line, session).await? {
+                        return Ok(());
+                    }
+                }
+                // `logout` is what an *interactive* login shell prints on its
+                // way out. Reading a pipe, bash prints nothing.
+                let status = self.shell().last_status as u32;
+                self.end_channel(channel, session, status)?;
+                return Ok(());
+            }
             let bytes = self.out(LOGOUT);
             session.data(channel, bytes)?;
             let status = self.shell().last_status as u32;
@@ -1158,6 +1274,7 @@ mod tests {
             sftp: None,
             quarantine_bytes: 0,
             password_buf: None,
+            line_buf: Vec::new(),
             _guard: guard,
         }
     }
@@ -1623,6 +1740,97 @@ mod tests {
 
         assert_eq!(seen, b"-bash: nosuchcmd: command not found\r\n");
         assert!(errs.is_empty(), "a PTY channel has no second stream");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ssh -T host < script` asks for a shell with no terminal. Real bash
+    /// finds a pipe on stdin and runs non-interactively: no readline, so no
+    /// prompt, no echo of the line, and none of the `\x1b[K` erase sequences
+    /// redrawing one needs — and no `logout`, which only an interactive login
+    /// shell prints. Sending any of that to a client that asked for no
+    /// terminal is a tell on its own.
+    #[tokio::test]
+    async fn a_shell_without_a_pty_runs_no_line_editor() {
+        let (handle, dir) = honeypot("no-pty-shell").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.request_shell(true).await.expect("shell request");
+        channel
+            .data(&b"echo one\nwhoami\nls /nope\nexit\n"[..])
+            .await
+            .expect("send script");
+        channel.eof().await.expect("send eof");
+
+        let (seen, errs, status) = drain_streams(&mut channel).await;
+        let out = String::from_utf8_lossy(&seen);
+
+        // The MOTD still arrives: it comes from the PAM session, which opens
+        // whether or not a terminal was allocated.
+        assert!(out.contains("Debian GNU/Linux"), "missing motd: {out:?}");
+        // Everything a terminal would have added is absent.
+        assert!(!out.contains("root@debian"), "prompt leaked: {out:?}");
+        assert!(!out.contains("\x1b["), "erase sequence leaked: {out:?}");
+        assert!(!out.contains('\r'), "CR leaked onto a channel with no pty");
+        assert!(!out.contains("Last login"), "lastlog leaked: {out:?}");
+        assert!(!out.contains("logout"), "logout leaked: {out:?}");
+        // What the commands actually wrote is all that is left, split by
+        // stream and LF-terminated.
+        assert!(out.ends_with("one\nroot\n"), "unexpected output: {out:?}");
+        assert_eq!(
+            errs,
+            b"ls: cannot access '/nope': No such file or directory\n"
+        );
+        // A shell that ended cleanly reports a status; without one `ssh`
+        // reports 255, which no real server does.
+        assert_eq!(status, Some(2), "missing exit status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `logout` is what an *interactive* login shell prints as it exits, so
+    /// `ssh host exit` — a one-shot command, never interactive — must print
+    /// nothing while still reporting the status.
+    #[tokio::test]
+    async fn exec_exit_prints_no_logout() {
+        let (handle, dir) = honeypot("exec-exit-quiet").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel
+            .exec(true, &b"echo a; exit 3"[..])
+            .await
+            .expect("exec");
+
+        let (seen, _, status) = drain_streams(&mut channel).await;
+
+        assert_eq!(seen, b"a\n", "an exec channel announced a logout");
+        assert_eq!(status, Some(3), "exit status lost");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A script whose last line has no trailing newline still runs, the way
+    /// bash runs what it has when the pipe reaches EOF.
+    #[tokio::test]
+    async fn a_shell_without_a_pty_runs_an_unterminated_last_line() {
+        let (handle, dir) = honeypot("no-pty-partial").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.request_shell(true).await.expect("shell request");
+        channel.data(&b"echo tail"[..]).await.expect("send script");
+        channel.eof().await.expect("send eof");
+
+        let (seen, _, status) = drain_streams(&mut channel).await;
+        let out = String::from_utf8_lossy(&seen);
+
+        assert!(out.ends_with("tail\n"), "last line did not run: {out:?}");
+        assert_eq!(status, Some(0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

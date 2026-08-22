@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `> f 2>&1` stay different from each other as bash's left-to-right ordering
   makes them. `grep -r` now reports an unreadable file on stderr rather than
   mixing the message into its matches.
+- A shell channel that asked for no terminal (`ssh -T host < script`) no longer
+  runs the line editor over its input. Real bash finds a pipe on stdin and runs
+  non-interactively, so it emits no prompt, no echo of the line, and none of the
+  `[K` erase sequences redrawing a line needs; the previous behaviour sent
+  all three plus a `Last login` banner, which is a tell for anything scripting
+  the session rather than typing into it. `logout` is likewise only printed by an
+  *interactive* login shell, so `ssh host exit` and a piped session now exit
+  silently while still reporting their status. The MOTD still arrives on both
+  paths, since it comes from the PAM session rather than the terminal.
 
 ## [0.4.0] - 2026-08-22
 

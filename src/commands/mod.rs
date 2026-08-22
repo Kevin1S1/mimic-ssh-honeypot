@@ -224,16 +224,20 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "true" => return CommandResult::ok(""),
         "false" => return CommandResult::err("", 1),
         "exit" | "logout" => {
+            // Only an interactive login shell announces itself on the way out.
+            // Reading a pipe — an `exec` command or a channel with no terminal
+            // — bash exits silently, so `ssh host exit` prints nothing.
+            let farewell = if shell.interactive { LOGOUT } else { "" };
             if args.is_empty() {
-                return CommandResult::streams(LOGOUT, "", shell.last_status).exiting();
+                return CommandResult::streams(farewell, "", shell.last_status).exiting();
             }
             if args.len() == 1 {
                 if let Ok(n) = args[0].parse::<i64>() {
                     let code = ((n % 256 + 256) % 256) as i32;
-                    return CommandResult::streams(LOGOUT, "", code).exiting();
+                    return CommandResult::streams(farewell, "", code).exiting();
                 } else {
                     return CommandResult::streams(
-                        LOGOUT,
+                        farewell,
                         format!("-bash: {cmd}: {}: numeric argument required\n", args[0]),
                         2,
                     )
