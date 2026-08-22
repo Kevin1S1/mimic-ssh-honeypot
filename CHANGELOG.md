@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ls` now supports `-d` and `--directory` to list directories themselves rather
   than their contents. `ls -ld /tmp` previously failed with `ls: invalid option -- 'd'`,
   revealing the shell as fake to standard reconnaissance commands.
+- Commands now keep stdout and stderr apart instead of merging them into one
+  stream. An `exec` channel without a PTY sends errors as `SSH_EXTENDED_DATA_STDERR`
+  the way a real sshd does, so `ssh host nosuchcmd 2>/dev/null` is silent where it
+  previously still printed `-bash: nosuchcmd: command not found`; a channel with a
+  PTY still sends one merged stream, because a real terminal has only one. Command
+  substitution captures stdout alone, so `echo $(ls /nosuch)` reports the error to
+  the terminal and echoes an empty argument rather than folding the error into the
+  value. A pipeline carries only stdout onward, so `cat /nosuch | wc -l` prints the
+  error and counts `0` instead of counting the error. `>` and `2>` now route each
+  stream independently rather than picking one by exit status, and both descriptors
+  of `> f 2>&1` share the file rather than the second truncating the first. The
+  1 MiB output cap is shared between the two streams, so splitting output across
+  them does not double the ceiling.
 
 ## [0.4.0] - 2026-08-22
 

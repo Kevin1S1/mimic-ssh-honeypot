@@ -22,9 +22,18 @@ use crate::shell::Shell;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// The result of running one command.
+///
+/// The two streams are kept apart because a real process keeps them apart:
+/// only stdout is what a pipe carries and what `$(…)` captures, and only
+/// stderr is what `2>` catches and what an `exec` channel sends as extended
+/// data. Merging them is directly observable — `ssh host nosuchcmd 2>/dev/null`
+/// would still print, and `echo $(ls /nosuch)` would echo the error.
+#[derive(Default)]
 pub struct CommandResult {
-    /// Text written to the client (LF line endings).
+    /// Text written to the client's stdout (LF line endings).
     pub output: String,
+    /// Text written to the client's stderr (LF line endings).
+    pub stderr: String,
     /// Process-style exit status.
     pub status: i32,
     /// Whether the session should end after this command.
@@ -32,19 +41,31 @@ pub struct CommandResult {
 }
 
 impl CommandResult {
-    /// A successful result (status 0) with the given output.
+    /// A successful result (status 0) with the given stdout.
     pub fn ok(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
-            status: 0,
-            exit: false,
+            ..Self::default()
         }
     }
 
-    /// A failing result with `status` and the given output.
-    pub fn err(output: impl Into<String>, status: i32) -> Self {
+    /// A failing result with `status` and the given stderr. Nothing reaches
+    /// stdout: a command that only reports on failure writes to fd 2.
+    pub fn err(stderr: impl Into<String>, status: i32) -> Self {
+        Self {
+            stderr: stderr.into(),
+            status,
+            ..Self::default()
+        }
+    }
+
+    /// A result that wrote to both streams. Commands that walk several
+    /// operands list the ones that worked while reporting the ones that did
+    /// not, and the two halves land on different descriptors.
+    pub fn streams(output: impl Into<String>, stderr: impl Into<String>, status: i32) -> Self {
         Self {
             output: output.into(),
+            stderr: stderr.into(),
             status,
             exit: false,
         }
@@ -61,20 +82,29 @@ impl CommandResult {
         self
     }
 
-    /// Truncate the output to at most [`MAX_COMMAND_OUTPUT_BYTES`], snapping to
-    /// a UTF-8 char boundary and appending a notice. Defence-in-depth: even if a
-    /// handler produces too much, dispatch caps it here.
+    /// Truncate the result to at most [`MAX_COMMAND_OUTPUT_BYTES`] across both
+    /// streams, snapping to a UTF-8 char boundary and appending a notice.
+    /// Defence-in-depth: even if a handler produces too much, dispatch caps it
+    /// here. The budget is shared, so a command cannot double the ceiling by
+    /// splitting what it writes between the two.
     fn truncate(&mut self) {
-        if self.output.len() <= MAX_COMMAND_OUTPUT_BYTES {
-            return;
-        }
-        let mut cut = MAX_COMMAND_OUTPUT_BYTES;
-        while cut > 0 && !self.output.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        self.output.truncate(cut);
-        self.output.push_str("\n... (output truncated)\n");
+        let budget = MAX_COMMAND_OUTPUT_BYTES;
+        truncate_stream(&mut self.output, budget);
+        truncate_stream(&mut self.stderr, budget.saturating_sub(self.output.len()));
     }
+}
+
+/// Cut `text` down to `budget` bytes on a char boundary, marking the cut.
+pub(crate) fn truncate_stream(text: &mut String, budget: usize) {
+    if text.len() <= budget {
+        return;
+    }
+    let mut cut = budget;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str("\n... (output truncated)\n");
 }
 
 /// A command handler that either mutates the shell or reads it.
@@ -195,29 +225,19 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "false" => return CommandResult::err("", 1),
         "exit" | "logout" => {
             if args.is_empty() {
-                return CommandResult {
-                    output: LOGOUT.to_string(),
-                    status: shell.last_status,
-                    exit: true,
-                };
+                return CommandResult::streams(LOGOUT, "", shell.last_status).exiting();
             }
             if args.len() == 1 {
                 if let Ok(n) = args[0].parse::<i64>() {
                     let code = ((n % 256 + 256) % 256) as i32;
-                    return CommandResult {
-                        output: LOGOUT.to_string(),
-                        status: code,
-                        exit: true,
-                    };
+                    return CommandResult::streams(LOGOUT, "", code).exiting();
                 } else {
-                    return CommandResult {
-                        output: format!(
-                            "-bash: {cmd}: {}: numeric argument required\n{LOGOUT}",
-                            args[0]
-                        ),
-                        status: 2,
-                        exit: true,
-                    };
+                    return CommandResult::streams(
+                        LOGOUT,
+                        format!("-bash: {cmd}: {}: numeric argument required\n", args[0]),
+                        2,
+                    )
+                    .exiting();
                 }
             }
             return CommandResult::err(format!("-bash: {cmd}: too many arguments\n"), 1);

@@ -1040,7 +1040,9 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
             status = 1;
         }
     }
-    CommandResult::err(out, status)
+    // A name that resolved still prints its path; `which` says nothing about
+    // the ones that did not, it only reports them in the exit status.
+    CommandResult::streams(out, "", status)
 }
 
 /// Resolve a known command name to the absolute path `which` would print, or

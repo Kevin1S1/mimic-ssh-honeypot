@@ -17,13 +17,40 @@ use crate::vfs::{snapshot, NodeId, Vfs};
 use env::Env;
 
 /// The result of running one command line.
+///
+/// `text` is what a terminal shows — both streams in the order the line
+/// produced them — and is what a PTY channel writes, because a real sshd with
+/// a pty has only one stream to write to. `stdout` and `stderr` are the same
+/// bytes split by descriptor, which is what a channel without a pty needs so
+/// stderr can go out as `SSH_EXTENDED_DATA_STDERR`.
+#[derive(Default)]
 pub struct Output {
-    /// Text to write back to the client.
+    /// Both streams, in terminal order.
     pub text: String,
+    /// Text the line wrote to stdout.
+    pub stdout: String,
+    /// Text the line wrote to stderr.
+    pub stderr: String,
     /// Process-style exit status.
     pub status: i32,
     /// Whether the session should end (e.g. after `exit`).
     pub exit: bool,
+}
+
+impl Output {
+    /// Append one command's two streams, keeping `text` in terminal order.
+    ///
+    /// ponytail: a command reports both streams as two finished strings, so
+    /// within one command stderr is shown before stdout — the order GNU `ls`
+    /// and `cat` actually use, since they report an operand they cannot open
+    /// before listing the ones they can. Upgrade when a command needs to
+    /// interleave the two.
+    fn push(&mut self, stdout: &str, stderr: &str) {
+        self.text.push_str(stderr);
+        self.text.push_str(stdout);
+        self.stdout.push_str(stdout);
+        self.stderr.push_str(stderr);
+    }
 }
 
 /// A structured event produced by a command that the network layer drains and
@@ -143,6 +170,11 @@ pub struct Shell {
     /// Bytes of command-substitution output the current line may still splice
     /// into itself. Reset per top-level line; see [`Shell::substitute`].
     subst_budget: usize,
+    /// Stderr written by substitutions while the current stage's words were
+    /// expanded. Expansion happens before the command's redirections are
+    /// applied, so this text goes to the shell's own stderr — `2>` on the
+    /// command does not catch it — and is drained by [`Shell::run_pipeline`].
+    subst_stderr: String,
     /// Standard input for the running command: the previous pipeline stage's
     /// output, or `None` outside a pipeline.
     pub stdin: Option<String>,
@@ -199,6 +231,7 @@ impl Shell {
             login: crate::clock::now(),
             nesting: 0,
             subst_budget: commands::MAX_COMMAND_OUTPUT_BYTES,
+            subst_stderr: String::new(),
             stdin: None,
             stdout_is_tty: true,
             history: Vec::new(),
@@ -366,7 +399,10 @@ impl Shell {
     }
 
     /// Run a substitution's body and return the text bash would splice into the
-    /// line: the command's output with its trailing newlines stripped.
+    /// line: the command's *stdout* with its trailing newlines stripped.
+    /// Anything the body wrote to stderr is not part of the value — it is held
+    /// for the outer line to emit, so `echo $(ls /nosuch)` reports the error
+    /// and echoes an empty argument, exactly as bash does.
     ///
     /// The body is a command line of its own — `$(cd /tmp; ls | wc -l)` — so it
     /// runs through [`Shell::execute`], in a subshell: what it changes about the
@@ -408,7 +444,12 @@ impl Shell {
         self.pending = session.pending;
         self.nesting -= 1;
 
-        let mut value = output.text;
+        // Held stderr is capped like any other stream: a line has room for
+        // hundreds of substitutions, and each one's stderr is only bounded on
+        // its own.
+        self.subst_stderr.push_str(&output.stderr);
+        commands::truncate_stream(&mut self.subst_stderr, commands::MAX_COMMAND_OUTPUT_BYTES);
+        let mut value = output.stdout;
         if output.exit {
             // `logout` is what an interactive shell prints on its way out; a
             // subshell that exits prints nothing.
@@ -497,22 +538,17 @@ impl Shell {
                     password: input.to_string(),
                 });
                 self.switch_user(&target);
-                Output {
-                    text: String::new(),
-                    status: 0,
-                    exit: false,
-                }
+                Output::default()
             }
-            None => Output {
-                text: String::new(),
-                status: 0,
-                exit: false,
-            },
+            None => Output::default(),
         }
     }
 
-    /// Run one segment as a pipeline: each stage's output becomes the next
-    /// stage's stdin, and only the last stage's output reaches the client.
+    /// Run one segment as a pipeline: each stage's *stdout* becomes the next
+    /// stage's stdin, and only the last stage's stdout reaches the client.
+    /// Every stage's stderr reaches the client, the way a real pipeline shares
+    /// one terminal between all of them — `cat /nope | wc -l` prints the error
+    /// and counts nothing, rather than counting the error.
     /// Returns `None` if the segment held no command at all.
     ///
     /// Filters (`cat`, `grep`, `head`, `tail`, `wc`) read [`Shell::stdin`] when
@@ -524,6 +560,7 @@ impl Shell {
         let last_stage = stages.len() - 1;
         let mut piped: Option<String> = None;
         let mut last: Option<commands::CommandResult> = None;
+        let mut stderr = String::new();
 
         for (i, stage) in stages.iter().enumerate() {
             let (text, redirects) = match parser::split_redirects(stage) {
@@ -540,6 +577,11 @@ impl Shell {
                 // redirect that cannot be opened means nothing runs at all.
                 Err(message) => return Some(commands::CommandResult::err(message, 1)),
             };
+            // Expanding the words above may have run a substitution that wrote
+            // to stderr; that happened before this command's redirections, so
+            // it goes straight to the terminal rather than through the sinks.
+            stderr.push_str(&std::mem::take(&mut self.subst_stderr));
+            commands::truncate_stream(&mut stderr, commands::MAX_COMMAND_OUTPUT_BYTES);
             // A stage that is nothing but a redirect (`> f`) still opens it.
             if argv.is_empty() {
                 continue;
@@ -549,9 +591,21 @@ impl Shell {
             let result = commands::dispatch(self, &argv);
             self.stdin = None;
             self.stdout_is_tty = true;
-            let result = self.route_output(result, &sinks);
+            let mut result = self.route_output(result, &sinks);
+            stderr.push_str(&std::mem::take(&mut result.stderr));
+            commands::truncate_stream(&mut stderr, commands::MAX_COMMAND_OUTPUT_BYTES);
             piped = Some(result.output.clone());
             last = Some(result);
+        }
+        // Every stage's stderr rides out on the last stage's result, which is
+        // the one the segment reports. A segment that ran no command at all
+        // still reports what expanding it wrote.
+        match last.as_mut() {
+            Some(result) => result.stderr = stderr,
+            None if !stderr.is_empty() => {
+                return Some(commands::CommandResult::streams("", stderr, 0))
+            }
+            None => {}
         }
         last
     }
@@ -641,52 +695,55 @@ impl Shell {
         Ok(Some(id))
     }
 
-    /// Send a command's output to whichever sink its stream was redirected to,
-    /// returning what is left for the client.
+    /// Send each of a command's streams to whichever sink it was redirected
+    /// to, returning what is left for the client.
     fn route_output(
         &mut self,
-        result: commands::CommandResult,
+        mut result: commands::CommandResult,
         sinks: &Sinks,
     ) -> commands::CommandResult {
-        // ponytail: a command produces one output string, not a stdout and a
-        // stderr, so its exit status stands in for which stream it wrote —
-        // right for the commands here, which only report on failure. Upgrade
-        // when a command needs to write to both at once.
-        let sink = if result.status == 0 {
-            sinks.stdout.as_ref()
-        } else {
-            sinks.stderr.as_ref()
-        };
-        let Some(sink) = sink else {
-            return result;
-        };
-        if result.output.is_empty() {
-            return commands::CommandResult {
-                output: String::new(),
-                ..result
-            };
+        // The streams go out in the order [`Output::push`] shows them, so
+        // `> f 2>&1` — where both descriptors are dups of one open file — puts
+        // the same bytes in the file that a terminal would have shown, and the
+        // second write follows the first rather than truncating it, exactly as
+        // one shared file offset does.
+        let mut written = None;
+        let mut failure = None;
+        if let Some(sink) = sinks.stderr.as_ref() {
+            let text = std::mem::take(&mut result.stderr);
+            failure = self.divert(sink, &text, &mut written);
         }
-        match self.write_redirect(sink, result.output.as_bytes()) {
-            Ok(()) => commands::CommandResult {
-                output: String::new(),
-                ..result
-            },
-            // A refused write is reported to the client, like a full disk.
-            Err(message) => commands::CommandResult {
-                output: message,
-                status: 1,
-                ..result
-            },
+        if let Some(sink) = sinks.stdout.as_ref() {
+            let text = std::mem::take(&mut result.output);
+            failure = self.divert(sink, &text, &mut written).or(failure);
         }
+        // A refused write is reported to the client, like a full disk.
+        if let Some(message) = failure {
+            result.stderr.push_str(&message);
+            result.status = 1;
+        }
+        result
+    }
+
+    /// Write one stream into its sink, recording the node it landed in so a
+    /// second stream pointed at the same file appends after it instead of
+    /// truncating what the first one wrote.
+    fn divert(&mut self, sink: &Sink, text: &str, written: &mut Option<NodeId>) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        let append = sink.append || (sink.node.is_some() && sink.node == *written);
+        *written = sink.node;
+        self.write_redirect(sink, text.as_bytes(), append).err()
     }
 
     /// Write `data` into an already-opened sink. A sink with no node is
     /// `/dev/null`, which swallows it.
-    fn write_redirect(&mut self, sink: &Sink, data: &[u8]) -> Result<(), String> {
+    fn write_redirect(&mut self, sink: &Sink, data: &[u8], append: bool) -> Result<(), String> {
         let Some(node) = sink.node else {
             return Ok(());
         };
-        if !self.vfs.write_file(node, data, sink.append) {
+        if !self.vfs.write_file(node, data, append) {
             return Err(format!("-bash: {}: No space left on device\n", sink.path));
         }
         Ok(())
@@ -704,20 +761,20 @@ impl Shell {
             self.subst_budget = commands::MAX_COMMAND_OUTPUT_BYTES;
         }
 
-        let mut text = String::new();
+        let mut out = Output::default();
         let mut status = 0;
-        let mut exit = false;
         let mut ran = false;
 
         for segment in parser::split_segments(parser::strip_comment(line)) {
             if segment.text.trim().is_empty() {
                 if segment.run_if != parser::Separator::Always {
                     // `&& cmd` with nothing in front of it, as bash sees it.
-                    return Output {
-                        text: "-bash: syntax error near unexpected token `&&'\n".to_string(),
+                    let mut syntax = Output {
                         status: 2,
-                        exit: false,
+                        ..Output::default()
                     };
+                    syntax.push("", "-bash: syntax error near unexpected token `&&'\n");
+                    return syntax;
                 }
                 continue;
             }
@@ -736,33 +793,29 @@ impl Shell {
             ran = true;
             status = result.status;
             self.last_status = status;
-            text.push_str(&result.output);
+            out.push(&result.output, &result.stderr);
             if result.exit {
-                exit = true;
+                out.exit = true;
                 break;
             }
             // The per-command cap bounds one command; a chained line has to be
             // bounded as a whole, or `cat big; cat big; ...` multiplies it by
-            // the number of segments the line has room for.
-            if text.len() >= commands::MAX_COMMAND_OUTPUT_BYTES {
-                let mut cut = commands::MAX_COMMAND_OUTPUT_BYTES;
-                while cut > 0 && !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                text.truncate(cut);
-                text.push_str("\n... (output truncated)\n");
+            // the number of segments the line has room for. The two streams
+            // share the budget, so splitting the output between them does not
+            // buy an attacker a second helping.
+            if out.text.len() >= commands::MAX_COMMAND_OUTPUT_BYTES {
+                let budget = commands::MAX_COMMAND_OUTPUT_BYTES;
+                commands::truncate_stream(&mut out.text, budget);
+                commands::truncate_stream(&mut out.stdout, budget);
+                commands::truncate_stream(&mut out.stderr, budget);
                 break;
             }
         }
 
-        if !ran {
-            return Output {
-                text,
-                status: 0,
-                exit,
-            };
+        if ran {
+            out.status = status;
         }
-        Output { text, status, exit }
+        out
     }
 }
 
@@ -1215,6 +1268,50 @@ mod tests {
     }
 
     #[test]
+    fn the_two_streams_stay_apart() {
+        let mut shell = Shell::new("root", "debian");
+
+        // A command that only reports on failure writes to stderr alone, so
+        // `2>/dev/null` silences it and stdout stays empty.
+        let out = shell.execute("nosuchcmd");
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "-bash: nosuchcmd: command not found\n");
+        assert_eq!(out.status, 127);
+        assert_eq!(shell.execute("nosuchcmd 2> /dev/null").stderr, "");
+
+        // A command that walks several operands splits what it wrote: the
+        // listing on stdout, the operand it could not open on stderr.
+        shell.execute("mkdir -p /tmp/d && touch /tmp/d/a");
+        let out = shell.execute("ls /tmp/d /nope");
+        assert_eq!(out.stdout, "/tmp/d:\na\n");
+        assert_eq!(
+            out.stderr,
+            "ls: cannot access '/nope': No such file or directory\n"
+        );
+        // The terminal still shows both, errors first, as GNU ls prints them.
+        assert_eq!(out.text, format!("{}{}", out.stderr, out.stdout));
+
+        // A substitution captures stdout only: the error reaches the terminal
+        // and `echo` is left with an empty argument.
+        let out = shell.execute("echo $(ls /nope)");
+        assert_eq!(out.stdout, "\n");
+        assert_eq!(
+            out.stderr,
+            "ls: cannot access '/nope': No such file or directory\n"
+        );
+        // The command's own redirection cannot catch it — bash expands the
+        // words before it applies them.
+        let out = shell.execute("echo $(ls /nope) 2> /dev/null");
+        assert!(out.stderr.contains("No such file or directory"));
+
+        // Only stdout is what a pipe carries, so the error goes to the
+        // terminal and the next stage counts nothing.
+        let out = shell.execute("cat /nope | wc -l");
+        assert_eq!(out.stdout, "0\n");
+        assert_eq!(out.stderr, "cat: /nope: No such file or directory\n");
+    }
+
+    #[test]
     fn redirection_routes_errors_and_reports_refused_targets() {
         let mut shell = Shell::new("root", "debian");
 
@@ -1241,6 +1338,15 @@ mod tests {
             .execute("cat /tmp/all")
             .text
             .contains("No such file or directory"));
+        // Both descriptors share the file, so the second stream written lands
+        // after the first instead of truncating it, and the file holds what a
+        // terminal would have shown.
+        shell.execute("mkdir -p /tmp/d2 && touch /tmp/d2/a");
+        shell.execute("ls /nope /tmp/d2 > /tmp/mix 2>&1");
+        assert_eq!(
+            shell.execute("cat /tmp/mix").text,
+            "ls: cannot access '/nope': No such file or directory\n/tmp/d2:\na\n"
+        );
         assert!(shell
             .execute("ls /nope 2>&1")
             .text

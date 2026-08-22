@@ -13,7 +13,7 @@ use crate::network::scp::{self, ScpMode, ScpSink};
 use crate::network::sftp::{self, SftpSession};
 use crate::shell::complete::{self, Completion};
 use crate::shell::line::{is_continuation, LineEditor, Reaction};
-use crate::shell::{Capture, Shell};
+use crate::shell::{Capture, Output, Shell};
 
 use anyhow::{Context, Result};
 use russh::server::{Auth, Config as ServerConfig, Handler, Msg, Session};
@@ -36,6 +36,9 @@ const MAX_COMMAND_LEN: usize = 4096;
 /// What a login shell prints when it reaches end-of-input, matching the `exit`
 /// builtin's own output. Line endings are applied by [`MimicHandler::out`].
 const LOGOUT: &str = "logout\n";
+
+/// The `data_type_code` RFC 4254 §5.2 assigns to stderr — the only one defined.
+const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
@@ -310,6 +313,33 @@ impl MimicHandler {
         } else {
             text.as_bytes().to_vec()
         }
+    }
+
+    /// Write a finished command line's output to the channel.
+    ///
+    /// With a PTY both streams share the terminal, so a real sshd has only the
+    /// data channel to write to. Without one they stay apart: stdout on the
+    /// data channel and stderr as `SSH_EXTENDED_DATA_STDERR`, so
+    /// `ssh host nosuchcmd 2>/dev/null` prints nothing.
+    fn write_output(
+        &self,
+        channel: ChannelId,
+        output: &Output,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        if self.pty {
+            if !output.text.is_empty() {
+                session.data(channel, self.out(&output.text))?;
+            }
+            return Ok(());
+        }
+        if !output.stdout.is_empty() {
+            session.data(channel, self.out(&output.stdout))?;
+        }
+        if !output.stderr.is_empty() {
+            session.extended_data(channel, SSH_EXTENDED_DATA_STDERR, self.out(&output.stderr))?;
+        }
+        Ok(())
     }
 
     /// Apply the configured authentication policy to one attempt.
@@ -867,10 +897,7 @@ impl Handler for MimicHandler {
         self.shell().pending = None;
         self.drain_captures();
         jitter().await;
-        if !result.text.is_empty() {
-            let bytes = self.out(&result.text);
-            session.data(channel, bytes)?;
-        }
+        self.write_output(channel, &result, session)?;
         self.end_channel(channel, session, result.status as u32)?;
         Ok(())
     }
@@ -926,10 +953,7 @@ impl Handler for MimicHandler {
                         self.drain_captures();
                         jitter().await;
 
-                        if !output.text.is_empty() {
-                            let bytes = self.out(&output.text);
-                            session.data(channel, bytes)?;
-                        }
+                        self.write_output(channel, &output, session)?;
                         if output.exit {
                             self.end_channel(channel, session, output.status as u32)?;
                             return Ok(());
@@ -1005,10 +1029,7 @@ impl Handler for MimicHandler {
                     // perfectly uniform (a passive timing tell).
                     jitter().await;
 
-                    if !result.text.is_empty() {
-                        let bytes = self.out(&result.text);
-                        session.data(channel, bytes)?;
-                    }
+                    self.write_output(channel, &result, session)?;
                     if result.exit {
                         self.end_channel(channel, session, result.status as u32)?;
                         return Ok(());
@@ -1427,12 +1448,27 @@ mod tests {
     async fn drain_until_closed(
         channel: &mut russh::Channel<russh::client::Msg>,
     ) -> (Vec<u8>, Option<u32>) {
+        let (seen, _, status) = drain_streams(channel).await;
+        (seen, status)
+    }
+
+    /// Drain a channel keeping the two data streams apart, as the client's own
+    /// stdout and stderr do.
+    async fn drain_streams(
+        channel: &mut russh::Channel<russh::client::Msg>,
+    ) -> (Vec<u8>, Vec<u8>, Option<u32>) {
         let mut seen = Vec::new();
+        let mut errs = Vec::new();
         let mut status = None;
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(msg) = channel.wait().await {
                 match msg {
                     russh::ChannelMsg::Data { ref data } => seen.extend_from_slice(data),
+                    russh::ChannelMsg::ExtendedData { ref data, ext }
+                        if ext == SSH_EXTENDED_DATA_STDERR =>
+                    {
+                        errs.extend_from_slice(data)
+                    }
                     russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
                     _ => {}
                 }
@@ -1440,7 +1476,7 @@ mod tests {
         })
         .await
         .expect("server closed the session");
-        (seen, status)
+        (seen, errs, status)
     }
 
     /// Ctrl-D on an empty line ends the session, and a login shell says so
@@ -1541,6 +1577,52 @@ mod tests {
         let (seen, _) = drain_until_closed(&mut channel).await;
 
         assert_eq!(seen, b"hello\r\n", "a PTY exec should be CRLF-terminated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real sshd running a command without a PTY has two streams to write
+    /// to, and sends stderr as extended data. Putting the error on stdout is
+    /// visible from the client the moment it writes `2>/dev/null` — and the
+    /// bytes still have to be bare LF, like everything else on this channel.
+    #[tokio::test]
+    async fn exec_without_a_pty_sends_errors_as_extended_data() {
+        let (handle, dir) = honeypot("exec-stderr").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel.exec(true, &b"nosuchcmd"[..]).await.expect("exec");
+
+        let (seen, errs, status) = drain_streams(&mut channel).await;
+
+        assert_eq!(seen, b"", "an error must not reach stdout");
+        assert_eq!(errs, b"-bash: nosuchcmd: command not found\n");
+        assert_eq!(status, Some(127), "missing exit status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With a PTY there is only one stream: a real sshd never sends extended
+    /// data on a channel that asked for a terminal, because the command's two
+    /// descriptors are both the tty.
+    #[tokio::test]
+    async fn a_pty_channel_sends_no_extended_data() {
+        let (handle, dir) = honeypot("pty-stderr").await;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .expect("session channel");
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .expect("pty request");
+        channel.exec(true, &b"nosuchcmd"[..]).await.expect("exec");
+
+        let (seen, errs, _) = drain_streams(&mut channel).await;
+
+        assert_eq!(seen, b"-bash: nosuchcmd: command not found\r\n");
+        assert!(errs.is_empty(), "a PTY channel has no second stream");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
