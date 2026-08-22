@@ -36,7 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream independently rather than picking one by exit status, and both descriptors
   of `> f 2>&1` share the file rather than the second truncating the first. The
   1 MiB output cap is shared between the two streams, so splitting output across
-  them does not double the ceiling.
+  them does not double the ceiling. `2>&1` still merges the two when stdout is
+  the terminal, so `cmd 2>&1 | grep` sees the error, while `2>&1 > f` and
+  `> f 2>&1` stay different from each other as bash's left-to-right ordering
+  makes them. `grep -r` now reports an unreadable file on stderr rather than
+  mixing the message into its matches.
 
 ## [0.4.0] - 2026-08-22
 

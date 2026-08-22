@@ -120,6 +120,13 @@ struct Sinks {
     stdout: Option<Sink>,
     /// Target for `2>` and the stderr half of `&>`.
     stderr: Option<Sink>,
+    /// `2>&1` while stdout was still the terminal: the two share one
+    /// descriptor, so what the command writes to stderr comes back to the
+    /// client on stdout — which is what puts it in the pipe that
+    /// `cmd 2>&1 | grep` is built around.
+    stderr_merged: bool,
+    /// `>&2`/`1>&2`, the mirror case.
+    stdout_merged: bool,
 }
 
 /// The session state a command substitution runs on a copy of, restored when
@@ -616,6 +623,14 @@ impl Shell {
     fn open_redirects(&mut self, redirects: &[parser::Redirect]) -> Result<Sinks, String> {
         let mut sinks = Sinks::default();
         for redirect in redirects {
+            // `>&1` and `2>&2` point a stream at itself, which changes nothing.
+            if matches!(&redirect.target, parser::Target::Dup(s) if *s == redirect.stream) {
+                continue;
+            }
+            // A dup against a stream that is still the terminal cannot be
+            // resolved to a sink: it means "come back on that stream instead",
+            // which only the routing below can honour.
+            let mut merged = false;
             let sink = match &redirect.target {
                 parser::Target::File { path, append } => {
                     // The target word is expanded like any other, so
@@ -635,17 +650,35 @@ impl Shell {
                     })
                 }
                 // `2>&1` points a stream at whatever the other one already
-                // reached, which is `None` when that one is still the terminal.
-                parser::Target::Dup(parser::Stream::Stdout) => sinks.stdout.clone(),
+                // reached; when that one is still the terminal there is no
+                // sink to share, only the stream it comes back on.
+                parser::Target::Dup(parser::Stream::Stdout) => {
+                    merged = sinks.stdout.is_none();
+                    sinks.stdout.clone()
+                }
                 // The parser only builds `Dup` from descriptor 1 or 2.
-                parser::Target::Dup(_) => sinks.stderr.clone(),
+                parser::Target::Dup(_) => {
+                    merged = sinks.stderr.is_none();
+                    sinks.stderr.clone()
+                }
             };
+            // Redirects apply left to right, so a later one pointing the same
+            // stream at a file undoes an earlier dup — which is the whole
+            // difference between `> f 2>&1` and `2>&1 > f`.
             match redirect.stream {
-                parser::Stream::Stdout => sinks.stdout = sink,
-                parser::Stream::Stderr => sinks.stderr = sink,
+                parser::Stream::Stdout => {
+                    sinks.stdout = sink;
+                    sinks.stdout_merged = merged;
+                }
+                parser::Stream::Stderr => {
+                    sinks.stderr = sink;
+                    sinks.stderr_merged = merged;
+                }
                 parser::Stream::Both => {
                     sinks.stdout = sink.clone();
                     sinks.stderr = sink;
+                    sinks.stdout_merged = merged;
+                    sinks.stderr_merged = merged;
                 }
             }
         }
@@ -722,6 +755,17 @@ impl Shell {
             result.stderr.push_str(&message);
             result.status = 1;
         }
+        // A stream duplicated onto one still reaching the client comes back on
+        // that one instead, so `2>&1` puts the error where a pipe can see it.
+        if sinks.stderr_merged {
+            let mut merged = std::mem::take(&mut result.stderr);
+            merged.push_str(&result.output);
+            result.output = merged;
+        }
+        if sinks.stdout_merged {
+            let stdout = std::mem::take(&mut result.output);
+            result.stderr.push_str(&stdout);
+        }
         result
     }
 
@@ -759,6 +803,10 @@ impl Shell {
         // the line the attacker typed, so only that one refills it.
         if self.nesting == 0 {
             self.subst_budget = commands::MAX_COMMAND_OUTPUT_BYTES;
+            // Every path that expands words drains this, but clearing it here
+            // means a caller that expands outside a pipeline (a prompt, a
+            // completion) cannot leave text to surface on the next line.
+            self.subst_stderr.clear();
         }
 
         let mut out = Output::default();
@@ -1309,6 +1357,33 @@ mod tests {
         let out = shell.execute("cat /nope | wc -l");
         assert_eq!(out.stdout, "0\n");
         assert_eq!(out.stderr, "cat: /nope: No such file or directory\n");
+
+        // `2>&1` with stdout still on the terminal makes the two share one
+        // descriptor, so the error comes back on stdout — which is what puts
+        // it into the pipe that `cmd 2>&1 | grep` is built around.
+        let out = shell.execute("ls /nope 2>&1");
+        assert_eq!(
+            out.stdout,
+            "ls: cannot access '/nope': No such file or directory\n"
+        );
+        assert_eq!(out.stderr, "");
+        assert_eq!(shell.execute("ls /nope 2>&1 | wc -l").stdout, "1\n");
+        // The mirror case sends stdout to stderr instead, and a stream pointed
+        // at itself changes nothing.
+        let out = shell.execute("echo oops >&2");
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "oops\n");
+        let out = shell.execute("echo fine >&1");
+        assert_eq!(out.stdout, "fine\n");
+        assert_eq!(out.stderr, "");
+
+        // Redirects apply left to right: `2>&1 > f` duplicates stderr onto the
+        // terminal first, then moves stdout to the file, so the error is still
+        // on the terminal — the classic difference from `> f 2>&1`.
+        shell.execute("ls /nope 2>&1 > /tmp/only-out");
+        let out = shell.execute("ls /nope 2>&1 > /tmp/only-out");
+        assert!(out.stdout.contains("No such file or directory"));
+        assert_eq!(shell.execute("cat /tmp/only-out").stdout, "");
     }
 
     #[test]
