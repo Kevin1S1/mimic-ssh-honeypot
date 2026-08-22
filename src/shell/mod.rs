@@ -503,14 +503,17 @@ impl Shell {
                 Ok(split) => split,
                 Err(message) => return Some(commands::CommandResult::err(message, 2)),
             };
+            // Words are expanded before the targets are opened, so
+            // `echo $(cat f) > f` reads `f` before the redirect truncates it —
+            // the order bash performs the two in.
+            let argv = self.parse_line(&text);
             let sinks = match self.open_redirects(&redirects) {
                 Ok(sinks) => sinks,
                 // bash opens the targets before it runs the command, so a
                 // redirect that cannot be opened means nothing runs at all.
                 Err(message) => return Some(commands::CommandResult::err(message, 1)),
             };
-
-            let argv = self.parse_line(&text);
+            // A stage that is nothing but a redirect (`> f`) still opens it.
             if argv.is_empty() {
                 continue;
             }
@@ -897,6 +900,10 @@ mod tests {
         assert!(shell.vfs.resolve(shell.vfs.root(), "/tmp/out").is_none());
         assert_eq!(shell.execute(r#"echo $(echo "it's")"#).text, "it's\n");
         assert_eq!(shell.execute("echo $(echo '$USER')").text, "$USER\n");
+        // The words are expanded before the redirect target is truncated.
+        shell.execute("echo before > /tmp/f");
+        shell.execute("echo $(cat /tmp/f) > /tmp/f");
+        assert_eq!(shell.execute("cat /tmp/f").text, "before\n");
 
         // Word splitting is the one thing that still applies, and only unquoted.
         assert_eq!(
