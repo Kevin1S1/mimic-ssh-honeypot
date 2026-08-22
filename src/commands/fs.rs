@@ -799,6 +799,7 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
                     shell.uid,
                     shell.gid,
                     &mut out,
+                    &mut errs,
                     &mut any_match,
                 );
             } else {
@@ -902,6 +903,7 @@ fn grep_dir(
     uid: u32,
     gid: u32,
     out: &mut String,
+    errs: &mut String,
     any_match: &mut bool,
 ) {
     let Some(entries) = vfs.entries(dir) else {
@@ -923,12 +925,13 @@ fn grep_dir(
                 uid,
                 gid,
                 out,
+                errs,
                 any_match,
             );
         } else if vfs.node(id).meta.readable_by(uid, gid) {
             grep_file(vfs, id, &child_path, needle, flags, out, any_match);
         } else {
-            out.push_str(&format!("grep: {child_path}: Permission denied\n"));
+            errs.push_str(&format!("grep: {child_path}: Permission denied\n"));
         }
     }
 }
