@@ -4,6 +4,7 @@
 mod hostkey;
 mod limiter;
 mod scp;
+mod sftp;
 mod ssh;
 
 use crate::config::Config;

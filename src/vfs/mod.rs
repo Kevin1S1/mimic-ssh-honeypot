@@ -334,6 +334,17 @@ impl Vfs {
         self.nodes[id].meta.mode = file_type | (perms & 0o7777);
     }
 
+    /// Set the owner uid and group gid of `id`.
+    pub fn chown(&mut self, id: NodeId, uid: u32, gid: u32) {
+        self.nodes[id].meta.uid = uid;
+        self.nodes[id].meta.gid = gid;
+    }
+
+    /// Set the modification time of `id`.
+    pub fn set_mtime(&mut self, id: NodeId, mtime: i64) {
+        self.nodes[id].meta.mtime = mtime;
+    }
+
     /// Detach the child `name` from directory `parent`, returning its id if it
     /// existed. The node itself is left orphaned in the arena (a tombstone);
     /// this keeps every other [`NodeId`] stable, which matters because callers

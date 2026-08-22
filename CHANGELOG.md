@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SFTP subsystem (version 3) support: accepts SFTP sessions for file uploads,
+  downloads, directory listings, and filesystem operations, quarantining uploaded
+  payloads and recording structured `subsystem_request` and `upload` events.
+
 ### Security
 - Positional parameter expansion: `$#` now expands to `0`, `$0` to `-bash`,
   `$1`..`$9` to empty string, and `${#}`/`${0}`/etc. behave consistently with

@@ -6,7 +6,7 @@
 
 A medium-to-high interaction SSH honeypot written in Rust. MIMIC presents attackers with a fully convincing Debian 12 shell — realistic prompt, MOTD, filesystem, and ~50 emulated commands — while the entire session runs as a **pure in-memory state machine**. No shell process is ever spawned. No real filesystem is ever touched. The Rust compiler statically enforces this through `#![forbid(unsafe_code)]` and strict module-visibility boundaries.
 
-Every attacker action — authentication attempts, commands, `wget`/`curl` downloads, and SCP uploads — is captured as a structured JSON event, ready for SIEM ingestion or offline analysis.
+Every attacker action — authentication attempts, commands, `wget`/`curl` downloads, and SCP/SFTP uploads — is captured as a structured JSON event, ready for SIEM ingestion or offline analysis.
 
 ---
 
@@ -35,7 +35,7 @@ MIMIC is split into five strictly isolated layers. Only the Network layer is all
 │     src/network/                         │  rate limiting, russh handshake
 ├──────────────────────────────────────────┤
 │  2. SSH Protocol Engine                  │  KEX, auth capture, PTY / exec /
-│     src/network/ssh.rs                   │  SCP channel routing
+│     src/network/ssh.rs                   │  SCP / SFTP channel routing
 ├──────────────────────────────────────────┤
 │  3. Shell Emulator (State Machine)       │  Line editing, pipes, env vars,
 │     src/shell/                           │  $PS1, $?, $$, quoting, exit
@@ -104,7 +104,7 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Shell built-ins** | `exit` (`[N]`), `logout` (`[N]`), `true`, `false`, `cd`, `export`, `unset` |
 | **Line syntax** | `;`, `&&`, `||` chaining, `|` pipelines, and `>`/`>>`/`2>`/`&>`/`2>&1` output redirection (all quoting-aware), `#` comments, `$VAR`/`${VAR}`/`$?`/`$$`/`$#`/`$0` expansion, `$(…)`/`` `…` `` command substitution and `$((…))` integer arithmetic, single/double quotes, backslash escapes |
 
-`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit. `tar` reads and writes real POSIX ustar archives, so `tar czf t.tgz d && tar tzf t.tgz` round-trips inside the VFS; nothing is compressed, since no command in the emulator can tell (`-z`/`-j`/`-J` are accepted and ignored).
+`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP and SFTP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit. `tar` reads and writes real POSIX ustar archives, so `tar czf t.tgz d && tar tzf t.tgz` round-trips inside the VFS; nothing is compressed, since no command in the emulator can tell (`-z`/`-j`/`-J` are accepted and ignored).
 
 
 ### SSH Banner
@@ -172,7 +172,7 @@ idle_timeout_secs = 300          # drop idle sessions after 5 minutes
 max_session_secs  = 1800         # absolute per-session lifetime cap
 
 # Capture
-quarantine_dir    = "/data/quarantine" # SCP uploads land here (SHA-256 named)
+quarantine_dir    = "/data/quarantine" # SCP/SFTP uploads land here (SHA-256 named)
 max_upload_bytes  = 8388608      # truncate stored files at 8 MiB
 host_key_dir      = "/data/host_keys"  # persisted Ed25519 + RSA keys
 
@@ -245,7 +245,10 @@ Pipe to `jq` or ship to your SIEM.
 // wget/curl download logged
 {"fields":{"event":"download","sensor_name":"mimic","session_id":42,"peer":"…","tool":"wget","url":"http://evil.sh/payload","dest":"/tmp/payload"}}
 
-// SCP upload captured. `sha256` is the complete payload as it came off the
+// Subsystem request (e.g. SFTP)
+{"fields":{"event":"subsystem_request","sensor_name":"mimic","session_id":42,"peer":"…","subsystem":"sftp","accepted":true}}
+
+// SCP/SFTP upload captured. `sha256` is the complete payload as it came off the
 // wire — the hash to look up in an IOC feed. `stored_sha256` is what is on
 // disk (and the quarantine filename); the two differ only when `truncated`.
 // `stored_path` is the full path under `quarantine_dir`, always written with
@@ -350,7 +353,7 @@ The timer fires at midnight UTC; the script then sleeps for a random duration wi
 
 ### What gets wiped
 
-- **Quarantine store** (`quarantine/`) — captured SCP uploads are deleted.
+- **Quarantine store** (`quarantine/`) — captured SCP and SFTP uploads are deleted.
 - **In-memory state** — the process restart clears all VFS modifications, shell histories, and session state.
 - **Host keys are preserved** — the SSH fingerprint stays stable across resets (a changing fingerprint is a honeypot tell).
 
@@ -369,6 +372,7 @@ mimic-ssh-honeypot/
 │   │   ├── ssh.rs           SSH protocol engine (russh), channel routing
 │   │   ├── limiter.rs       Connection registry (global + per-IP caps, RAII guards)
 │   │   ├── scp.rs           SCP sink — upload capture protocol
+│   │   ├── sftp.rs          SFTP subsystem (v3) — upload capture & VFS operations
 │   │   └── hostkey.rs       Persistent Ed25519 + RSA host keys
 │   ├── shell/
 │   │   ├── mod.rs           Shell state machine, expansion, dispatch, history
