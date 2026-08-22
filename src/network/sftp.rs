@@ -343,6 +343,10 @@ impl SftpSession {
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (_, name) = Vfs::split_path(&abs);
+                if name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
                 let name = name.to_string();
 
                 if self.handles.len() >= MAX_SFTP_HANDLES {
@@ -539,6 +543,10 @@ impl SftpSession {
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
+                if name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
                 if let Some(parent_id) = shell.vfs.resolve(shell.cwd, parent_path) {
                     if shell.vfs.unlink(parent_id, name).is_some() {
                         put_status(out, id, SSH_FX_OK, "OK");
@@ -555,6 +563,10 @@ impl SftpSession {
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
+                if name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
                 if let Some(parent_id) = shell.vfs.resolve(shell.cwd, parent_path) {
                     let perms = attrs.and_then(|a| a.permissions).unwrap_or(0o755) & 0o7777;
                     shell
@@ -570,6 +582,10 @@ impl SftpSession {
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
+                if name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
                 if let Some(parent_id) = shell.vfs.resolve(shell.cwd, parent_path) {
                     if let Some(child_id) = shell.vfs.child(parent_id, name) {
                         if let Some(entries) = shell.vfs.entries(child_id) {
@@ -596,6 +612,10 @@ impl SftpSession {
                 let old_abs = normalize_path(&cwd_str, oldpath);
                 let new_abs = normalize_path(&cwd_str, newpath);
                 let (new_parent_path, new_name) = Vfs::split_path(&new_abs);
+                if new_name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
                 let old_node = shell.vfs.resolve(shell.cwd, &old_abs);
                 let new_parent = shell.vfs.resolve(shell.cwd, new_parent_path);
                 if let (Some(old_id), Some(new_p_id)) = (old_node, new_parent) {
@@ -613,6 +633,10 @@ impl SftpSession {
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
+                if name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
                 let resolved = shell
                     .vfs
                     .resolve(shell.cwd, parent_path)
@@ -634,8 +658,17 @@ impl SftpSession {
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs_link = normalize_path(&cwd_str, linkpath);
                 let (parent_path, name) = Vfs::split_path(&abs_link);
+                if name.is_empty() {
+                    put_status(out, id, SSH_FX_FAILURE, "Invalid path");
+                    return;
+                }
+                let target_sanitized: String = targetpath
+                    .replace('\\', "/")
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect();
                 if let Some(parent_id) = shell.vfs.resolve(shell.cwd, parent_path) {
-                    shell.vfs.add_symlink(parent_id, name, targetpath);
+                    shell.vfs.add_symlink(parent_id, name, &target_sanitized);
                     put_status(out, id, SSH_FX_OK, "OK");
                 } else {
                     put_status(out, id, SSH_FX_NO_SUCH_FILE, "No such file or directory");
@@ -649,12 +682,17 @@ impl SftpSession {
 }
 
 fn normalize_path(cwd: &str, path: &str) -> String {
-    let raw = if path.starts_with('/') {
-        path.to_string()
+    let sanitized: String = path
+        .replace('\\', "/")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let raw = if sanitized.starts_with('/') {
+        sanitized
     } else if cwd == "/" {
-        format!("/{path}")
+        format!("/{sanitized}")
     } else {
-        format!("{cwd}/{path}")
+        format!("{cwd}/{sanitized}")
     };
     let mut parts = Vec::new();
     for comp in raw.split('/') {
@@ -1199,5 +1237,58 @@ mod tests {
         });
         let (out, _) = session.feed(&rmdir_pkt, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_STATUS);
+    }
+
+    #[test]
+    fn sftp_rejects_empty_final_path_components_and_sanitizes_separators() {
+        let mut session = SftpSession::new();
+        let mut shell = test_shell();
+
+        // normalize_path strips control characters and converts backslashes
+        assert_eq!(normalize_path("/root", r"a\b\c"), "/root/a/b/c");
+        assert_eq!(
+            normalize_path("/root", "/tmp/bot\x00\x1b.elf"),
+            "/tmp/bot.elf"
+        );
+
+        // Opening "/" for write is rejected
+        let open_root_pkt = make_pkt(SSH_FXP_OPEN, |p| {
+            put_u32(p, 10);
+            put_str(p, "/");
+            put_u32(p, SSH_FXF_WRITE);
+            put_u32(p, 0);
+        });
+        let (out1, _) = session.feed(&open_root_pkt, &mut shell, 1024);
+        assert_eq!(out1[4], SSH_FXP_STATUS);
+        let mut cur = &out1[5..];
+        let _id = get_u32(&mut cur).unwrap();
+        let code = get_u32(&mut cur).unwrap();
+        assert_eq!(code, SSH_FX_FAILURE);
+
+        // mkdir "/" is rejected
+        let mkdir_root_pkt = make_pkt(SSH_FXP_MKDIR, |p| {
+            put_u32(p, 11);
+            put_str(p, "/");
+            put_u32(p, 0);
+        });
+        let (out2, _) = session.feed(&mkdir_root_pkt, &mut shell, 1024);
+        assert_eq!(out2[4], SSH_FXP_STATUS);
+        let mut cur = &out2[5..];
+        let _id = get_u32(&mut cur).unwrap();
+        let code = get_u32(&mut cur).unwrap();
+        assert_eq!(code, SSH_FX_FAILURE);
+
+        // symlink "/" is rejected
+        let symlink_root_pkt = make_pkt(SSH_FXP_SYMLINK, |p| {
+            put_u32(p, 12);
+            put_str(p, "/");
+            put_str(p, "/tmp/target");
+        });
+        let (out3, _) = session.feed(&symlink_root_pkt, &mut shell, 1024);
+        assert_eq!(out3[4], SSH_FXP_STATUS);
+        let mut cur = &out3[5..];
+        let _id = get_u32(&mut cur).unwrap();
+        let code = get_u32(&mut cur).unwrap();
+        assert_eq!(code, SSH_FX_FAILURE);
     }
 }
