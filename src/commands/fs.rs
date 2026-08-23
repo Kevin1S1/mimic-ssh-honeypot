@@ -2107,7 +2107,8 @@ pub fn cp(shell: &mut Shell, args: &[String]) -> CommandResult {
         );
     }
 
-    let dest = operands.pop().unwrap();
+    // The length check above refused anything shorter than two operands.
+    let dest = operands.pop().expect("at least two operands");
     let dest_dir = shell
         .vfs
         .resolve(shell.cwd, dest)
@@ -2177,7 +2178,8 @@ pub fn mv(shell: &mut Shell, args: &[String]) -> CommandResult {
         );
     }
 
-    let dest = operands.pop().unwrap();
+    // The length check above refused anything shorter than two operands.
+    let dest = operands.pop().expect("at least two operands");
     let dest_dir = shell
         .vfs
         .resolve(shell.cwd, dest)

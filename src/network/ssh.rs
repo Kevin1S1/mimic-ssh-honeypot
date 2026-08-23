@@ -1132,10 +1132,12 @@ impl Handler for MimicHandler {
     ) -> Result<(), Self::Error> {
         // Route bytes to the SFTP subsystem when active.
         if self.sftp.is_some() {
+            // Builds the shell if this is the first use, so the borrow below
+            // always finds one.
             let _ = self.shell();
             let (resp, uploads) = {
                 let max_bytes = self.config.max_upload_bytes;
-                let shell = self.shell.as_mut().unwrap();
+                let shell = self.shell.as_mut().expect("shell just initialised");
                 let sftp = self.sftp.as_mut().expect("sftp active");
                 sftp.feed(data, shell, max_bytes)
             };
@@ -1190,8 +1192,10 @@ impl Handler for MimicHandler {
             if self.password_buf.is_some() {
                 match byte {
                     b'\r' | b'\n' => {
-                        let password = String::from_utf8_lossy(self.password_buf.as_ref().unwrap())
-                            .into_owned();
+                        let password = String::from_utf8_lossy(
+                            self.password_buf.as_ref().expect("collecting"),
+                        )
+                        .into_owned();
                         self.password_buf = None;
                         session.data(channel, b"\r\n".to_vec())?;
 
@@ -1311,8 +1315,10 @@ impl Handler for MimicHandler {
         if self.scp.take().is_some() {
             self.end_channel(channel, session, 0)?;
         } else if let Some(sftp) = self.sftp.take() {
+            // Builds the shell if this is the first use, as above.
             let _ = self.shell();
-            let uploads = sftp.into_pending_uploads(self.shell.as_mut().unwrap());
+            let uploads =
+                sftp.into_pending_uploads(self.shell.as_mut().expect("shell just initialised"));
             for upload in uploads {
                 self.store_sftp_upload(upload);
             }

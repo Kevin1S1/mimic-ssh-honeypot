@@ -33,12 +33,12 @@ idle_timeout_secs = 300
 # keeping a session open indefinitely with periodic keep-alive traffic.
 max_session_secs = 1800
 
-# Directory where files uploaded over SCP are quarantined. Captured payloads
+# Directory where files uploaded over SCP/SFTP are quarantined. Captured payloads
 # are written here named by their SHA-256 hash (content-addressed, deduplicated).
 quarantine_dir = "/data/quarantine"
 
 # Maximum number of bytes stored per uploaded file. Larger uploads are still
-# fully consumed off the wire (to keep the SCP protocol in sync) but truncated
+# fully consumed off the wire (to keep the transfer protocol in sync) but truncated
 # in the quarantine store. Default: 8 MiB.
 max_upload_bytes = 8388608
 
