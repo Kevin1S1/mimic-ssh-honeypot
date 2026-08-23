@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them, so the shipper config cannot drift from what the sensor emits.
 
 ### Security
+- `SECURITY.md` documents that `python3`/`perl` emulate the invocation only and
+  never evaluate a payload, and extends T1/T4 and the fake-networking section to
+  cover `nc` and the interpreters. The claims were already true of the code; a
+  reader had no way to confirm it from the document.
 - `logging.retention_days` now means days. It was passed straight to
   `tracing-appender`'s `max_log_files`, which counts *files* — the two coincide
   only while the process runs every single day, so a sensor that was down for a
