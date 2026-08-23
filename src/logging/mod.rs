@@ -123,7 +123,7 @@ pub fn init(config: &LoggingConfig) -> Result<Option<WorkerGuard>> {
 /// sensor. The number of files removed is returned so the caller can log it.
 fn prune_expired(dir: &std::path::Path, retention_days: usize) -> usize {
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
-        retention_days as u64 * 86_400,
+        (retention_days as u64).saturating_mul(86_400),
     )) else {
         // Only reachable with a system clock set near the epoch. Nothing can
         // predate the cutoff, so there is nothing to prune.
