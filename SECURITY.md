@@ -20,8 +20,12 @@ All emulated commands (`ls`, `cat`, `rm`, `touch`, etc.) operate purely on the `
 - There are no symlink traversal vulnerabilities to the real host because the real host's filesystem is completely decoupled from the VFS.
 - The node arena is kept **acyclic**: `Vfs::rename` refuses to move a directory into itself or into its own subtree (`mv a a/b`), exactly as real `mv` does. A cycle would make every tree walk — path rendering, `find`, `grep -r`, `chmod -R` — run forever, which is a whole-process failure rather than a per-session one. `path_of` is additionally bounded by the arena size as defence-in-depth.
 
-### 4. Fake Networking (`wget`, `curl`, `ping`)
+### 4. Fake Networking (`wget`, `curl`, `ping`, `nc`) and Fake Interpreters (`python3`, `perl`)
 When an attacker attempts to download a malicious payload via `wget` or `curl`, the honeypot fakes the download progress, generates a fake IP resolution, and drops a placeholder of the reported size — bounded by the VFS content cap — into the in-memory VFS. It never actually opens a network socket to fetch the file, preventing the honeypot from being used in DDoS amplification attacks or as an open proxy.
+
+`nc` follows the same rule: no socket is opened, and every connect reports `Connection refused`. The remote endpoint is recorded as a `download` event, so the intelligence is kept without the traffic.
+
+`python3` and `perl` are emulated **at the invocation only — no interpreter exists and no attacker code is ever run**, which is the same guarantee T1 makes for every other command. The `-c`/`-e` payload is already captured verbatim in the `command` event, which is where the value is; what the emulation adds is a plausible outcome rather than `command not found`. A one-liner that opens a socket is answered with the traceback a failed connect produces — its endpoint captured the same way `nc`'s is — and anything else exits quietly. Nothing in the payload string is parsed as code: it is scanned only for a quoted host and a nearby integer, and is otherwise treated as opaque text.
 
 ### 5. Safe SCP and SFTP Quarantining
 The only time the honeypot touches the real disk based on attacker input is during an SCP or SFTP upload. This is heavily sanitized:
@@ -87,10 +91,10 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 
 | # | Attack | Vector | Mitigation | Residual risk |
 |---|---|---|---|---|
-| T1 | Remote code execution | Any typed command / exec request | No `std::process` reachable from emulation layers; build-enforced by `escape_vectors` test | None by design |
+| T1 | Remote code execution | Any typed command / exec request, including `python3 -c` / `perl -e` / `sh` payloads | No `std::process` reachable from emulation layers; build-enforced by `escape_vectors` test. The interpreters emulate the *invocation* only — no payload is ever evaluated | None by design |
 | T2 | Real filesystem read/write | `cat`, `rm`, `cp`, path traversal | All ops act on the in-memory `Vfs`; real FS decoupled | None by design |
 | T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; unit tests covering malformed UTF-8, control-byte floods, oversized lines and truncated packets in the line editor and the SFTP/SCP decoders | Unknown bug in a dependency |
-| T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping` to attacker host | Network commands are faked; no real socket opened | None by design |
+| T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping`/`nc`, or a `python3`/`perl` socket one-liner, aimed at an attacker host | Network commands are faked; no real socket opened. Endpoints are logged, never contacted | None by design |
 | T5 | Disk exhaustion | SCP / SFTP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec, per-session quarantine disk-write cap (`max_upload_bytes` × 32) | Bounded per session; capped total across sessions only by the daily reset |
 | T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output, SSH channel flood | Shipped defaults cap connections at 32 globally/4 per IP under a 1 GiB process ceiling; each connection permits one active channel; VFS ≤ 2k nodes and ≤ 8 MiB content bytes; uploads ≤ 8 MiB; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session and by deployment memory controls |
 | T7 | Connection flood | TCP/SSH flood | Per-IP + global caps enforced at accept time, before crypto | Bounded by OS accept rate |
