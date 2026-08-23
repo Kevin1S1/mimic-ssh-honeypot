@@ -17,8 +17,8 @@ use crate::shell::line::{is_continuation, LineEditor, Reaction};
 use crate::shell::{Capture, Output, Shell};
 
 use anyhow::{Context, Result};
-use russh::server::{Auth, Config as ServerConfig, Handler, Msg, Session};
-use russh::{Channel, ChannelId, Disconnect, MethodKind, MethodSet};
+use russh::server::{Auth, ChannelOpenHandle, Config as ServerConfig, Handler, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodKind, MethodSet};
 // What `Handle::data` takes, reached through russh's own re-export so this
 // stays free of a direct `bytes` dependency.
 use russh::keys::ssh_encoding::bytes::Bytes;
@@ -1226,10 +1226,18 @@ impl Handler for MimicHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.log_client_banner(session);
-        Ok(self.try_open_channel(channel.id().number()))
+        if self.try_open_channel(channel.id().number()) {
+            reply.accept().await;
+        } else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+        }
+        Ok(())
     }
 
     /// A real Debian sshd always answers `pty-req` with success. russh's
