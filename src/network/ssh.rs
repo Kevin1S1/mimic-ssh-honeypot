@@ -1030,8 +1030,16 @@ impl MimicHandler {
             }
         };
 
+        // The returned path is what the `upload` event records, so it must be
+        // where the file actually went. Mirroring into the VFS is best-effort —
+        // it has its own node and byte caps — and when either refuses, the
+        // honest answer is the path the attacker asked for, not `path_of` of a
+        // parent directory that happens to be what the arena handed back.
+        let intended = format!("{}/{name}", dir_path.trim_end_matches('/'));
         let shell = self.shell();
-        let parent = shell.vfs.mkdir_p(&dir_path, 0o755, uid, gid);
+        let Some(parent) = shell.vfs.mkdir_p(&dir_path, 0o755, uid, gid) else {
+            return intended;
+        };
         let id = shell.vfs.add_file(
             parent,
             &name,
@@ -1040,6 +1048,9 @@ impl MimicHandler {
             uid,
             gid,
         );
+        if id == parent {
+            return intended;
+        }
         shell.vfs.path_of(id)
     }
 }

@@ -304,15 +304,27 @@ impl Vfs {
 
     /// Create every directory along `path` (like `mkdir -p`), returning the
     /// id of the final directory. `path` must be absolute.
-    pub fn mkdir_p(&mut self, path: &str, perms: u32, uid: u32, gid: u32) -> NodeId {
+    ///
+    /// Returns `None` if any component could not be created because the arena
+    /// hit the node cap. Callers must not fall back to the last id that did
+    /// exist: that is an *ancestor* of the requested path, and writing into it
+    /// puts the file somewhere other than where the caller reports it went.
+    pub fn mkdir_p(&mut self, path: &str, perms: u32, uid: u32, gid: u32) -> Option<NodeId> {
         let mut current = self.root;
         for comp in path.split('/') {
             if comp.is_empty() || comp == "." {
                 continue;
             }
-            current = self.mkdir(current, comp, perms, uid, gid);
+            let next = self.mkdir(current, comp, perms, uid, gid);
+            // `mkdir` returns `parent` unchanged when the node cap drops the
+            // new directory. A real child always has a distinct id, so this
+            // comparison is unambiguous.
+            if next == current {
+                return None;
+            }
+            current = next;
         }
-        current
+        Some(current)
     }
 
     /// Create an empty regular file under `parent` with the given name if it
@@ -553,10 +565,24 @@ mod tests {
     fn mkdir_p_creates_and_reuses_chain() {
         let mut fs = fixture();
         let made = fs.mkdir_p("/var/log/app", 0o755, 0, 0);
-        assert_eq!(fs.resolve(fs.root(), "/var/log/app"), Some(made));
+        assert_eq!(fs.resolve(fs.root(), "/var/log/app"), made);
         // Re-running over an existing prefix reuses nodes rather than duplicating.
         let again = fs.mkdir_p("/var/log/app", 0o755, 0, 0);
         assert_eq!(again, made);
+    }
+
+    #[test]
+    fn mkdir_p_reports_failure_instead_of_an_ancestor() {
+        let mut fs = Vfs::new();
+        let root = fs.root();
+        while fs.nodes.len() < MAX_VFS_NODES {
+            fs.mkdir(root, &format!("d{}", fs.nodes.len()), 0o755, 0, 0);
+        }
+        // With the arena full the chain cannot be created. Returning the last
+        // existing ancestor would send a caller's write to the wrong directory,
+        // so the failure has to be visible.
+        assert_eq!(fs.mkdir_p("/srv/deep/tree", 0o755, 0, 0), None);
+        assert!(fs.resolve(root, "/srv").is_none());
     }
 
     #[test]

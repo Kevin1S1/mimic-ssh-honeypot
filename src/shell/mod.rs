@@ -1175,12 +1175,16 @@ fn push_value(out: &mut String, value: &str, in_double: bool) {
 }
 
 /// Ensure `home_path` exists in `vfs`, creating it with skeleton dotfiles if
-/// the account is one the snapshot does not ship. Returns the home node id.
+/// the account is one the snapshot does not ship. Returns the home node id, or
+/// the root when the arena is too full to create it — which is what real sshd
+/// does after "Could not chdir to home directory".
 fn ensure_home(vfs: &mut Vfs, home_path: &str, uid: u32, gid: u32) -> NodeId {
     if let Some(id) = vfs.resolve(vfs.root(), home_path) {
         return id;
     }
-    let home = vfs.mkdir_p(home_path, 0o755, uid, gid);
+    let Some(home) = vfs.mkdir_p(home_path, 0o755, uid, gid) else {
+        return vfs.root();
+    };
     vfs.add_file(home, ".bashrc", &b"# ~/.bashrc\n"[..], 0o644, uid, gid);
     vfs.add_file(home, ".profile", &b"# ~/.profile\n"[..], 0o644, uid, gid);
     home
