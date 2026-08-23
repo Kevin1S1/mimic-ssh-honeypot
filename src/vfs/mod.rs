@@ -360,6 +360,13 @@ impl Vfs {
     /// this keeps every other [`NodeId`] stable, which matters because callers
     /// hold ids across mutations. Orphaned slots are unreachable and bounded by
     /// the per-session lifetime, so the leak is acceptable for a honeypot.
+    ///
+    /// ponytail: a tombstone's bytes are never returned to `content_bytes`, so
+    /// the budget only ever shrinks. Safe — the cap still holds — but
+    /// observable: after enough write/delete churn in one session every write
+    /// reports `No space left on device` on a box `df` shows as mostly empty.
+    /// Upgrade when the arena grows a free list, which is also what would let
+    /// node ids be reused safely.
     pub fn unlink(&mut self, parent: NodeId, name: &str) -> Option<NodeId> {
         match &mut self.nodes[parent].kind {
             NodeKind::Directory { children } => children.remove(name),

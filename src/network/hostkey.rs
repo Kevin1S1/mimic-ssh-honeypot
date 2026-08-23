@@ -72,6 +72,11 @@ fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     file.write_all(contents)
 }
 
+// ponytail: off Unix the key is written with default permissions — there is
+// no `0600` equivalent applied. Windows is a development platform only (the
+// deployment targets are Docker and systemd), and SECURITY.md T11 scopes the
+// at-rest claims to Unix for the same reason. Upgrade if a Windows
+// deployment is ever supported, which would need an ACL, not a mode.
 #[cfg(not(unix))]
 fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)

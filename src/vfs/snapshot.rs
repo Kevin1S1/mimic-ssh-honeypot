@@ -14,15 +14,20 @@ const USR_BIN: &[&str] = &[
     "apt",
     "apt-get",
     "arch",
+    "base64",
+    "basename",
     "bash",
     "cat",
+    "chattr",
     "chmod",
     "clear",
     "cp",
     "crontab",
     "curl",
+    "cut",
     "date",
     "df",
+    "dirname",
     "dmesg",
     "dpkg",
     "echo",
@@ -30,49 +35,173 @@ const USR_BIN: &[&str] = &[
     "false",
     "find",
     "free",
+    "getent",
     "grep",
     "groups",
     "head",
     "hostname",
     "id",
     "kill",
+    "killall",
     "last",
     "ls",
+    "lsattr",
     "lsb_release",
     "lscpu",
     "mkdir",
     "mount",
     "mv",
     "netstat",
+    "nl",
+    "nohup",
     "nproc",
+    "passwd",
+    "pgrep",
+    "pidof",
     "ping",
     "pkill",
     "printenv",
+    "printf",
     "ps",
     "pwd",
+    "rev",
     "rm",
     "rmdir",
     "scp",
+    "sed",
+    "seq",
     "sh",
+    "sha256sum",
+    "sha512sum",
+    "sleep",
+    "sort",
     "su",
     "sudo",
+    "sync",
+    "systemctl",
     "tail",
     "tar",
+    "tee",
     "top",
     "touch",
+    "tr",
     "true",
     "tty",
     "uname",
+    "uniq",
     "uptime",
     "w",
     "wc",
     "wget",
     "which",
     "whoami",
+    "xargs",
 ];
 
 /// Binaries in `/usr/sbin`, matching the paths `which` reports for them.
-const USR_SBIN: &[&str] = &["ip", "ss"];
+const USR_SBIN: &[&str] = &[
+    "addgroup", "adduser", "chpasswd", "deluser", "groupadd", "ip", "nologin", "service", "ss",
+    "useradd", "userdel",
+];
+
+/// `/etc/ssh/sshd_config` as Debian 12 ships it.
+///
+/// Kept faithful to the stock file — almost all of it is commented defaults —
+/// with one deliberate departure: `MaxAuthTries 6` is written out rather than
+/// left commented, because the server really does enforce 6. A config that
+/// disagreed with observable behaviour would be worse than no config at all.
+const SSHD_CONFIG: &str = "# This is the sshd server system-wide configuration file.  See\n\
+# sshd_config(5) for more information.\n\
+\n\
+Include /etc/ssh/sshd_config.d/*.conf\n\
+\n\
+#Port 22\n\
+#AddressFamily any\n\
+#ListenAddress 0.0.0.0\n\
+#ListenAddress ::\n\
+\n\
+#HostKey /etc/ssh/ssh_host_rsa_key\n\
+#HostKey /etc/ssh/ssh_host_ecdsa_key\n\
+#HostKey /etc/ssh/ssh_host_ed25519_key\n\
+\n\
+# Ciphers and keying\n\
+#RekeyLimit default none\n\
+\n\
+# Logging\n\
+#SyslogFacility AUTH\n\
+#LogLevel INFO\n\
+\n\
+# Authentication:\n\
+\n\
+#LoginGraceTime 2m\n\
+#PermitRootLogin prohibit-password\n\
+#StrictModes yes\n\
+MaxAuthTries 6\n\
+#MaxSessions 10\n\
+\n\
+#PubkeyAuthentication yes\n\
+\n\
+# Expect .ssh/authorized_keys2 to be disregarded by default in future.\n\
+#AuthorizedKeysFile\t.ssh/authorized_keys .ssh/authorized_keys2\n\
+\n\
+#AuthorizedPrincipalsFile none\n\
+\n\
+# To disable tunneled clear text passwords, change to no here!\n\
+#PasswordAuthentication yes\n\
+#PermitEmptyPasswords no\n\
+\n\
+# Change to yes to enable challenge-response passwords (beware issues with\n\
+# some PAM modules and threads)\n\
+KbdInteractiveAuthentication no\n\
+\n\
+UsePAM yes\n\
+\n\
+#AllowAgentForwarding yes\n\
+#AllowTcpForwarding yes\n\
+#GatewayPorts no\n\
+X11Forwarding yes\n\
+#X11DisplayOffset 10\n\
+#PrintMotd yes\n\
+#PrintLastLog yes\n\
+#TCPKeepAlive yes\n\
+#PermitUserEnvironment no\n\
+#Compression delayed\n\
+#ClientAliveInterval 0\n\
+#ClientAliveCountMax 3\n\
+#UseDNS no\n\
+#PidFile /run/sshd.pid\n\
+#MaxStartups 10:30:100\n\
+#PermitTunnel no\n\
+#Banner none\n\
+\n\
+# Allow client to pass locale environment variables\n\
+AcceptEnv LANG LC_*\n\
+\n\
+# override default of no subsystems\n\
+Subsystem\tsftp\t/usr/lib/openssh/sftp-server\n";
+
+/// `/etc/ssh/ssh_config` as Debian 12 ships it — the client-side file, which is
+/// what makes every ordinary `ssh` send `LANG`/`LC_*` at connection time.
+const SSH_CONFIG: &str = "# This is the ssh client system-wide configuration file.  See\n\
+# ssh_config(5) for more information.\n\
+\n\
+Include /etc/ssh/ssh_config.d/*.conf\n\
+\n\
+Host *\n\
+\x20   SendEnv LANG LC_*\n\
+\x20   HashKnownHosts yes\n\
+\x20   GSSAPIAuthentication yes\n";
+
+/// `/etc/apt/sources.list` for a stock Debian 12 install. `apt update` is
+/// emulated and succeeds, so the file it would have read has to exist.
+const SOURCES_LIST: &str = "deb http://deb.debian.org/debian bookworm main\n\
+deb-src http://deb.debian.org/debian bookworm main\n\
+\n\
+deb http://deb.debian.org/debian-security/ bookworm-security main\n\
+deb-src http://deb.debian.org/debian-security/ bookworm-security main\n\
+\n\
+deb http://deb.debian.org/debian bookworm-updates main\n\
+deb-src http://deb.debian.org/debian bookworm-updates main\n";
 
 /// File contents for `/etc/os-release` on Debian 12.
 const OS_RELEASE: &str = "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n\
@@ -287,6 +416,14 @@ pub fn build(hostname: &str, persona: &Persona) -> Vfs {
     // empty file — `ls -l` shows `-` where a real one shows `c`. Upgrade when
     // the arena grows a device node kind.
     fs.add_file(dev, "null", Vec::new(), 0o666, 0, 0);
+    fs.add_file(dev, "zero", Vec::new(), 0o666, 0, 0);
+    fs.add_file(dev, "urandom", Vec::new(), 0o666, 0, 0);
+    // The pty this session is on. `tty` and `$SSH_TTY` both name `/dev/pts/0`,
+    // so a box where `ls -l /dev/pts/0` says "No such file" is contradicting
+    // itself — a cheaper check than any of the missing-content ones.
+    let pts = fs.mkdir(dev, "pts", 0o755, 0, 0);
+    fs.add_file(pts, "0", Vec::new(), 0o620, 0, 5);
+    fs.add_file(dev, "ptmx", Vec::new(), 0o666, 0, 5);
     fs.mkdir(root, "opt", 0o755, 0, 0);
     fs.mkdir(root, "run", 0o755, 0, 0);
     fs.mkdir(root, "srv", 0o755, 0, 0);
@@ -348,8 +485,25 @@ pub fn build(hostname: &str, persona: &Persona) -> Vfs {
         0,
         0,
     );
-    fs.mkdir(etc, "ssh", 0o755, 0, 0);
-    fs.mkdir(etc, "apt", 0o755, 0, 0);
+    // `cat /etc/ssh/sshd_config` is the first thing anyone runs after logging
+    // into an sshd, and an empty /etc/ssh was a one-command contradiction: the
+    // daemon you just authenticated to has no configuration. `MaxAuthTries 6`
+    // here is the same 6 the server actually enforces.
+    let etc_ssh = fs.mkdir(etc, "ssh", 0o755, 0, 0);
+    fs.add_file(etc_ssh, "sshd_config", SSHD_CONFIG, 0o644, 0, 0);
+    fs.add_file(etc_ssh, "ssh_config", SSH_CONFIG, 0o644, 0, 0);
+    // The host keys are listed by `sshd_config`. Only the public halves are
+    // materialised, and they hold this deployment's own fabricated key text —
+    // the real host key never enters the VFS.
+    for (name, body) in &persona.host_keys {
+        fs.add_file(etc_ssh, name, body.as_str(), 0o644, 0, 0);
+    }
+    // `apt update` is emulated and succeeds, so a missing sources.list is the
+    // same class of contradiction.
+    let etc_apt = fs.mkdir(etc, "apt", 0o755, 0, 0);
+    fs.add_file(etc_apt, "sources.list", SOURCES_LIST, 0o644, 0, 0);
+    fs.mkdir(etc_apt, "sources.list.d", 0o755, 0, 0);
+    fs.mkdir(etc_apt, "preferences.d", 0o755, 0, 0);
     fs.mkdir(etc, "systemd", 0o755, 0, 0);
     fs.mkdir(etc, "network", 0o755, 0, 0);
 
@@ -454,6 +608,51 @@ mod tests {
             Vec::<&&str>::new(),
             "runnable but missing from /usr/bin and /usr/sbin"
         );
+    }
+
+    /// The box asserts each of these facts through one command; a missing file
+    /// is it denying the same fact through another. These are the cheapest
+    /// checks an operator or a fingerprinting scanner has, so they are the ones
+    /// that have to hold.
+    #[test]
+    fn the_box_does_not_contradict_its_own_commands() {
+        let fs = build("srv1", &Persona::sample());
+
+        // `tty` and `$SSH_TTY` both name this pty.
+        assert!(
+            fs.resolve(fs.root(), "/dev/pts/0").is_some(),
+            "the pty `tty` reports must exist"
+        );
+        // We *are* an sshd; `AcceptEnv LANG LC_*` is what env_request honours,
+        // and `MaxAuthTries 6` is what the server really enforces.
+        let sshd_config = read(&fs, "/etc/ssh/sshd_config");
+        assert!(sshd_config.contains("MaxAuthTries 6"), "{sshd_config}");
+        assert!(sshd_config.contains("AcceptEnv LANG LC_*"), "{sshd_config}");
+        // `apt update` is emulated and succeeds.
+        assert!(read(&fs, "/etc/apt/sources.list").contains("bookworm"));
+    }
+
+    /// The `.pub` files must carry this deployment's real public host keys, not
+    /// invented ones: an attacker can compare them against the fingerprint
+    /// their own client recorded during the handshake.
+    #[test]
+    fn host_key_files_come_from_the_keys_actually_served() {
+        let persona = Persona::sample().with_host_keys(vec![(
+            "ssh_host_ed25519_key.pub".to_string(),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample root@srv1\n".to_string(),
+        )]);
+        let fs = build("srv1", &persona);
+        assert_eq!(
+            read(&fs, "/etc/ssh/ssh_host_ed25519_key.pub"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample root@srv1\n"
+        );
+        // A deployment with no keys threaded in simply has no `.pub` files —
+        // it never fabricates one.
+        let bare = build("srv1", &Persona::sample());
+        assert!(bare.resolve(bare.root(), "/etc/ssh/sshd_config").is_some());
+        assert!(bare
+            .resolve(bare.root(), "/etc/ssh/ssh_host_ed25519_key.pub")
+            .is_none());
     }
 
     #[test]
