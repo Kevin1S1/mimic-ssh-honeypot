@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shell channel that asked for no terminal (`ssh -T host < script`) no longer
   runs the line editor over its input. Real bash finds a pipe on stdin and runs
   non-interactively, so it emits no prompt, no echo of the line, and none of the
-  `[K` erase sequences redrawing a line needs; the previous behaviour sent
+  `\x1b[K` erase sequences redrawing a line needs; the previous behaviour sent
   all three plus a `Last login` banner, which is a tell for anything scripting
   the session rather than typing into it. `logout` is likewise only printed by an
   *interactive* login shell, so `ssh host exit` and a piped session now exit
