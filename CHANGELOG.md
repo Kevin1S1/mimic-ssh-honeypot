@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downloads, directory listings, and filesystem operations, quarantining uploaded
   payloads and recording structured `subsystem_request` and `upload` events.
 
+### Fixed
+- `deploy/mimic.toml` described the quarantine store as SCP-only. SFTP uploads
+  land in it too, so the shipped reference config now says so.
+
 ### Security
 - Positional parameter expansion: `$#` now expands to `0`, `$0` to `-bash`,
   `$1`..`$9` to empty string, and `${#}`/`${0}`/etc. behave consistently with
