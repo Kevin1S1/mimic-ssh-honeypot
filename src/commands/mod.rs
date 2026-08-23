@@ -4,10 +4,12 @@
 //! [`Shell`] state and returns a [`CommandResult`]. No real process is ever
 //! spawned and no real path is ever touched.
 
+pub mod admin;
 pub mod fs;
 pub mod net;
 pub mod pkg;
 pub mod system;
+pub mod text;
 
 use crate::shell::Shell;
 
@@ -159,6 +161,25 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "grep" => CommandHandler::Read(fs::grep),
         "find" => CommandHandler::Read(fs::find),
 
+        // Text-processing plumbing. These are what shell one-liners are made
+        // of: a pipeline dies at its first `command not found`, so their
+        // absence hid everything downstream of them.
+        "base64" => CommandHandler::Read(text::base64),
+        "sed" => CommandHandler::Read(text::sed),
+        "cut" => CommandHandler::Read(text::cut),
+        "tr" => CommandHandler::Read(text::tr),
+        "sort" => CommandHandler::Read(text::sort),
+        "uniq" => CommandHandler::Read(text::uniq),
+        "basename" => CommandHandler::Read(text::basename),
+        "dirname" => CommandHandler::Read(text::dirname),
+        "rev" => CommandHandler::Read(text::rev),
+        "nl" => CommandHandler::Read(text::nl),
+        "seq" => CommandHandler::Read(text::seq),
+        "tee" => CommandHandler::Mut(text::tee),
+        "xargs" => CommandHandler::Mut(text::xargs),
+        "sha256sum" => CommandHandler::Read(text::sha256sum),
+        "sha512sum" => CommandHandler::Read(text::sha512sum),
+
         // Filesystem mutations (operate on the per-session VFS only).
         "touch" => CommandHandler::Mut(fs::touch),
         "mkdir" => CommandHandler::Mut(fs::mkdir),
@@ -186,10 +207,31 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "bash" | "sh" => CommandHandler::Mut(system::shell_cmd),
         "scp" => CommandHandler::Mut(system::scp),
         "echo" => CommandHandler::Read(system::echo),
+        "printf" => CommandHandler::Read(system::printf),
         "env" | "printenv" => CommandHandler::Read(system::env),
         "export" => CommandHandler::Mut(system::export),
         "unset" => CommandHandler::Mut(system::unset),
         "clear" => CommandHandler::Read(system::clear),
+
+        // Persistence and account management — what an intrusion does after it
+        // lands. All in-memory: accounts live in this session's /etc/passwd.
+        "sleep" => CommandHandler::Read(admin::sleep),
+        "passwd" => CommandHandler::Mut(admin::passwd),
+        "chpasswd" => CommandHandler::Mut(admin::chpasswd),
+        "useradd" | "adduser" => CommandHandler::Mut(admin::useradd),
+        "userdel" | "deluser" => CommandHandler::Mut(admin::userdel),
+        "groupadd" | "addgroup" => CommandHandler::Mut(admin::groupadd),
+        "systemctl" => CommandHandler::Read(admin::systemctl),
+        "service" => CommandHandler::Read(admin::service),
+        "chattr" => CommandHandler::Read(admin::chattr),
+        "lsattr" => CommandHandler::Read(admin::lsattr),
+        "nohup" => CommandHandler::Mut(admin::nohup),
+        "getent" => CommandHandler::Read(admin::getent),
+        "killall" => CommandHandler::Read(admin::killall),
+        "sync" => CommandHandler::Read(admin::sync),
+        "nologin" => CommandHandler::Read(admin::nologin),
+        "pidof" => CommandHandler::Read(admin::pidof),
+        "pgrep" => CommandHandler::Read(admin::pgrep),
 
         // Process-table emulation (no real process is ever signalled).
         "ps" => CommandHandler::Read(system::ps),

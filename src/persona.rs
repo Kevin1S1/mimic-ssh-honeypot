@@ -45,6 +45,16 @@ pub struct Persona {
     pub ipv4: String,
     /// The /24 this box sits on, e.g. `10.0.0`.
     pub subnet: String,
+    /// This deployment's `/etc/ssh/*.pub` files, as `(filename, contents)`.
+    ///
+    /// These carry the **public** halves of the sensor's real host keys — the
+    /// same bytes every client is handed during the key exchange, so publishing
+    /// them in the emulated filesystem discloses nothing the handshake has not
+    /// already disclosed. Fabricating them instead would be the tell: an
+    /// attacker can compare the fingerprint their client just recorded against
+    /// what `ssh-keygen -lf` would report here. The private halves never leave
+    /// `src/network/`.
+    pub host_keys: Vec<(String, String)>,
 }
 
 /// A plausible cloud/VM CPU, with the fields `/proc/cpuinfo` and `lscpu` need
@@ -226,7 +236,15 @@ impl Persona {
             mac,
             ipv4,
             subnet,
+            host_keys: Vec::new(),
         }
+    }
+
+    /// Attach this deployment's public host-key files, as the network layer
+    /// reads them off the keys it is actually serving.
+    pub fn with_host_keys(mut self, keys: Vec<(String, String)>) -> Self {
+        self.host_keys = keys;
+        self
     }
 
     /// The persona used by tests and by any caller that has no seed.

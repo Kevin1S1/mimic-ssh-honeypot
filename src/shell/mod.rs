@@ -52,6 +52,17 @@ impl Output {
         self.stdout.push_str(stdout);
         self.stderr.push_str(stderr);
     }
+
+    /// A finished [`Output`] holding one write to each stream. Used where a
+    /// prompt answers the client directly rather than through a command.
+    fn written(stdout: &str, stderr: &str, status: i32) -> Self {
+        let mut out = Output {
+            status,
+            ..Output::default()
+        };
+        out.push(stdout, stderr);
+        out
+    }
 }
 
 /// A structured event produced by a command that the network layer drains and
@@ -67,6 +78,15 @@ pub enum Capture {
         url: String,
         /// Where the body was written (a VFS path, or `-` for stdout).
         dest: String,
+    },
+    /// A password set non-interactively (`chpasswd`, `passwd`). Locking the
+    /// owner out is the most common thing an SSH botnet does once it lands, so
+    /// the new secret is captured the same way a guessed one is.
+    PasswordChange {
+        /// The account whose password was changed.
+        target: String,
+        /// The new password, in the clear.
+        password: String,
     },
     /// A password entered at an `su` prompt. The attempted secret is captured
     /// as forensic data (a guessed root/target password) before the switch.
@@ -88,6 +108,16 @@ pub enum Pending {
     SuPassword {
         /// The account to become once a password is supplied.
         target: String,
+    },
+    /// `passwd [USER]` is collecting a new secret. Real `passwd` asks twice and
+    /// refuses if the two differ, so both prompts are emulated: the second one
+    /// is where a script that pipes the same line twice succeeds and a typo
+    /// fails, which is the behaviour a bot's `passwd` wrapper is written for.
+    NewPassword {
+        /// The account whose password is being set.
+        target: String,
+        /// The first answer, once given.
+        first: Option<String>,
     },
     /// A here-document (`cat << EOF`) is collecting its body. The line that
     /// opened it runs once a line holds the delimiter and nothing else.
@@ -115,7 +145,7 @@ impl Pending {
     /// `su` writes its own; a here-document gets bash's `PS2`.
     pub fn prompt(&self) -> Option<&'static str> {
         match self {
-            Pending::SuPassword { .. } => None,
+            Pending::SuPassword { .. } | Pending::NewPassword { .. } => None,
             Pending::Heredoc { .. } => Some("> "),
         }
     }
@@ -642,6 +672,38 @@ impl Shell {
                 });
                 self.switch_user(&target);
                 Output::default()
+            }
+            Some(Pending::NewPassword {
+                target,
+                first: None,
+            }) => {
+                self.pending = Some(Pending::NewPassword {
+                    target,
+                    first: Some(input.to_string()),
+                });
+                Output::written("Retype new password: ", "", 0)
+            }
+            Some(Pending::NewPassword {
+                target,
+                first: Some(first),
+            }) => {
+                if first != input {
+                    return Output::written(
+                        "",
+                        "Sorry, passwords do not match.\n\
+                         passwd: Authentication token manipulation error\n\
+                         passwd: password unchanged\n",
+                        1,
+                    );
+                }
+                // The plaintext is the forensic value; the emulated shadow file
+                // only ever holds a crypt-shaped placeholder.
+                self.captures.push(Capture::PasswordChange {
+                    target: target.clone(),
+                    password: first.clone(),
+                });
+                commands::admin::set_shadow_entry(self, &target);
+                Output::written("passwd: password updated successfully\n", "", 0)
             }
             Some(Pending::Heredoc {
                 command,

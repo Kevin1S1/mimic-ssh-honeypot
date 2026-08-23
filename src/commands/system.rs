@@ -177,10 +177,17 @@ pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
 
 /// `bash`/`sh` — the shell this session already claims to be.
 ///
-/// `-c LINE` runs the line, which is how bot payloads usually arrive
-/// (`sh -c "cd /tmp; wget ...; ./x"`). Without `-c` a real shell would start an
-/// interactive subshell: since the emulated prompt is identical either way,
-/// returning immediately is indistinguishable to the attacker.
+/// Three ways a payload arrives, all of which now run:
+///
+/// - `-c LINE`, the classic `sh -c "cd /tmp; wget ...; ./x"`;
+/// - piped stdin, which is what `... | base64 -d | sh` and `curl ... | sh`
+///   produce — the single most common staging idiom there is;
+/// - a script operand, read back out of the VFS, which is what the
+///   `wget`-then-`chmod +x`-then-run sequence ends in.
+///
+/// Each line of a script or of stdin is run through the same shell that would
+/// have run it interactively, so the nesting cap and the output cap apply
+/// exactly as they do everywhere else.
 pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -197,13 +204,137 @@ pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
             }
             // Interactive/login flags change nothing here.
             "-i" | "-l" | "-s" | "--login" | "-" => {}
-            // ponytail: a script operand runs nothing (an empty script is the
-            // honest reading of a VFS file with no executable semantics);
-            // upgrade when the VFS can actually interpret file contents.
-            _ => return CommandResult::ok(""),
+            other if other.starts_with('-') => {}
+            // A script operand: read it out of the VFS and run it.
+            other => {
+                let Some(id) = shell.vfs.resolve(shell.cwd, other) else {
+                    return CommandResult::err(
+                        format!("bash: {other}: No such file or directory\n"),
+                        127,
+                    );
+                };
+                let text = match &shell.vfs.node(id).kind {
+                    crate::vfs::NodeKind::File { contents } => {
+                        String::from_utf8_lossy(contents).into_owned()
+                    }
+                    _ => {
+                        return CommandResult::err(format!("bash: {other}: Is a directory\n"), 126)
+                    }
+                };
+                return run_script(shell, &text);
+            }
         }
     }
-    CommandResult::ok("")
+
+    // No `-c` and no operand: a real shell reads its stdin. Over a pipe that is
+    // the payload; with no pipe there is nothing to read and it exits.
+    match shell.stdin.clone() {
+        Some(text) if !text.trim().is_empty() => run_script(shell, &text),
+        _ => CommandResult::ok(""),
+    }
+}
+
+/// How many lines of a script or of piped stdin `sh` will run.
+///
+/// The output cap alone does not bound this: a script of a million `true` lines
+/// produces nothing to truncate and still costs a parse per line. A VFS file
+/// can hold 8 MiB, so without a line cap an attacker buys arbitrary CPU for one
+/// upload.
+const MAX_SCRIPT_LINES: usize = 4096;
+
+/// Run each line of `text` as a shell command, accumulating both streams.
+///
+/// This is what makes a dropped script observable: the download was already
+/// captured, but until the body actually ran, nothing downstream of it — the
+/// second-stage fetch, the persistence attempt, the credential change — was
+/// ever seen.
+fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
+    let mut out = String::new();
+    let mut errs = String::new();
+    let mut status = 0;
+
+    for line in text.lines().take(MAX_SCRIPT_LINES) {
+        let line = line.trim();
+        // Shebangs and comments are not commands.
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let result = shell.execute(line);
+        // `stdout` is the pipe view and `text` the terminal-combined one; a
+        // script's output is going onward as a stream, so only the former.
+        out.push_str(&result.stdout);
+        errs.push_str(&result.stderr);
+        status = result.status;
+        if result.exit {
+            break;
+        }
+        // Bounded like every other accumulated stream.
+        if out.len() + errs.len() > super::MAX_COMMAND_OUTPUT_BYTES {
+            break;
+        }
+    }
+    CommandResult::streams(out, errs, status)
+}
+
+/// `printf FORMAT [ARG]...`
+///
+/// Scripts reach for `printf` wherever `echo`'s portability is in doubt, which
+/// in practice means anywhere a payload builds a multi-line file.
+pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
+    let Some(format) = args.first() else {
+        return CommandResult::err("printf: usage: printf [-v var] format [arguments]\n", 2);
+    };
+    let mut operands = args[1..].iter();
+    let mut out = String::new();
+    let chars: Vec<char> = format.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                match chars[i + 1] {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '0' => out.push('\0'),
+                    '\\' => out.push('\\'),
+                    // An unknown escape is passed through as written, the way
+                    // bash's printf does rather than swallowing the backslash.
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                i += 2;
+            }
+            '%' if i + 1 < chars.len() => {
+                match chars[i + 1] {
+                    '%' => out.push('%'),
+                    's' => out.push_str(operands.next().map(String::as_str).unwrap_or("")),
+                    'd' | 'i' => {
+                        let v: i64 = operands
+                            .next()
+                            .and_then(|a| a.trim().parse().ok())
+                            .unwrap_or(0);
+                        out.push_str(&v.to_string());
+                    }
+                    other => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                }
+                i += 2;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+        if out.len() > super::MAX_COMMAND_OUTPUT_BYTES {
+            break;
+        }
+    }
+    CommandResult::ok(out)
 }
 
 /// `scp` run as an interactive command.
@@ -679,6 +810,41 @@ fn invocation(name: &str, args: &[String]) -> String {
 /// Build the full table including this session's own login chain. `running` is
 /// the command asking for the table: it is itself in the process list it
 /// prints, so `top` must not report `ps aux` as the process at the top.
+/// The `(pid, command)` pairs the fabricated process table holds.
+///
+/// `pidof`, `pgrep` and `killall` all read this, so none of them can disagree
+/// with what `ps` prints — three commands inventing their own tables would
+/// contradict each other on the first cross-check.
+pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
+    session_table(shell, "ps")
+        .into_iter()
+        .map(|p| (p.pid, p.cmd))
+        .collect()
+}
+
+/// The executable name a `ps` command line reports, the way `/proc/PID/comm`
+/// would: the first word, minus any directory, minus the `sshd: ` title prefix
+/// a privilege-separated daemon rewrites its argv to, minus the brackets a
+/// kernel thread is shown in.
+///
+/// Without this, `pidof sshd` misses the one process an attacker is guaranteed
+/// to look for — `ps` prints `sshd: /usr/sbin/sshd -D [listener]`, whose first
+/// word is `sshd:`.
+pub fn process_name(cmd: &str) -> &str {
+    let first = cmd.split_whitespace().next().unwrap_or(cmd);
+    let first = first.strip_suffix(':').unwrap_or(first);
+    let first = first.rsplit('/').next().unwrap_or(first);
+    first.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// The pid of the first process whose executable name is `name`, if any.
+pub fn process_pid(shell: &Shell, name: &str) -> Option<u32> {
+    process_table(shell)
+        .into_iter()
+        .find(|(_, cmd)| process_name(cmd) == name)
+        .map(|(pid, _)| pid)
+}
+
 fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
     let mut table = base_table();
     let user = shell.username.clone();
@@ -1127,7 +1293,8 @@ fn binary_path(name: &str) -> Option<String> {
         return None;
     }
     let dir = match name {
-        "ip" | "ss" => "/usr/sbin",
+        "addgroup" | "adduser" | "chpasswd" | "deluser" | "groupadd" | "ip" | "nologin"
+        | "service" | "ss" | "useradd" | "userdel" => "/usr/sbin",
         _ => "/usr/bin",
     };
     Some(format!("{dir}/{name}"))
@@ -1407,6 +1574,51 @@ mod tests {
 
     fn run(shell: &mut Shell, line: &str) -> String {
         shell.execute(line).text
+    }
+
+    /// The whole point of running a dropped script: the download was already
+    /// captured, but nothing downstream of it was observable until the body
+    /// actually ran.
+    #[test]
+    fn a_dropped_script_runs_its_body() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir -p /tmp/.x");
+        shell.execute("printf '#!/bin/sh\\nid\\nwhoami\\n' > /tmp/.x/p.sh");
+        let out = shell.execute("sh /tmp/.x/p.sh");
+        assert!(out.stdout.contains("uid=0(root)"), "{:?}", out.stdout);
+        assert!(out.stdout.contains("root\n"), "{:?}", out.stdout);
+        // A missing script fails the way a real shell reports it.
+        let missing = shell.execute("sh /tmp/nope.sh");
+        assert_eq!(missing.status, 127);
+    }
+
+    /// A script that runs itself is the obvious way to turn one upload into an
+    /// unbounded stack. `dispatch`'s nesting cap has to catch it, because a
+    /// stack overflow aborts the whole process rather than one session.
+    #[test]
+    fn a_self_running_script_hits_the_nesting_cap() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("echo 'sh /tmp/loop.sh' > /tmp/loop.sh");
+        let out = shell.execute("sh /tmp/loop.sh");
+        assert!(
+            out.stderr.contains("Resource temporarily unavailable"),
+            "recursion was not bounded: {:?}",
+            out.stderr
+        );
+    }
+
+    /// A script's line count is not bounded by the output cap: a million `true`
+    /// lines produce nothing to truncate and still cost a parse each.
+    #[test]
+    fn a_script_runs_at_most_the_line_cap() {
+        let mut shell = Shell::new("root", "debian");
+        let body = "echo x\n".repeat(super::MAX_SCRIPT_LINES + 500);
+        let out = shell.execute(&format!("printf '%s' '{body}' | sh"));
+        assert_eq!(
+            out.stdout.matches('x').count(),
+            super::MAX_SCRIPT_LINES,
+            "line cap not applied"
+        );
     }
 
     #[test]

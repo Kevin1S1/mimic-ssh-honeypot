@@ -53,10 +53,10 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
     // so it is stable across restarts (like the fingerprint) but different on
     // every sensor. Reading the key material is real I/O and belongs here; the
     // persona itself is pure data the emulation layers consume.
-    let persona = Arc::new(crate::persona::Persona::from_seed(persona_seed(
-        &host_keys,
-        &config.sensor_name,
-    )));
+    let persona = Arc::new(
+        crate::persona::Persona::from_seed(persona_seed(&host_keys, &config.sensor_name))
+            .with_host_keys(host_key_files(&host_keys)),
+    );
 
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::Password);
@@ -214,6 +214,30 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             }
         });
     }
+}
+
+/// This deployment's `/etc/ssh/*.pub` files, taken from the keys actually being
+/// served.
+///
+/// Only public halves: `to_openssh` on a `PublicKey` emits exactly the line a
+/// real `.pub` file holds, which every client already receives during the key
+/// exchange. Fabricating these instead would be a contradiction an attacker can
+/// check with one `ssh-keygen -lf` against the fingerprint their own client
+/// recorded.
+fn host_key_files(keys: &[russh::keys::PrivateKey]) -> Vec<(String, String)> {
+    keys.iter()
+        .filter_map(|key| {
+            let public = key.public_key();
+            let stem = match public.algorithm() {
+                russh::keys::Algorithm::Ed25519 => "ssh_host_ed25519_key",
+                russh::keys::Algorithm::Rsa { .. } => "ssh_host_rsa_key",
+                russh::keys::Algorithm::Ecdsa { .. } => "ssh_host_ecdsa_key",
+                _ => return None,
+            };
+            let line = public.to_openssh().ok()?;
+            Some((format!("{stem}.pub"), format!("{line}\n")))
+        })
+        .collect()
 }
 
 /// Derive this deployment's persona seed from its host keys and sensor name.
@@ -828,6 +852,21 @@ impl MimicHandler {
             match capture {
                 Capture::Download { tool, url, dest } => {
                     event::download(session_id, peer, &tool, &url, &dest);
+                }
+                Capture::PasswordChange { target, password } => {
+                    // A password set non-interactively. Logged as an auth event
+                    // so credential dashboards pick it up alongside guesses —
+                    // this is the secret the attacker chose, which is at least
+                    // as interesting as the ones they tried.
+                    event::auth_attempt(
+                        session_id,
+                        peer,
+                        &target,
+                        "chpasswd",
+                        Some(&password),
+                        None,
+                        true,
+                    );
                 }
                 Capture::SuAuth { target, password } => {
                     // A guessed password entered at an `su` prompt: log it as an
@@ -1484,6 +1523,13 @@ impl Handler for MimicHandler {
                         let output = self.shell().resume(&password);
                         if self.deliver(channel, &output, session).await? {
                             return Ok(());
+                        }
+                        // One answer can leave another prompt outstanding —
+                        // `passwd` asks twice — so stay in echo-suppressed
+                        // collection rather than drawing `PS1` over it.
+                        if self.shell().pending.as_ref().is_some_and(|p| !p.echoes()) {
+                            self.password_buf = Some(Vec::new());
+                            continue;
                         }
                         let prompt = self.shell().prompt();
                         self.editor.set_prompt(&prompt);
