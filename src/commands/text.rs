@@ -193,38 +193,54 @@ pub fn base64(shell: &Shell, args: &[String]) -> CommandResult {
 
 // --- hashes ---------------------------------------------------------------
 
+/// `md5sum [FILE]...`
+pub fn md5sum(shell: &Shell, args: &[String]) -> CommandResult {
+    digest_command(shell, args, "md5sum", |data| {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(data);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
+/// `sha1sum [FILE]...`
+pub fn sha1sum(shell: &Shell, args: &[String]) -> CommandResult {
+    digest_command(shell, args, "sha1sum", |data| {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(data);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
 /// `sha256sum [FILE]...`
 pub fn sha256sum(shell: &Shell, args: &[String]) -> CommandResult {
-    shasum(shell, args, 256)
+    digest_command(shell, args, "sha256sum", |data| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    })
 }
 
 /// `sha512sum [FILE]...`
 pub fn sha512sum(shell: &Shell, args: &[String]) -> CommandResult {
-    shasum(shell, args, 512)
+    digest_command(shell, args, "sha512sum", |data| {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update(data);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    })
 }
 
-/// The shared implementation behind both digest commands.
-///
-/// ponytail: `md5sum` and `sha1sum` are absent — both would need a digest crate
-/// this tree does not carry, while `sha2` is already here for the quarantine
-/// store. Upgrade if captured scripts are seen verifying payloads with the
-/// legacy pair.
-fn shasum(shell: &Shell, args: &[String], bits: u16) -> CommandResult {
-    use sha2::{Digest, Sha256, Sha512};
-    let tool = format!("sha{bits}sum");
+/// The shared implementation behind digest commands.
+fn digest_command(
+    shell: &Shell,
+    args: &[String],
+    tool: &str,
+    hash: impl Fn(&[u8]) -> String,
+) -> CommandResult {
     let (_, operands) = split_args(args);
-
-    let hash = |data: &[u8]| -> String {
-        if bits == 512 {
-            let mut h = Sha512::new();
-            h.update(data);
-            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-        } else {
-            let mut h = Sha256::new();
-            h.update(data);
-            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-        }
-    };
 
     if operands.is_empty() {
         let text = shell.stdin.clone().unwrap_or_default();
@@ -1228,6 +1244,27 @@ mod tests {
         let out = shell.execute("echo '!!!!' | base64 -d");
         assert_eq!(out.status, 1);
         assert!(out.stderr.contains("invalid input"), "{}", out.stderr);
+    }
+
+    #[test]
+    fn md5sum_matches_a_known_vector() {
+        let mut shell = Shell::new("root", "debian");
+        // Well-known: md5 of "abc" is 900150983cd24fb0d6963f7d28e17f72.
+        let out = run(&mut shell, "echo -n abc | md5sum");
+        assert!(out.starts_with("900150983cd24fb0d6963f7d28e17f72"), "{out}");
+        assert!(out.trim_end().ends_with("  -"), "{out}");
+    }
+
+    #[test]
+    fn sha1sum_matches_a_known_vector() {
+        let mut shell = Shell::new("root", "debian");
+        // Well-known: sha1 of "abc" is a9993e364706816aba3e25717850c26c9cd0d89d.
+        let out = run(&mut shell, "echo -n abc | sha1sum");
+        assert!(
+            out.starts_with("a9993e364706816aba3e25717850c26c9cd0d89d"),
+            "{out}"
+        );
+        assert!(out.trim_end().ends_with("  -"), "{out}");
     }
 
     #[test]

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Central forensic log field sanitisation: non-printable control characters (including ANSI escape sequences, bell, backspace, and NUL bytes) in attacker-controlled strings are hex-escaped to prevent terminal injection attacks on log viewers and SIEM operators.
 
 ### Added
+- `md5sum` and `sha1sum` digest utilities, allowing malware droppers that verify payload hashes with legacy checksums to complete without failing early on exit 127.
 - Dynamic virtual files in VFS (`/proc/uptime` and `/proc/loadavg`): `/proc/uptime` now dynamically computes uptime at read time instead of remaining a static snapshot string, defeating sleep-and-reread honeypot fingerprinting.
 - `/usr/bin`/`/usr/sbin` density: 400 real Debian 12 binary names (up from
   109), sourced from packages.debian.org filelists for coreutils, util-linux,
