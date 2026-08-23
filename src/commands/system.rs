@@ -213,14 +213,10 @@ pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
                         127,
                     );
                 };
-                let text = match &shell.vfs.node(id).kind {
-                    crate::vfs::NodeKind::File { contents } => {
-                        String::from_utf8_lossy(contents).into_owned()
-                    }
-                    _ => {
-                        return CommandResult::err(format!("bash: {other}: Is a directory\n"), 126)
-                    }
+                let Some(bytes) = shell.vfs.node(id).file_bytes() else {
+                    return CommandResult::err(format!("bash: {other}: Is a directory\n"), 126);
                 };
+                let text = String::from_utf8_lossy(&bytes).into_owned();
                 return run_script(shell, &text);
             }
         }

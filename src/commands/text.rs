@@ -12,7 +12,6 @@
 
 use super::{CommandResult, MAX_COMMAND_OUTPUT_BYTES};
 use crate::shell::Shell;
-use crate::vfs::NodeKind;
 
 /// Read the operands as files, or fall back to the pipeline's stdin when there
 /// are none — the convention every filter here follows, and what real
@@ -40,15 +39,14 @@ fn input_text(shell: &Shell, tool: &str, files: &[&str]) -> (String, String, i32
             text.push_str(shell.stdin.as_deref().unwrap_or_default());
         } else {
             match shell.vfs.resolve(shell.cwd, f) {
-                Some(id) => match &shell.vfs.node(id).kind {
-                    NodeKind::File { contents } => {
-                        text.push_str(&String::from_utf8_lossy(contents));
-                    }
-                    _ => {
+                Some(id) => {
+                    if let Some(bytes) = shell.vfs.node(id).file_bytes() {
+                        text.push_str(&String::from_utf8_lossy(&bytes));
+                    } else {
                         errs.push_str(&format!("{tool}: {f}: Is a directory\n"));
                         status = 1;
                     }
-                },
+                }
                 None => {
                     errs.push_str(&format!("{tool}: {f}: No such file or directory\n"));
                     status = 1;
@@ -238,15 +236,14 @@ fn shasum(shell: &Shell, args: &[String], bits: u16) -> CommandResult {
     let mut status = 0;
     for f in operands {
         match shell.vfs.resolve(shell.cwd, f) {
-            Some(id) => match &shell.vfs.node(id).kind {
-                NodeKind::File { contents } => {
-                    out.push_str(&format!("{}  {f}\n", hash(contents)));
-                }
-                _ => {
+            Some(id) => {
+                if let Some(bytes) = shell.vfs.node(id).file_bytes() {
+                    out.push_str(&format!("{}  {f}\n", hash(&bytes)));
+                } else {
                     errs.push_str(&format!("{tool}: {f}: Is a directory\n"));
                     status = 1;
                 }
-            },
+            }
             None => {
                 errs.push_str(&format!("{tool}: {f}: No such file or directory\n"));
                 status = 1;
@@ -924,14 +921,13 @@ pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
                 // reading out of the VFS rather than refusing.
                 let Some(path) = iter.next() else { continue };
                 match shell.vfs.resolve(shell.cwd, path) {
-                    Some(id) => match &shell.vfs.node(id).kind {
-                        NodeKind::File { contents } => {
-                            program = Some(String::from_utf8_lossy(contents).into_owned())
+                    Some(id) => {
+                        if let Some(bytes) = shell.vfs.node(id).file_bytes() {
+                            program = Some(String::from_utf8_lossy(&bytes).into_owned());
+                        } else {
+                            return CommandResult::err(format!("awk: can't open file {path}\n"), 2);
                         }
-                        _ => {
-                            return CommandResult::err(format!("awk: can't open file {path}\n"), 2)
-                        }
-                    },
+                    }
                     None => return CommandResult::err(format!("awk: can't open file {path}\n"), 2),
                 }
             }
