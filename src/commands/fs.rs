@@ -959,10 +959,13 @@ fn grep_text(
                     out.push_str(&(i + 1).to_string());
                     out.push(':');
                 }
-                // `-o` prints the matched text alone, once per occurrence.
+                // `-o` prints the matched text alone, once per occurrence —
+                // taken from the line as written, since under `-i` the haystack
+                // was lowercased to match and the original casing is what real
+                // grep prints.
                 if flags.only_matching && !flags.invert {
-                    for _ in hay.matches(needle) {
-                        out.push_str(needle);
+                    for (i, m) in hay.match_indices(needle) {
+                        out.push_str(line.get(i..i + m.len()).unwrap_or(needle));
                         out.push('\n');
                     }
                 } else {
@@ -1014,6 +1017,9 @@ mod grep_flag_tests {
             "/etc/passwd\n"
         );
         assert_eq!(run(&mut shell, "echo aXbXc | grep -o X").stdout, "X\nX\n");
+        // Under -i the match is case-insensitive but the text printed is the
+        // line's own casing, as real grep does.
+        assert_eq!(run(&mut shell, "echo aXbXc | grep -io x").stdout, "X\nX\n");
 
         // -s swallows the error but keeps the status.
         let quiet_err = run(&mut shell, "grep -s root /nosuchfile");

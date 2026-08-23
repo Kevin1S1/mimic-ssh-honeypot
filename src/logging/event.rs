@@ -254,6 +254,9 @@ pub enum CommandSource {
     Pipe,
     /// A here-document, logged whole once its delimiter closed it.
     Heredoc,
+    /// One line of a script `sh` ran out of the VFS, or of a payload piped into
+    /// it. Never typed by the client — this is the body of a dropper.
+    Script,
     /// A synthetic marker for a sub-protocol the command line started (SCP).
     Transfer,
 }
@@ -265,6 +268,7 @@ impl CommandSource {
             CommandSource::Exec => "exec",
             CommandSource::Pipe => "pipe",
             CommandSource::Heredoc => "heredoc",
+            CommandSource::Script => "script",
             CommandSource::Transfer => "transfer",
         }
     }

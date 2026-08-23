@@ -853,6 +853,13 @@ impl MimicHandler {
                 Capture::Download { tool, url, dest } => {
                     event::download(session_id, peer, &tool, &url, &dest);
                 }
+                Capture::ScriptCommand { line, status } => {
+                    // A line out of a dropped script, not one the client typed.
+                    // Without this the log shows `sh /tmp/x.sh` and nothing of
+                    // what it did — which is the intelligence running the body
+                    // exists to recover.
+                    self.log_command(&line, CommandSource::Script, Some(status));
+                }
                 Capture::PasswordChange { target, password } => {
                     // A password set non-interactively. Logged as an auth event
                     // so credential dashboards pick it up alongside guesses —
@@ -2407,6 +2414,51 @@ mod tests {
             "the redraw timer outlived the display: {:?}",
             String::from_utf8_lossy(&quiet)
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `passwd` asks twice, and *both* answers must be collected with echo
+    /// suppressed. One answer leaving another prompt outstanding is the case
+    /// the prompt loop originally missed: it would have drawn `PS1` over the
+    /// second prompt, echoed the secret in clear on the attacker's terminal,
+    /// and then run it as a command line.
+    #[tokio::test]
+    async fn passwd_suppresses_echo_for_both_prompts() {
+        let (_handle, mut channel, dir) = shell_session("passwd-echo").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel.data(&b"passwd\r"[..]).await.expect("send passwd");
+        let first = read_for(&mut channel, Duration::from_millis(300)).await;
+        let first = String::from_utf8_lossy(&first).into_owned();
+        assert!(first.contains("New password: "), "{first:?}");
+
+        channel.data(&b"hunter2\r"[..]).await.expect("first answer");
+        let second = read_for(&mut channel, Duration::from_millis(300)).await;
+        let second = String::from_utf8_lossy(&second).into_owned();
+        assert!(
+            second.contains("Retype new password: "),
+            "second prompt missing: {second:?}"
+        );
+        assert!(
+            !second.contains("hunter2"),
+            "the first answer was echoed: {second:?}"
+        );
+        assert!(
+            !second.contains("root@debian"),
+            "PS1 was drawn over the second prompt: {second:?}"
+        );
+
+        channel
+            .data(&b"hunter2\r"[..])
+            .await
+            .expect("second answer");
+        let done = read_for(&mut channel, Duration::from_millis(300)).await;
+        let done = String::from_utf8_lossy(&done).into_owned();
+        assert!(done.contains("updated successfully"), "{done:?}");
+        assert!(!done.contains("hunter2"), "the secret was echoed: {done:?}");
+        // The shell comes back afterwards.
+        assert!(done.contains("root@debian"), "no prompt after: {done:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

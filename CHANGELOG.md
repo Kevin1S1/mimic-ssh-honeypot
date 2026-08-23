@@ -79,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `chattr`, `lsattr`, `nohup`, `sleep`, `killall`, `pidof`, `pgrep`, `sync`,
   `nologin`. `echo 'root:pass' | chpasswd` is the most common post-access action
   in SSH botnet telemetry; the new secret is captured as credential data.
+- `command` events for each line of a script `sh` ran, with `source: script`
+  and the line's exit status. A `command` event is emitted per line the client
+  submits, so a dropped script's body would otherwise show as one
+  `sh /tmp/x.sh` entry and nothing of what it did.
 - `sh`/`bash` runs a script operand and piped stdin, not only `-c`. The
   `wget` → `chmod +x` → run sequence previously captured the download and not
   one byte of what the script would have done.
@@ -126,6 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run it.
 - `mkdir`, `touch` and `cp` report `No space left on device` at the VFS node cap
   instead of exiting 0 on a file that never appears.
+- A script's lines no longer overwrite each other's captures. `Shell::execute`
+  clears them on entry, so a two-stage dropper logged only its second fetch.
 - `pidof`, `pgrep` and `killall` match the executable name the way `/proc/comm`
   does, so `pidof sshd` finds the `sshd: /usr/sbin/sshd -D [listener]` entry
   that `ps` prints.
