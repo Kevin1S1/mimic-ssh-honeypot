@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Cargo advisories are already covered weekly by cargo-audit/cargo-deny in
+  # CI; this is for routine version bumps, grouped so they land as one PR
+  # instead of one per crate.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-dependencies:
+        patterns:
+          - "*"

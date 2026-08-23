@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthesised by the Filebeat recipe in `README.md`, which helped only Elastic
   users and kept the values in each operator's shipper config rather than in the
   sensor that knows them.
+- `.github/dependabot.yml` for weekly, grouped Cargo and GitHub Actions version
+  bumps — `cargo-audit`/`cargo-deny` in CI already catch advisories, this
+  covers routine updates. Issue templates (bug report, feature request, and a
+  config that points security reports at Private Vulnerability Reporting
+  instead of a public issue) and a PR template checklisting the gates
+  `CONTRIBUTING.md` already documents.
 
 ### Changed
 - `auth_attempt` with `accepted: true` and `upload` are logged at `WARN` instead
