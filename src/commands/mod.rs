@@ -180,6 +180,8 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "tee" => CommandHandler::Mut(text::tee),
         "xargs" => CommandHandler::Mut(text::xargs),
         "awk" | "mawk" => CommandHandler::Read(text::awk),
+        "md5sum" => CommandHandler::Read(text::md5sum),
+        "sha1sum" => CommandHandler::Read(text::sha1sum),
         "sha256sum" => CommandHandler::Read(text::sha256sum),
         "sha512sum" => CommandHandler::Read(text::sha512sum),
 
