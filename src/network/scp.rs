@@ -232,18 +232,19 @@ fn parse_cd(line: &str) -> Option<(u32, u64, String)> {
     // SHA-256, so this name never forms a real filesystem path — this is
     // defence-in-depth for the two sinks that do echo it back.)
     //
-    // ORDER IS A SECURITY INVARIANT: collapse path separators to `_` first,
-    // THEN `..`. The replacement char has no dots, so once separators are gone
-    // no new `..` can appear — reversing the two steps would let `....//`
-    // survive separator-stripping and re-collapse into a `..` traversal
-    // component. Control bytes (including NUL) are dropped last so the name
-    // can't truncate a path or smuggle terminal/log-injection escapes.
-    let name: String = raw_name
-        .replace(['/', '\\'], "_")
-        .replace("..", "_")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
+    // ORDER IS A SECURITY INVARIANT, and all three steps matter:
+    //
+    //  1. Drop control bytes (including NUL) FIRST. They must go before the
+    //     `..` collapse, not after it: `.\0.` holds no literal `..`, so it
+    //     survives the collapse untouched and a trailing filter would then
+    //     produce exactly `..` — reconstituting the traversal component the
+    //     collapse exists to remove.
+    //  2. Collapse path separators to `_`. The replacement has no dots, so
+    //     once separators are gone no new `..` can appear.
+    //  3. Collapse `..` last. Reversing 2 and 3 would let `....//` survive
+    //     separator-stripping and re-collapse into a `..` component.
+    let stripped: String = raw_name.chars().filter(|c| !c.is_control()).collect();
+    let name = stripped.replace(['/', '\\'], "_").replace("..", "_");
     let name = if name.is_empty() {
         "unnamed".to_string()
     } else {
@@ -378,6 +379,16 @@ mod tests {
             ("a/b\\c", "a_b_c"),
             ("evil\0.sh", "evil.sh"), // NUL dropped: no path truncation
             ("..\0../secret", "___secret"), // NUL between dots can't shield `..`
+            // The case that pins the control-strip-first ordering. This input
+            // holds no literal `..`, so a filter running *after* the collapse
+            // would hand back exactly `..`. It is the one hostile name the
+            // other five cannot catch: each of those contains a real `..` too,
+            // so they pass whichever order the steps run in.
+            (".\0.", "_"),
+            // Three dots once the NUL is gone: the leading pair collapses and
+            // the odd dot is left as ordinary filename text.
+            ("..\0.", "_."),
+            ("a\0.\0.\0b", "a_b"), // controls interleaved through the pair
         ];
         for (raw, expected) in cases {
             let line = format!("C0644 1 {raw}");

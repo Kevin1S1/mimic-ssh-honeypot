@@ -53,6 +53,14 @@ const SSH_FXF_WRITE: u32 = 0x00000002;
 // Safety caps
 const MAX_SFTP_PACKET_LEN: usize = 256 * 1024;
 const MAX_SFTP_HANDLES: usize = 64;
+/// Ceiling on bytes held across all of one session's open SFTP handles,
+/// expressed as a multiple of `max_upload_bytes`. See
+/// [`SftpSession::buffer_cap`].
+const SFTP_SESSION_BUFFER_MULTIPLIER: u64 = 2;
+/// Ceiling on the response bytes one [`SftpSession::feed`] call may accumulate
+/// before it stops processing and returns. Matches the shell's own output cap:
+/// unprocessed input stays in `self.buf` for the next call, so nothing is lost.
+const MAX_SFTP_FEED_RESPONSE: usize = 1024 * 1024;
 const MAX_READ_CHUNK: usize = 32 * 1024;
 const MAX_DIR_ENTRIES_PER_READ: usize = 64;
 
@@ -102,6 +110,11 @@ pub struct SftpSession {
     buf: Vec<u8>,
     handles: BTreeMap<Vec<u8>, SftpHandle>,
     next_handle: u32,
+    /// Bytes currently held across every open handle's buffer. Bounds one
+    /// session's SFTP memory the way `quarantine_bytes` bounds its disk: without
+    /// it, 64 handles each grown to `max_upload_bytes` by a single sparse write
+    /// multiply the per-file cap by [`MAX_SFTP_HANDLES`].
+    buffered_bytes: usize,
 }
 
 impl Default for SftpSession {
@@ -117,7 +130,23 @@ impl SftpSession {
             buf: Vec::new(),
             handles: BTreeMap::new(),
             next_handle: 1,
+            buffered_bytes: 0,
         }
+    }
+
+    /// Per-session ceiling on bytes held across all open handles, as a multiple
+    /// of `max_upload_bytes`. A legitimate client transfers files one handle at
+    /// a time, so a small multiple leaves real usage untouched while capping the
+    /// 64× amplification a hostile client can otherwise reach.
+    fn buffer_cap(max_upload_bytes: u64) -> usize {
+        max_upload_bytes
+            .saturating_mul(SFTP_SESSION_BUFFER_MULTIPLIER)
+            .min(usize::MAX as u64) as usize
+    }
+
+    /// Whether `extra` more bytes can be buffered without exceeding the cap.
+    fn can_buffer(&self, extra: usize, max_upload_bytes: u64) -> bool {
+        self.buffered_bytes.saturating_add(extra) <= Self::buffer_cap(max_upload_bytes)
     }
 
     /// Feed incoming channel data bytes into the SFTP state machine.
@@ -156,6 +185,13 @@ impl SftpSession {
             let pkt = self.buf[pkt_start..pkt_end].to_vec();
             self.handle_packet(&pkt, shell, max_upload_bytes, &mut out, &mut completed);
             read_pos = pkt_end;
+
+            // Individual responses are bounded, but a pipelined burst of small
+            // requests can each amplify into one. Stop once the batch reaches
+            // the cap; what is left in `self.buf` is processed on the next call.
+            if out.len() >= MAX_SFTP_FEED_RESPONSE {
+                break;
+            }
         }
 
         if read_pos > 0 {
@@ -383,14 +419,20 @@ impl SftpSession {
                     if let Some(node_id) = shell.vfs.resolve(shell.cwd, &abs) {
                         let node = shell.vfs.node(node_id);
                         if let NodeKind::File { contents } = &node.kind {
+                            // Opening a read handle copies the whole file, so it
+                            // is charged against the same budget writes are:
+                            // 64 handles on one large file is the same
+                            // amplification from the other direction.
+                            if !self.can_buffer(contents.len(), max_upload_bytes) {
+                                put_status(out, id, SSH_FX_FAILURE, "Too many open handles");
+                                return;
+                            }
+                            let data = contents.clone();
+                            let meta = node.meta.clone();
+                            self.buffered_bytes += data.len();
                             let handle_bytes = self.alloc_handle();
-                            self.handles.insert(
-                                handle_bytes.clone(),
-                                SftpHandle::ReadFile {
-                                    data: contents.clone(),
-                                    meta: node.meta.clone(),
-                                },
-                            );
+                            self.handles
+                                .insert(handle_bytes.clone(), SftpHandle::ReadFile { data, meta });
                             put_handle(out, id, &handle_bytes);
                         } else {
                             put_status(out, id, SSH_FX_FAILURE, "Not a regular file");
@@ -424,6 +466,12 @@ impl SftpSession {
                 let raw_offset = get_u64(&mut cursor).unwrap_or(0);
                 let chunk = get_bytes(&mut cursor).unwrap_or(&[]);
 
+                // Checked before the mutable borrow below so the session-wide
+                // budget is visible; `grow_to` charges what it actually adds.
+                let budget_left =
+                    Self::buffer_cap(max_upload_bytes).saturating_sub(self.buffered_bytes);
+                let mut grew = 0usize;
+
                 if let Some(SftpHandle::WriteFile {
                     data,
                     size,
@@ -435,14 +483,32 @@ impl SftpSession {
                     hasher.update(chunk);
                     *size += chunk.len() as u64;
 
+                    // Grow only as far as the per-file cap, the session budget,
+                    // and `usize` all allow. A write past any of them is
+                    // consumed and hashed (so the wire protocol and the payload
+                    // hash stay correct) but not stored.
+                    let mut grow_to = |data: &mut Vec<u8>, end: usize| -> bool {
+                        if end <= data.len() {
+                            return true;
+                        }
+                        let extra = end - data.len();
+                        if extra > budget_left - grew {
+                            return false;
+                        }
+                        data.resize(end, 0);
+                        grew += extra;
+                        true
+                    };
+
                     let raw_end = raw_offset.saturating_add(chunk.len() as u64);
                     if raw_end <= max_upload_bytes && raw_end <= usize::MAX as u64 {
                         let offset = raw_offset as usize;
                         let end = raw_end as usize;
-                        if end > data.len() {
-                            data.resize(end, 0);
+                        if grow_to(data, end) {
+                            data[offset..end].copy_from_slice(chunk);
+                        } else {
+                            *truncated = true;
                         }
-                        data[offset..end].copy_from_slice(chunk);
                     } else {
                         *truncated = true;
                         if raw_offset < max_upload_bytes && raw_offset < usize::MAX as u64 {
@@ -452,20 +518,29 @@ impl SftpSession {
                                 as usize;
                             let take = allowed.min(chunk.len());
                             let chunk_end = offset + take;
-                            if chunk_end > data.len() {
-                                data.resize(chunk_end, 0);
+                            if grow_to(data, chunk_end) {
+                                data[offset..chunk_end].copy_from_slice(&chunk[..take]);
                             }
-                            data[offset..chunk_end].copy_from_slice(&chunk[..take]);
                         }
                     }
                     put_status(out, id, SSH_FX_OK, "OK");
                 } else {
                     put_status(out, id, SSH_FX_FAILURE, "Invalid handle");
                 }
+                self.buffered_bytes += grew;
             }
             SSH_FXP_CLOSE => {
                 let handle = get_bytes(&mut cursor).unwrap_or(&[]);
                 if let Some(h) = self.handles.remove(handle) {
+                    // Closing a handle returns its bytes to the session budget,
+                    // so a client transferring many files in sequence is never
+                    // charged for more than what it holds at once.
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(match &h {
+                        SftpHandle::WriteFile { data, .. } | SftpHandle::ReadFile { data, .. } => {
+                            data.len()
+                        }
+                        SftpHandle::Dir { .. } => 0,
+                    });
                     if let SftpHandle::WriteFile {
                         dest_path,
                         name,
