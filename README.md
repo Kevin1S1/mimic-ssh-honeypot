@@ -328,8 +328,10 @@ Two caveats that produce silently wrong dashboards rather than errors:
 ```
 
 - `source` is `interactive` (typed at a PTY), `exec` (`ssh host 'cmd'`), `pipe`
-  (a shell channel with no terminal), `heredoc`, or `transfer` (SCP). Anything
-  other than `interactive` is close to a bot marker on its own.
+  (a shell channel with no terminal), `heredoc`, `script` (one line of a body
+  `sh` ran out of the VFS or off a pipe — the inside of a dropper, never typed
+  by the client), or `transfer` (SCP). Anything other than `interactive` is
+  close to a bot marker on its own.
 - `status` is the exit code, or `-1` when the line is logged before it runs.
   **`status: 127` is the most useful single query a honeypot operator has** — it
   names the commands attackers expected to work that this box does not emulate,
