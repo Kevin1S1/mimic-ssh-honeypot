@@ -9,8 +9,8 @@
 
 use super::CommandResult;
 use crate::clock;
-use crate::shell::complete::COMMANDS;
 use crate::shell::{Pending, Shell};
+use crate::vfs::snapshot::{USR_BIN, USR_SBIN};
 
 /// Emulated kernel release (`uname -r`).
 const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
@@ -1301,17 +1301,21 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
 }
 
 /// Resolve a known command name to the absolute path `which` would print, or
-/// `None` if it is not a recognised external binary.
+/// `None` if it is not a recognised external binary. Resolves against the
+/// listed set (`USR_BIN`/`USR_SBIN` — the same names `ls /usr/bin` shows),
+/// not the runnable registry, so `which gzip` finds it even though `gzip`
+/// isn't wired into `commands::dispatch`.
 fn binary_path(name: &str) -> Option<String> {
-    if !COMMANDS.contains(&name) || BUILTINS.contains(&name) {
+    if BUILTINS.contains(&name) {
         return None;
     }
-    let dir = match name {
-        "addgroup" | "adduser" | "chpasswd" | "deluser" | "groupadd" | "ip" | "nologin"
-        | "service" | "ss" | "useradd" | "userdel" => "/usr/sbin",
-        _ => "/usr/bin",
-    };
-    Some(format!("{dir}/{name}"))
+    if USR_BIN.contains(&name) {
+        Some(format!("/usr/bin/{name}"))
+    } else if USR_SBIN.contains(&name) {
+        Some(format!("/usr/sbin/{name}"))
+    } else {
+        None
+    }
 }
 
 /// `w` — who is logged on and what they are doing. A single fabricated session

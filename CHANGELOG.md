@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `/usr/bin`/`/usr/sbin` density: 400 real Debian 12 binary names (up from
+  109), sourced from packages.debian.org filelists for coreutils, util-linux,
+  procps, iproute2, e2fsprogs, gzip, bzip2, xz-utils, less, nano, man-db,
+  debianutils, net-tools, openssh-client, bind9-dnsutils, ncurses-bin and
+  libc-bin, plus their packages added to the fake `dpkg -l` database. Most of
+  these are listed but not emulated — `ls /usr/bin` and tab completion now
+  show what a real Debian 12 box would, without claiming to emulate all 400.
+  A listed-but-unimplemented name returns exit 0 with no output, the real
+  ENOEXEC-into-`/bin/sh` outcome for the zero-byte file it actually is in the
+  VFS, not an invented error. `/proc/self` and numbered PID directories, and
+  `/etc` density, are known follow-ups, not covered by this change.
 - `awk`/`mawk`, `nc`/`netcat`, `stat`, `du`, `ln`, `chown`/`chgrp`, `python3` and
   `perl`. A pipeline dies at its first `command not found`, so `awk`'s absence
   hid everything downstream of it; the rest are ordinary recon and persistence
@@ -32,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` already documents.
 
 ### Changed
+- `which`/tab completion now resolve against the listed `/usr/bin`/`/usr/sbin`
+  set instead of the runnable command registry, so `which gzip` and
+  Tab-completing `gzip` both work even though `gzip` isn't wired into
+  dispatch — matching what `ls /usr/bin` already showed.
 - `auth_attempt` with `accepted: true` and `upload` are logged at `WARN` instead
   of `INFO`. A login that worked and a payload that landed are not the same
   urgency as a connection opening, and without the split an operator needs a
