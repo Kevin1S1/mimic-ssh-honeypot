@@ -56,8 +56,10 @@ host_key_dir = "/data/host_keys"
 dir = "/data/logs"
 
 # How many days of rotated log files to keep. Omit this (the default) to keep
-# every file forever and never delete logs. Set it to cap retention, e.g. 30
-# keeps the most recent 30 daily files and prunes older ones on rotation.
+# every file forever and never delete logs. Set it and any `mimic.<date>.jsonl`
+# older than that many days is deleted — at startup, hourly while running, and
+# on rotation — so the window survives restarts and downtime. Only this
+# appender's own files are touched. Must be between 1 and 3650.
 # retention_days = 30
 
 [auth]

@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `log_retention_pruned` event, emitted when the retention sweep deletes rotated
+  log files.
+
 ### Security
+- `logging.retention_days` now means days. It was passed straight to
+  `tracing-appender`'s `max_log_files`, which counts *files* — the two coincide
+  only while the process runs every single day, so a sensor that was down for a
+  week came back holding files older than the configured window, with captured
+  credentials in them in cleartext. Rotated files are now deleted by
+  modification time, swept at startup and hourly while running, with the file
+  count kept as an in-process backstop. Only this appender's own
+  `mimic.<date>.jsonl` files are eligible, so pointing `logging.dir` at a
+  populated directory cannot delete anything else.
 - Uploads are no longer materialised in a directory other than the one the
   `upload` event reports. `Vfs::mkdir_p` returned the last ancestor that did
   exist when the node cap stopped it from creating the rest of the chain, so an
