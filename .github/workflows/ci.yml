@@ -36,11 +36,10 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      # Informational only: the codebase uses an intentionally compact style in
-      # places, so a formatting drift should not block a security fix.
-      - name: Check formatting (non-blocking)
+      # Blocking. It passes today, and on a public repo a non-blocking check
+      # means drive-by PRs land unformatted.
+      - name: Check formatting
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

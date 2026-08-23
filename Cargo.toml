@@ -30,7 +30,7 @@ rand = { version = "0.10", features = ["sys_rng"] }
 russh = "0.61.2"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["net", "time", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["net", "time", "rt-multi-thread", "macros", "signal"] }
 toml = "1.0.7"
 tracing = "0.1"
 tracing-appender = "0.2"

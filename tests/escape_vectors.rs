@@ -20,6 +20,14 @@ const FORBIDDEN: &[&str] = &[
     "std::process",
     "process::Command",
     "std::fs",
+    // A brace-grouped import defeats every `std::…` entry above:
+    // `use std::{fs, process};` contains neither `std::fs` nor `std::process`.
+    // Nothing in the emulation layers groups a `std` import today, so banning
+    // the form outright costs nothing and closes the hole permanently.
+    "std::{",
+    // Reading the real process environment is host information leakage, which
+    // SECURITY.md puts in scope even though it is not a write.
+    "std::env",
     "tokio::fs",
     "tokio::net",
     "TcpStream",

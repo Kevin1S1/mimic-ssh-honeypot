@@ -13,6 +13,7 @@ pub mod line;
 pub mod parser;
 
 use crate::commands;
+use crate::persona::Persona;
 use crate::vfs::{snapshot, NodeId, Vfs};
 use env::Env;
 
@@ -51,6 +52,17 @@ impl Output {
         self.stdout.push_str(stdout);
         self.stderr.push_str(stderr);
     }
+
+    /// A finished [`Output`] holding one write to each stream. Used where a
+    /// prompt answers the client directly rather than through a command.
+    fn written(stdout: &str, stderr: &str, status: i32) -> Self {
+        let mut out = Output {
+            status,
+            ..Output::default()
+        };
+        out.push(stdout, stderr);
+        out
+    }
 }
 
 /// A structured event produced by a command that the network layer drains and
@@ -66,6 +78,28 @@ pub enum Capture {
         url: String,
         /// Where the body was written (a VFS path, or `-` for stdout).
         dest: String,
+    },
+    /// One line of a script `sh` ran, with the status it returned.
+    ///
+    /// A `command` event is emitted by the network layer per line the *client*
+    /// submits, so a dropped script's body would otherwise be invisible in the
+    /// log — the very intelligence running it exists to recover. Routing it
+    /// through the capture channel keeps the emulation layer free of the
+    /// session id and peer it would need to log directly.
+    ScriptCommand {
+        /// The line as it appeared in the script.
+        line: String,
+        /// The status it returned.
+        status: i32,
+    },
+    /// A password set non-interactively (`chpasswd`, `passwd`). Locking the
+    /// owner out is the most common thing an SSH botnet does once it lands, so
+    /// the new secret is captured the same way a guessed one is.
+    PasswordChange {
+        /// The account whose password was changed.
+        target: String,
+        /// The new password, in the clear.
+        password: String,
     },
     /// A password entered at an `su` prompt. The attempted secret is captured
     /// as forensic data (a guessed root/target password) before the switch.
@@ -87,6 +121,16 @@ pub enum Pending {
     SuPassword {
         /// The account to become once a password is supplied.
         target: String,
+    },
+    /// `passwd [USER]` is collecting a new secret. Real `passwd` asks twice and
+    /// refuses if the two differ, so both prompts are emulated: the second one
+    /// is where a script that pipes the same line twice succeeds and a typo
+    /// fails, which is the behaviour a bot's `passwd` wrapper is written for.
+    NewPassword {
+        /// The account whose password is being set.
+        target: String,
+        /// The first answer, once given.
+        first: Option<String>,
     },
     /// A here-document (`cat << EOF`) is collecting its body. The line that
     /// opened it runs once a line holds the delimiter and nothing else.
@@ -114,7 +158,7 @@ impl Pending {
     /// `su` writes its own; a here-document gets bash's `PS2`.
     pub fn prompt(&self) -> Option<&'static str> {
         match self {
-            Pending::SuPassword { .. } => None,
+            Pending::SuPassword { .. } | Pending::NewPassword { .. } => None,
             Pending::Heredoc { .. } => Some("> "),
         }
     }
@@ -242,6 +286,10 @@ pub struct Shell {
     /// substitution captures its body's stdout through a pipe, so nothing
     /// inside one is writing to a terminal however the stage itself looks.
     subst_depth: u32,
+    /// This deployment's fabricated hardware identity. Every command that
+    /// reports a hardware fact reads it from here, so `lscpu`, `free`, `df`,
+    /// `dmesg` and `/proc` cannot contradict each other.
+    pub persona: Persona,
     /// A here-document body waiting to become the next pipeline's stdin.
     heredoc_stdin: Option<String>,
     /// A completed here-document, opening line and body together, waiting for
@@ -251,11 +299,22 @@ pub struct Shell {
 
 impl Shell {
     /// Construct a fresh shell for `username` on a freshly built Debian
-    /// snapshot. `root` (and the empty username) get uid 0 and `/root`; any
-    /// other user is treated as a normal account (uid 1000) with a home under
-    /// `/home`, created on demand.
+    /// snapshot, using the default persona.
+    ///
+    /// Production goes through [`Shell::with_persona`] so each sensor gets its
+    /// own hardware identity; this is the convenience form for tests and any
+    /// caller with no seed to derive one from.
     pub fn new(username: &str, hostname: &str) -> Self {
-        let mut vfs = snapshot::build(hostname);
+        Self::with_persona(username, hostname, Persona::sample())
+    }
+
+    /// Construct a fresh shell whose emulated hardware comes from `persona`.
+    ///
+    /// `root` (and the empty username) get uid 0 and `/root`; any other user is
+    /// treated as a normal account (uid 1000) with a home under `/home`,
+    /// created on demand.
+    pub fn with_persona(username: &str, hostname: &str, persona: Persona) -> Self {
+        let mut vfs = snapshot::build(hostname, &persona);
         let user = if username.is_empty() {
             "root"
         } else {
@@ -295,6 +354,7 @@ impl Shell {
             subst_depth: 0,
             heredoc_stdin: None,
             heredoc_log: None,
+            persona,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,
@@ -625,6 +685,38 @@ impl Shell {
                 });
                 self.switch_user(&target);
                 Output::default()
+            }
+            Some(Pending::NewPassword {
+                target,
+                first: None,
+            }) => {
+                self.pending = Some(Pending::NewPassword {
+                    target,
+                    first: Some(input.to_string()),
+                });
+                Output::written("Retype new password: ", "", 0)
+            }
+            Some(Pending::NewPassword {
+                target,
+                first: Some(first),
+            }) => {
+                if first != input {
+                    return Output::written(
+                        "",
+                        "Sorry, passwords do not match.\n\
+                         passwd: Authentication token manipulation error\n\
+                         passwd: password unchanged\n",
+                        1,
+                    );
+                }
+                // The plaintext is the forensic value; the emulated shadow file
+                // only ever holds a crypt-shaped placeholder.
+                self.captures.push(Capture::PasswordChange {
+                    target: target.clone(),
+                    password: first.clone(),
+                });
+                commands::admin::set_shadow_entry(self, &target);
+                Output::written("passwd: password updated successfully\n", "", 0)
             }
             Some(Pending::Heredoc {
                 command,

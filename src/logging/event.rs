@@ -8,10 +8,17 @@ use tracing::info;
 /// Process-wide sensor name, set once at startup.
 static SENSOR_NAME: OnceLock<String> = OnceLock::new();
 
-/// Store the sensor name so every subsequent event log line includes it.
+/// Store the sensor name and mint this process's boot id, so every subsequent
+/// event log line carries both.
 pub fn init(name: &str) {
     SENSOR_NAME
         .set(name.to_owned())
+        .expect("event::init called more than once");
+    // `session_id` is a per-process counter that restarts at 1, so on its own it
+    // collides across restarts and a SIEM correlating on it silently merges
+    // unrelated sessions. `boot_id` makes the pair unique; consumers key on both.
+    BOOT_ID
+        .set(format!("{:016x}", rand::random::<u64>()))
         .expect("event::init called more than once");
 }
 
@@ -19,29 +26,161 @@ fn sensor_name() -> &'static str {
     SENSOR_NAME.get().map_or("mimic", |s| s.as_str())
 }
 
+/// Process-wide boot id, set once at startup alongside the sensor name.
+static BOOT_ID: OnceLock<String> = OnceLock::new();
+
+fn boot_id() -> &'static str {
+    BOOT_ID.get().map_or("0000000000000000", |s| s.as_str())
+}
+
+/// Split a peer address into the two fields a SIEM data model wants.
+///
+/// `peer` is kept as-is for continuity, but Splunk CIM (`src_ip`/`src_port`)
+/// and ECS (`source.ip`/`source.port`) both want them typed and separate — and
+/// re-splitting the combined string downstream is a parser bug waiting to
+/// happen for IPv6 peers, which carry their own colons inside brackets.
+fn peer_parts(peer: SocketAddr) -> (String, u16) {
+    (peer.ip().to_string(), peer.port())
+}
+
 /// A new TCP/SSH connection was accepted.
 pub fn connection_opened(session_id: u64, peer: SocketAddr) {
-    info!(event = "connection_opened", sensor_name = sensor_name(), session_id, peer = %peer);
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "connection_opened",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+    );
+}
+
+/// The client's SSH identification string, as sent in the version exchange.
+///
+/// `SSH-2.0-libssh2_1.9.0` / `SSH-2.0-Go` / `SSH-2.0-paramiko_2.7.2` separates
+/// commodity botnet tooling from an interactive client faster than anything
+/// else available, so it is worth its own event rather than a field on one.
+pub fn client_banner(session_id: u64, peer: SocketAddr, banner: &str) {
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "client_banner",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+        banner,
+    );
+}
+
+/// The listener is up and accepting connections.
+pub fn listening(addr: &str, port: u16, max_sessions: usize, per_ip_connections: usize) {
+    info!(
+        event = "listening",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        addr,
+        port,
+        max_sessions,
+        per_ip_connections,
+    );
+}
+
+/// The process was asked to stop and is shutting the listener down.
+pub fn shutdown() {
+    info!(
+        event = "shutdown",
+        sensor_name = sensor_name(),
+        boot_id = boot_id()
+    );
+}
+
+/// `accept()` failed. Transient (fd exhaustion, and similar), not fatal.
+pub fn accept_error(error: &str) {
+    tracing::warn!(
+        event = "accept_error",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        error,
+    );
+}
+
+/// A session hit the absolute lifetime cap and was disconnected.
+pub fn session_timeout(session_id: u64, peer: SocketAddr) {
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "session_timeout",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+    );
+}
+
+/// A session reached its cumulative quarantine-write cap; later uploads in this
+/// session are logged but not stored on disk.
+pub fn quarantine_session_cap(session_id: u64, peer: SocketAddr) {
+    let (src_ip, src_port) = peer_parts(peer);
+    tracing::warn!(
+        event = "quarantine_session_cap",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+    );
+}
+
+/// Writing a captured payload to the quarantine store failed. This is the only
+/// signal that a capture was lost, so it carries the full field set.
+pub fn quarantine_error(session_id: u64, peer: SocketAddr, error: &str) {
+    let (src_ip, src_port) = peer_parts(peer);
+    tracing::warn!(
+        event = "quarantine_error",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+        error,
+    );
 }
 
 /// An authentication attempt was observed. `secret` is the captured password
-/// for password auth, or `None` for other methods.
+/// for password auth, or `None` for other methods; `fingerprint` is the offered
+/// key's SHA-256 fingerprint for public-key auth, or `None` otherwise. Attackers
+/// reuse key material across campaigns, which makes the fingerprint a pivotable
+/// IOC in a way a sprayed password rarely is.
+#[allow(clippy::too_many_arguments)]
 pub fn auth_attempt(
     session_id: u64,
     peer: SocketAddr,
     username: &str,
     method: &str,
     secret: Option<&str>,
+    fingerprint: Option<&str>,
     accepted: bool,
 ) {
+    let (src_ip, src_port) = peer_parts(peer);
     info!(
         event = "auth_attempt",
         sensor_name = sensor_name(),
+        boot_id = boot_id(),
         session_id,
         peer = %peer,
+        src_ip,
+        src_port,
         username,
         method,
         password = secret.unwrap_or(""),
+        key_fingerprint = fingerprint.unwrap_or(""),
         accepted,
     );
 }
@@ -49,33 +188,132 @@ pub fn auth_attempt(
 /// A connection was refused before the SSH handshake because a concurrency
 /// limit was reached. `reason` is `"global_limit"` or `"per_ip_limit"`.
 pub fn connection_rejected(peer: SocketAddr, reason: &str) {
-    info!(event = "connection_rejected", sensor_name = sensor_name(), peer = %peer, reason);
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "connection_rejected",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        peer = %peer,
+        src_ip,
+        src_port,
+        reason,
+    );
 }
 
-/// The session ended.
-pub fn connection_closed(session_id: u64, peer: SocketAddr) {
-    info!(event = "connection_closed", sensor_name = sensor_name(), session_id, peer = %peer);
+/// The session ended. `duration_secs` and `command_count` summarise it so a
+/// dashboard can rank sessions without first correlating every command event
+/// back to its session.
+pub fn connection_closed(
+    session_id: u64,
+    peer: SocketAddr,
+    duration_secs: u64,
+    command_count: u64,
+) {
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "connection_closed",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+        duration_secs,
+        command_count,
+    );
 }
 
 /// An attacker fetched a remote URL with `wget`/`curl`. `dest` is the VFS path
 /// the body was "saved" to (or `-` for stdout). No real request was made.
 pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: &str) {
-    info!(event = "download", sensor_name = sensor_name(), session_id, peer = %peer, tool, url, dest);
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "download",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+        tool,
+        url,
+        dest,
+    );
 }
 
-/// A command line was submitted by the client (interactive shell or one-shot
-/// `exec`). Logged verbatim for forensic replay.
-pub fn command(session_id: u64, peer: SocketAddr, command: &str) {
-    info!(event = "command", sensor_name = sensor_name(), session_id, peer = %peer, command);
+/// How a command line reached the shell. The distinction is close to a binary
+/// bot-versus-human classifier: a human types into an interactive session, while
+/// automation overwhelmingly arrives as a one-shot `exec` or a piped script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSource {
+    /// Typed at a line editor on a channel with a PTY.
+    Interactive,
+    /// A one-shot `ssh host 'cmd'`.
+    Exec,
+    /// A line read from a shell channel that asked for no terminal.
+    Pipe,
+    /// A here-document, logged whole once its delimiter closed it.
+    Heredoc,
+    /// One line of a script `sh` ran out of the VFS, or of a payload piped into
+    /// it. Never typed by the client — this is the body of a dropper.
+    Script,
+    /// A synthetic marker for a sub-protocol the command line started (SCP).
+    Transfer,
+}
+
+impl CommandSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            CommandSource::Interactive => "interactive",
+            CommandSource::Exec => "exec",
+            CommandSource::Pipe => "pipe",
+            CommandSource::Heredoc => "heredoc",
+            CommandSource::Script => "script",
+            CommandSource::Transfer => "transfer",
+        }
+    }
+}
+
+/// A command line was submitted by the client. Logged verbatim for forensic
+/// replay.
+///
+/// `status` is the exit code the emulated command returned, or `None` when the
+/// line is logged before it runs. A 127 answers the most useful question a
+/// honeypot operator has — which commands did attackers expect to work that this
+/// box does not implement — so it also drives what to emulate next.
+pub fn command(
+    session_id: u64,
+    peer: SocketAddr,
+    command: &str,
+    source: CommandSource,
+    status: Option<i32>,
+) {
+    let (src_ip, src_port) = peer_parts(peer);
+    info!(
+        event = "command",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+        command,
+        source = source.as_str(),
+        status = status.unwrap_or(-1),
+    );
 }
 
 /// An SSH subsystem request (such as `sftp`) was received from the client.
 pub fn subsystem_request(session_id: u64, peer: SocketAddr, subsystem: &str, accepted: bool) {
+    let (src_ip, src_port) = peer_parts(peer);
     info!(
         event = "subsystem_request",
         sensor_name = sensor_name(),
+        boot_id = boot_id(),
         session_id,
         peer = %peer,
+        src_ip,
+        src_port,
         subsystem,
         accepted,
     );
@@ -101,11 +339,15 @@ pub fn upload(
     stored_path: &str,
     truncated: bool,
 ) {
+    let (src_ip, src_port) = peer_parts(peer);
     info!(
         event = "upload",
         sensor_name = sensor_name(),
+        boot_id = boot_id(),
         session_id,
         peer = %peer,
+        src_ip,
+        src_port,
         name,
         dest,
         size,
@@ -183,9 +425,9 @@ mod tests {
     fn each_event_is_one_valid_json_line_with_expected_fields() {
         let (_, events) = capture(|| {
             connection_opened(1, peer());
-            auth_attempt(1, peer(), "root", "password", Some("hunter2"), false);
+            auth_attempt(1, peer(), "root", "password", Some("hunter2"), None, false);
             connection_rejected(peer(), "per_ip_limit");
-            connection_closed(1, peer());
+            connection_closed(1, peer(), 42, 7);
         });
 
         assert_eq!(events.len(), 4, "one JSON line per event");
@@ -249,7 +491,15 @@ mod tests {
     #[test]
     fn public_key_auth_records_no_password() {
         let (_, events) = capture(|| {
-            auth_attempt(9, peer(), "admin", "publickey", None, false);
+            auth_attempt(
+                9,
+                peer(),
+                "admin",
+                "publickey",
+                None,
+                Some("SHA256:abc123"),
+                false,
+            );
         });
 
         let auth = fields(&events[0]);
@@ -272,6 +522,7 @@ mod tests {
                 malicious_user,
                 "password",
                 Some(malicious_pass),
+                None,
                 false,
             );
         });

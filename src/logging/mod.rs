@@ -48,6 +48,10 @@ fn restrict_log_dir(dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+// ponytail: off Unix the log directory keeps whatever permissions it was
+// created with, so the `0700` SECURITY.md T11 describes does not apply — and
+// captured credentials sit in there in the clear. Windows is a development
+// platform only. Upgrade if a Windows deployment is ever supported.
 #[cfg(not(unix))]
 fn restrict_log_dir(_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())

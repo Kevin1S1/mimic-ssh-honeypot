@@ -11,6 +11,11 @@ use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
+/// How many authentication attempts one connection may make before the server
+/// disconnects it. Matches Debian 12 sshd's default `MaxAuthTries 6`; russh's
+/// own default is 10, which is a one-connection fingerprint.
+pub const MAX_AUTH_ATTEMPTS: u32 = 6;
+
 /// Top-level runtime configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -182,6 +187,15 @@ impl Config {
         anyhow::ensure!(
             self.max_upload_bytes > 0 && self.max_upload_bytes <= 1024 * 1024 * 1024,
             "max_upload_bytes must be between 1 and 1073741824 (1 GiB)"
+        );
+        // Upper bound is `max_auth_attempts` (6, matching Debian's MaxAuthTries):
+        // a larger value would have the connection torn down before the
+        // accepting attempt was ever reached, so the honeypot would silently
+        // never grant a shell. Zero would make every attempt succeed, quietly
+        // turning `accept_after` into `accept_all`.
+        anyhow::ensure!(
+            (1..=MAX_AUTH_ATTEMPTS).contains(&self.auth.accept_after),
+            "auth.accept_after must be between 1 and {MAX_AUTH_ATTEMPTS}"
         );
         if self.auth.mode == AuthMode::Credentials {
             anyhow::ensure!(

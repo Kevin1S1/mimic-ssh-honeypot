@@ -7,6 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `SECURITY.md` no longer claims fuzz testing of the line editor. There is no
+  `fuzz/` target, no `cargo-fuzz`, and no property-testing dependency; the T3
+  mitigation now names the unit tests that do exist. Every other claim in that
+  document checks out against the code, which is exactly why one that does not
+  is costly — a reader who verifies it starts doubting the rest.
+- `SECURITY.md` T11 scopes the `0600`/`0700` at-rest protections to Unix
+  deployment targets. The `#[cfg(not(unix))]` fallbacks write with default
+  permissions, and the claim was unqualified.
+- SFTP writes are bounded by a per-session byte budget. `SSH_FXP_WRITE` used to
+  grow a handle's buffer to cover the client's declared offset, so a ~30-byte
+  packet writing one byte at `max_upload_bytes - 1` allocated the whole buffer;
+  with 64 handles per session that reached roughly 2 GiB from a single source IP
+  at stock settings. Opening a read handle is charged against the same budget,
+  because it copies the file eagerly.
+- SFTP `feed()` stops accumulating responses past 1 MiB. Unprocessed input stays
+  buffered for the next call, so nothing is lost.
+- Uploads interrupted mid-transfer are captured instead of discarded. Draining
+  ran only from `channel_eof`, which needs a clean half-close, so a transfer cut
+  short by the session watchdog, the idle timeout, or a TCP reset produced no
+  `upload` event, no quarantine write, and no hash. All teardown paths now drain
+  through `Drop`, the only hook guaranteed to run.
+- Quarantine writes stage to `<sha256>.partial` and rename into place. A write
+  that failed partway previously left a truncated file under a valid hash name,
+  and every later upload of the same payload reported that corrupt file as
+  stored.
+- SIGTERM returns from the accept loop so the logging guard flushes on the way
+  out. `docker restart` and `systemctl restart` previously discarded whatever
+  the file appender still held — daily, since `deploy/daily-reset.sh` restarts
+  the container.
+- `auth.accept_after` is range-checked to `1..=6`. `0` silently meant
+  `accept_all`, and a value above russh's auth limit meant the honeypot could
+  never grant a shell at all.
+- SCP filenames have control bytes stripped *before* `..` is collapsed, not
+  after. `".\0."` holds no literal `..`, so it survived the collapse and the
+  trailing filter then produced exactly `..`.
+- `tests/escape_vectors.rs` also rejects brace-grouped `std::{…}` imports and
+  `std::env`. `use std::{fs, process};` contains neither `std::fs` nor
+  `std::process`, so it defeated every existing entry; reading the real process
+  environment is host information leakage that the test never covered.
+- Text-processing commands bound their own allocations rather than relying on
+  the dispatch cap, which only trims a result already paid for: filter input is
+  capped at 1 MiB, `tr` bounds set expansion (two characters of argument could
+  expand to 1.1 million), `sed` bounds a growing substitution both per line and
+  across lines, and `sh` bounds how many lines of a script it will run.
+
+### Added
+- `CONTRIBUTING.md`, documenting the two conventions that were defined only in
+  a gitignored file: the build-enforced module boundary — and why it is a test
+  rather than a review rule — and the `// ponytail:` marker for deliberate
+  emulation shortcuts.
+- A top-level `LICENSE` stating the dual MIT/Apache-2.0 grant, which GitHub was
+  reporting as Apache-2.0 alone.
+- `SECURITY.md` gains one table of every attacker-driven bound — value, file,
+  and what it protects. They were spread across eight files, which is why the
+  one gap that did exist was hard to notice.
+- `README.md` gains Splunk `props.conf`/`inputs.conf` and Filebeat/ECS
+  ingestion recipes, a table of all fifteen event types with their levels, and
+  the two caveats that silently produce wrong dashboards rather than errors:
+  correlate on `boot_id` + `session_id` rather than `session_id` alone, and
+  `connection_rejected` carries no `session_id` to join on.
+- Text-processing commands: `base64`, `sed`, `cut`, `tr`, `sort`, `uniq`,
+  `xargs`, `tee`, `rev`, `nl`, `seq`, `basename`, `dirname`, `printf`,
+  `sha256sum`, `sha512sum`. A pipeline dies at its first `command not found`, so
+  their absence hid everything downstream of them —
+  `echo <b64> | base64 -d | sh` is the dominant payload-delivery idiom in SSH
+  botnets and previously stopped at step one.
+- Account and persistence commands: `passwd`, `chpasswd`, `useradd`/`adduser`,
+  `userdel`/`deluser`, `groupadd`/`addgroup`, `getent`, `systemctl`, `service`,
+  `chattr`, `lsattr`, `nohup`, `sleep`, `killall`, `pidof`, `pgrep`, `sync`,
+  `nologin`. `echo 'root:pass' | chpasswd` is the most common post-access action
+  in SSH botnet telemetry; the new secret is captured as credential data.
+- `command` events for each line of a script `sh` ran, with `source: script`
+  and the line's exit status. A `command` event is emitted per line the client
+  submits, so a dropped script's body would otherwise show as one
+  `sh /tmp/x.sh` entry and nothing of what it did.
+- `sh`/`bash` runs a script operand and piped stdin, not only `-c`. The
+  `wget` → `chmod +x` → run sequence previously captured the download and not
+  one byte of what the script would have done.
+- `passwd` prompts for the new secret twice with echo suppressed, over the same
+  mechanism `su` uses.
+- Every event carries `boot_id`, and `src_ip`/`src_port` alongside `peer`.
+  `session_id` restarts at 1 each boot, so correlating on it alone silently
+  merged unrelated sessions across a restart; CIM and ECS both want the peer
+  typed and split.
+- `command` events record how the line arrived (interactive, exec, pipe,
+  heredoc) and its exit status — close to a bot/human classifier, and the field
+  that names which commands are worth emulating next.
+- Public-key attempts log the offered key's fingerprint, and the client's SSH
+  version banner is recorded at first channel open.
+- Per-deployment hardware identity: machine-id, CPU, RAM, disk, MAC and IP are
+  derived from a seed hashed from the sensor's own host key, so they are stable
+  across restarts but differ between sensors.
+- `/etc/ssh/sshd_config`, `/etc/ssh/ssh_config`, `/etc/apt/sources.list`,
+  `/dev/pts/0` and the deployment's real public host keys. Each closed a
+  one-command self-contradiction: the box hosted an sshd with no config, ran
+  `apt update` against no sources list, and named a pty in `tty` and `$SSH_TTY`
+  that `ls` said did not exist.
+
+### Changed
+- `README.md` carries a CI status badge, and its documented event samples and
+  command table match what the code now emits and serves.
+- CI's format check is blocking rather than `continue-on-error`.
+- `Dockerfile` no longer strips a binary that `[profile.release]` already
+  stripped.
+- `MaxAuthTries` is 6, matching Debian, rather than russh's default of 10.
+- `pty-req`'s `TERM` and dimensions and accepted `LANG`/`LC_*` values are
+  applied to the session. `echo $TERM` returning a terminal the client never
+  asked for was a one-command tell, and Debian's stock client sends `LANG` by
+  default.
+- Response latency scales with output size instead of a flat uniform 2–18 ms,
+  which had zero correlation with the work done.
+- The five operational events emitted as ad-hoc `tracing` macros moved into
+  `event.rs` so they carry the same fields as every other event.
+
+### Fixed
+- `grep` accepts the flags real grep accepts. `-q`, `-l`, `-w`, `-o`, `-s`,
+  `-h`/`-H`, `-e` and the matcher-selecting `-E`/`-F`/`-G`/`-P` previously
+  hard-errored with `invalid option`, so `grep -q pattern file && …` — a
+  scripting staple — stopped an attacker's pipeline where a real box would have
+  run it.
+- `mkdir`, `touch` and `cp` report `No space left on device` at the VFS node cap
+  instead of exiting 0 on a file that never appears.
+- A script's lines no longer overwrite each other's captures. `Shell::execute`
+  clears them on entry, so a two-stage dropper logged only its second fetch.
+- `pidof`, `pgrep` and `killall` match the executable name the way `/proc/comm`
+  does, so `pidof sshd` finds the `sshd: /usr/sbin/sshd -D [listener]` entry
+  that `ps` prints.
+
 ## [0.5.0] - 2026-08-23
 
 ### Added

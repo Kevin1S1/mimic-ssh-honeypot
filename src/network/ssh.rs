@@ -8,6 +8,7 @@
 
 use crate::config::{AuthMode, Config};
 use crate::logging::event;
+use crate::logging::event::CommandSource;
 use crate::network::limiter::{ConnectionGuard, ConnectionRegistry};
 use crate::network::scp::{self, ScpMode, ScpSink};
 use crate::network::sftp::{self, SftpSession};
@@ -48,6 +49,15 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
     // Persist host keys so the server fingerprint stays stable across restarts.
     let host_keys = super::hostkey::load_or_create(&config.host_key_dir)?;
 
+    // This deployment's fabricated hardware identity, seeded from the host key
+    // so it is stable across restarts (like the fingerprint) but different on
+    // every sensor. Reading the key material is real I/O and belongs here; the
+    // persona itself is pure data the emulation layers consume.
+    let persona = Arc::new(
+        crate::persona::Persona::from_seed(persona_seed(&host_keys, &config.sensor_name))
+            .with_host_keys(host_key_files(&host_keys)),
+    );
+
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::Password);
     methods.push(MethodKind::PublicKey);
@@ -59,7 +69,17 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         // server offer (no sntrup761, umac, or group-exchange).
         preferred: debian_openssh_preferred(),
         auth_rejection_time: Duration::from_secs(2),
+        // NOT a fingerprint, despite how it reads: russh applies this only to
+        // the `none` probe every client sends first to discover auth methods
+        // (see `initial_auth_until` in russh's `server::encrypted`). Real sshd
+        // answers that probe immediately; password and publickey rejections
+        // still take the full two seconds. Without it every connection would
+        // stall 2s before the password prompt, which *would* be a tell.
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
+        // Debian 12 sshd defaults to `MaxAuthTries 6`; russh defaults to 10.
+        // A client that keeps getting prompted past six is a one-connection
+        // honeypot check.
+        max_auth_attempts: crate::config::MAX_AUTH_ATTEMPTS as usize,
         inactivity_timeout: Some(Duration::from_secs(config.idle_timeout_secs)),
         keys: host_keys,
         ..Default::default()
@@ -74,22 +94,35 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         .await
         .with_context(|| format!("binding {}:{}", config.listen_addr, config.port))?;
 
-    tracing::info!(
-        event = "listening",
-        sensor_name = config.sensor_name.as_str(),
-        addr = %config.listen_addr,
-        port = config.port,
-        max_sessions = config.max_sessions,
-        per_ip_connections = config.per_ip_connections,
+    event::listening(
+        &config.listen_addr.to_string(),
+        config.port,
+        config.max_sessions,
+        config.per_ip_connections,
     );
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            // Returning on a termination signal is what lets `main` unwind and
+            // drop the logging `WorkerGuard`, which is the only thing that
+            // flushes the file appender's buffered lines. Without it the
+            // process is killed where it stands and whatever is still in the
+            // appender's channel is lost — on every `docker restart` /
+            // `systemctl restart`, which `deploy/daily-reset.sh` performs
+            // daily by design.
+            () = shutdown_signal() => {
+                event::shutdown();
+                return Ok(());
+            }
+            result = listener.accept() => result,
+        };
+
+        let (stream, peer) = match accepted {
             Ok(pair) => pair,
             Err(err) => {
                 // Transient accept errors (e.g. fd exhaustion) shouldn't kill
                 // the listener; back off briefly and keep serving.
-                tracing::warn!(event = "accept_error", error = %err);
+                event::accept_error(&err.to_string());
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -114,6 +147,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
 
         let handler = MimicHandler {
             config: Arc::clone(&config),
+            persona: Arc::clone(&persona),
             session_id,
             peer,
             local,
@@ -130,6 +164,11 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             password_buf: None,
             line_buf: Vec::new(),
             screen: None,
+            pty_term: None,
+            accepted_env: Vec::new(),
+            banner_logged: false,
+            opened_at: std::time::Instant::now(),
+            command_count: 0,
             _guard: guard,
         };
 
@@ -149,7 +188,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
                         let handle = session.handle();
                         async move {
                             tokio::time::sleep_until(deadline).await;
-                            tracing::info!(event = "session_timeout", session_id);
+                            event::session_timeout(session_id, peer);
                             let _ = handle
                                 .disconnect(Disconnect::ByApplication, String::new(), String::new())
                                 .await;
@@ -174,6 +213,84 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
                 }
             }
         });
+    }
+}
+
+/// This deployment's `/etc/ssh/*.pub` files, taken from the keys actually being
+/// served.
+///
+/// Only public halves: `to_openssh` on a `PublicKey` emits exactly the line a
+/// real `.pub` file holds, which every client already receives during the key
+/// exchange. Fabricating these instead would be a contradiction an attacker can
+/// check with one `ssh-keygen -lf` against the fingerprint their own client
+/// recorded.
+fn host_key_files(keys: &[russh::keys::PrivateKey]) -> Vec<(String, String)> {
+    keys.iter()
+        .filter_map(|key| {
+            let public = key.public_key();
+            let stem = match public.algorithm() {
+                russh::keys::Algorithm::Ed25519 => "ssh_host_ed25519_key",
+                russh::keys::Algorithm::Rsa { .. } => "ssh_host_rsa_key",
+                russh::keys::Algorithm::Ecdsa { .. } => "ssh_host_ecdsa_key",
+                _ => return None,
+            };
+            let line = public.to_openssh().ok()?;
+            Some((format!("{stem}.pub"), format!("{line}\n")))
+        })
+        .collect()
+}
+
+/// Derive this deployment's persona seed from its host keys and sensor name.
+///
+/// The host key is already the thing that must not change between restarts, so
+/// binding the emulated hardware to it gives the persona the same stability for
+/// free — and two sensors never share a key, so they never share an identity.
+fn persona_seed(keys: &[russh::keys::PrivateKey], sensor_name: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mimic-persona-v1");
+    hasher.update(sensor_name.as_bytes());
+    for key in keys {
+        // The *public* half is enough to be unique per deployment, and keeps
+        // private key material out of every derived value.
+        if let Ok(blob) = key.public_key().to_openssh() {
+            hasher.update(blob.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 8];
+    seed.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(seed)
+}
+
+/// Resolve once the process is asked to stop.
+///
+/// SIGTERM is what `docker stop` and `systemctl restart` send, so it is the
+/// signal that matters for a clean flush; Ctrl-C is handled too for a honeypot
+/// run in the foreground. On non-Unix (a development platform only) there is no
+/// SIGTERM, so Ctrl-C is the whole story.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            // Without a handler the default disposition still terminates the
+            // process; we simply lose the clean flush. Not worth refusing to
+            // serve over.
+            Err(err) => {
+                tracing::warn!(event = "signal_handler_error", error = %err);
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -261,9 +378,35 @@ struct MimicHandler {
     /// The redraw task of a full-screen command holding the terminal (`top`).
     /// While it is `Some`, input goes to the display rather than the editor.
     screen: Option<ScreenHold>,
+    /// The terminal type, width, and height the client asked for in `pty-req`.
+    /// Real sshd exports these into the session; inventing our own values while
+    /// echoing back `channel_success` is a one-command tell.
+    pty_term: Option<PtyRequest>,
+    /// Locale variables the client sent with `env` requests and the server
+    /// accepted. Applied when the shell is built, the way a real sshd does.
+    accepted_env: Vec<(String, String)>,
+    /// Whether the client's SSH identification string has been logged yet. The
+    /// banner is only reachable once a `Session` is in hand, so it is emitted
+    /// at the first channel rather than at accept time.
+    banner_logged: bool,
+    /// When this connection was accepted, for the `connection_closed` summary.
+    opened_at: std::time::Instant,
+    /// How many `command` events this session has emitted.
+    command_count: u64,
+    /// This deployment's fabricated hardware identity, handed to every shell
+    /// this connection builds.
+    persona: Arc<crate::persona::Persona>,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
+}
+
+/// What the client asked for in `pty-req`, kept so the session environment can
+/// reflect it rather than inventing a terminal the client never requested.
+struct PtyRequest {
+    term: String,
+    cols: u32,
+    rows: u32,
 }
 
 /// How often a full-screen command repaints. Real `top`'s default delay.
@@ -302,8 +445,36 @@ impl MimicHandler {
         true
     }
 
+    /// Finalise any SFTP write handles that never received `SSH_FXP_CLOSE`,
+    /// storing and logging what they hold.
+    ///
+    /// Every path that ends an SFTP transfer routes through here — a clean
+    /// `channel_eof`, a channel close, and the handler's own `Drop`. Only the
+    /// last of those is guaranteed to run: `channel_close` is a protocol message
+    /// russh never delivers when the peer sends a reset or simply vanishes, and
+    /// `channel_eof` additionally requires the client to half-close cleanly. A
+    /// transfer cut short by the session watchdog, the idle timeout, or a
+    /// dropped socket is exactly the case where the payload matters most, so it
+    /// must not be the case where it is discarded.
+    fn drain_sftp_uploads(&mut self) {
+        let Some(sftp) = self.sftp.take() else {
+            return;
+        };
+        // No shell means nothing was ever fed to the subsystem, so there is
+        // nothing in flight to recover.
+        let uploads = match self.shell.as_mut() {
+            Some(shell) => sftp.into_pending_uploads(shell),
+            None => return,
+        };
+        for upload in uploads {
+            self.store_sftp_upload(upload);
+        }
+    }
+
     fn close_channel(&mut self, channel: u32) {
         if self.active_channel == Some(channel) {
+            // Before the shell is torn down: the drain writes into its VFS.
+            self.drain_sftp_uploads();
             self.active_channel = None;
             self.editor = LineEditor::new(MAX_COMMAND_LEN, 1000);
             self.shell = None;
@@ -387,9 +558,9 @@ impl MimicHandler {
         session: &mut Session,
     ) -> Result<bool, russh::Error> {
         self.drain_captures();
-        // Small randomised delay so response latency is not perfectly uniform
-        // (a passive timing tell).
-        jitter().await;
+        // Response latency scaled by how much this command produced, so the
+        // timing profile correlates with workload the way a real shell's does.
+        jitter_for(output.text.len() + output.stdout.len() + output.stderr.len()).await;
         self.write_output(channel, output, session)?;
         if output.exit {
             self.end_channel(channel, session, output.status as u32)?;
@@ -416,7 +587,12 @@ impl MimicHandler {
         // holding `cat << EOF > drop.sh` without the script is worth little.
         let parked = self.shell().pending.as_ref().is_some_and(|p| p.echoes());
         if !trimmed.is_empty() && !parked {
-            event::command(self.session_id, self.peer, &trimmed);
+            let source = if self.pty {
+                CommandSource::Interactive
+            } else {
+                CommandSource::Pipe
+            };
+            self.log_command(&trimmed, source, Some(result.status));
         }
         self.deliver(channel, &result, session).await
     }
@@ -424,8 +600,17 @@ impl MimicHandler {
     /// Log a here-document that has just closed, as the single command it is.
     fn log_closed_heredoc(&mut self) {
         if let Some(text) = self.shell().heredoc_log.take() {
-            event::command(self.session_id, self.peer, &text);
+            self.log_command(&text, CommandSource::Heredoc, None);
         }
+    }
+
+    /// Emit one `command` event and count it toward the session summary.
+    ///
+    /// Every command log goes through here so the count on `connection_closed`
+    /// cannot drift from the number of events actually emitted.
+    fn log_command(&mut self, text: &str, source: CommandSource, status: Option<i32>) {
+        self.command_count += 1;
+        event::command(self.session_id, self.peer, text, source, status);
     }
 
     /// Take over the terminal with a full-screen display, repainting it every
@@ -557,11 +742,32 @@ impl MimicHandler {
         }
     }
 
+    /// Emit the client's SSH identification string, once per connection.
+    ///
+    /// `remote_sshid` is only reachable through a `Session`, which the auth
+    /// callbacks do not receive — so the earliest hook is the first channel
+    /// request. A scanner that disconnects before opening a channel is not
+    /// recorded, which is the ceiling of doing this without patching russh.
+    fn log_client_banner(&mut self, session: &Session) {
+        if self.banner_logged {
+            return;
+        }
+        self.banner_logged = true;
+        let banner = String::from_utf8_lossy(session.remote_sshid()).into_owned();
+        if !banner.is_empty() {
+            event::client_banner(self.session_id, self.peer, &banner);
+        }
+    }
+
     /// Borrow the session shell, creating it on first use from the captured
     /// username and configured hostname.
     fn shell(&mut self) -> &mut Shell {
         if self.shell.is_none() {
-            let mut shell = Shell::new(&self.username, &self.config.hostname);
+            let mut shell = Shell::with_persona(
+                &self.username,
+                &self.config.hostname,
+                (*self.persona).clone(),
+            );
             // Every real sshd exports the connection details into the session
             // environment; a shell without them is a one-line honeypot tell.
             // The values are the client's own address and the socket it dialled,
@@ -582,6 +788,18 @@ impl MimicHandler {
             if self.pty {
                 // Matches the `tty` command; unset for exec, like a real sshd.
                 shell.env.set("SSH_TTY", "/dev/pts/0");
+            }
+            // What the client asked for in `pty-req`, not what we would have
+            // picked. `echo $TERM` returning a terminal the client never named
+            // is a one-command tell.
+            if let Some(pty) = self.pty_term.as_ref() {
+                shell.env.set("TERM", &pty.term);
+                shell.env.set("COLUMNS", &pty.cols.to_string());
+                shell.env.set("LINES", &pty.rows.to_string());
+            }
+            // Locale variables the client sent and `env_request` accepted.
+            for (key, value) in &self.accepted_env {
+                shell.env.set(key, value);
             }
             self.shell = Some(shell);
         }
@@ -635,10 +853,40 @@ impl MimicHandler {
                 Capture::Download { tool, url, dest } => {
                     event::download(session_id, peer, &tool, &url, &dest);
                 }
+                Capture::ScriptCommand { line, status } => {
+                    // A line out of a dropped script, not one the client typed.
+                    // Without this the log shows `sh /tmp/x.sh` and nothing of
+                    // what it did — which is the intelligence running the body
+                    // exists to recover.
+                    self.log_command(&line, CommandSource::Script, Some(status));
+                }
+                Capture::PasswordChange { target, password } => {
+                    // A password set non-interactively. Logged as an auth event
+                    // so credential dashboards pick it up alongside guesses —
+                    // this is the secret the attacker chose, which is at least
+                    // as interesting as the ones they tried.
+                    event::auth_attempt(
+                        session_id,
+                        peer,
+                        &target,
+                        "chpasswd",
+                        Some(&password),
+                        None,
+                        true,
+                    );
+                }
                 Capture::SuAuth { target, password } => {
                     // A guessed password entered at an `su` prompt: log it as an
                     // authentication attempt (accepted, matching the switch).
-                    event::auth_attempt(session_id, peer, &target, "su", Some(&password), true);
+                    event::auth_attempt(
+                        session_id,
+                        peer,
+                        &target,
+                        "su",
+                        Some(&password),
+                        None,
+                        true,
+                    );
                 }
             }
         }
@@ -676,7 +924,7 @@ impl MimicHandler {
             .max_upload_bytes
             .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
         let stored_path = if self.quarantine_bytes.saturating_add(file.data.len() as u64) > cap {
-            tracing::warn!(event = "quarantine_session_cap", session_id);
+            event::quarantine_session_cap(session_id, peer);
             String::new()
         } else {
             match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
@@ -685,11 +933,7 @@ impl MimicHandler {
                     p
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        event = "quarantine_error",
-                        session_id,
-                        error = %err,
-                    );
+                    event::quarantine_error(session_id, peer, &err.to_string());
                     String::new()
                 }
             }
@@ -728,7 +972,7 @@ impl MimicHandler {
             .saturating_add(upload.data.len() as u64)
             > cap
         {
-            tracing::warn!(event = "quarantine_session_cap", session_id);
+            event::quarantine_session_cap(session_id, peer);
             String::new()
         } else {
             match write_quarantine(&quarantine_dir, &stored_sha256, &upload.data) {
@@ -737,11 +981,7 @@ impl MimicHandler {
                     p
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        event = "quarantine_error",
-                        session_id,
-                        error = %err,
-                    );
+                    event::quarantine_error(session_id, peer, &err.to_string());
                     String::new()
                 }
             }
@@ -840,13 +1080,38 @@ fn write_quarantine(
     // Content-addressed store: identical payloads dedupe. `create_new` also
     // closes the exists()-then-write TOCTOU — if a concurrent session already
     // stored the same bytes, `AlreadyExists` is success, not an error.
-    let newly_written = match create_restricted(&path) {
-        Ok(mut file) => {
-            file.write_all(data)?;
-            data.len() as u64
+    // Write to a scratch name and rename into place, so the store's invariant —
+    // the filename is the SHA-256 of the contents — holds even if the write
+    // fails partway. A direct write that dies on ENOSPC would leave a truncated
+    // file under a valid hash name, and every later upload of the same payload
+    // would then take the `AlreadyExists` path and report that corrupt file as
+    // successfully stored. `rename` is atomic on both target platforms.
+    let newly_written = if path.exists() {
+        0
+    } else {
+        let staging = dir.join(format!("{sha256}.partial"));
+        // A concurrent session storing the same payload is using the same
+        // staging name; `create_new` makes exactly one of them the writer and
+        // the other falls back to the dedup path below.
+        match create_restricted(&staging) {
+            Ok(mut file) => {
+                let result = file.write_all(data).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(e) = result {
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(e);
+                }
+                match std::fs::rename(&staging, &path) {
+                    Ok(()) => data.len() as u64,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&staging);
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => 0,
+            Err(e) => return Err(e),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => 0,
-        Err(e) => return Err(e),
     };
     let stored = path.to_string_lossy().into_owned();
     // `Path::join` appends a backslash on Windows, so a forward-slash
@@ -891,15 +1156,16 @@ impl Handler for MimicHandler {
             user,
             "password",
             Some(password),
+            None,
             accepted,
         );
 
         if accepted {
             self.username = user.to_string();
-            jitter().await;
+            jitter_for(0).await;
             Ok(Auth::Accept)
         } else {
-            jitter().await;
+            jitter_for(0).await;
             // Keep offering the password method so the client re-prompts.
             // With `proceed_with_methods: None`, russh removes `password` from
             // the offered set on rejection, leaving only `publickey` — the
@@ -919,10 +1185,22 @@ impl Handler for MimicHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        _key: &russh::keys::PublicKey,
+        key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
         self.auth_attempts += 1;
-        event::auth_attempt(self.session_id, self.peer, user, "publickey", None, false);
+        // The offered key is intelligence in its own right: campaigns reuse key
+        // material, so the fingerprint pivots across sessions and sensors in a
+        // way a sprayed password does not.
+        let fingerprint = key.fingerprint(Default::default()).to_string();
+        event::auth_attempt(
+            self.session_id,
+            self.peer,
+            user,
+            "publickey",
+            None,
+            Some(&fingerprint),
+            false,
+        );
 
         // Reject public-key auth so clients fall back to password, which we can
         // capture in cleartext.
@@ -937,8 +1215,9 @@ impl Handler for MimicHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.log_client_banner(session);
         Ok(self.try_open_channel(channel.id().number()))
     }
 
@@ -949,15 +1228,32 @@ impl Handler for MimicHandler {
     async fn pty_request(
         &mut self,
         channel: ChannelId,
-        _term: &str,
-        _col_width: u32,
-        _row_height: u32,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
         _pix_width: u32,
         _pix_height: u32,
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.pty = true;
+        self.log_client_banner(session);
+        // A real sshd exports the requested terminal into the session, so
+        // `echo $TERM` answers with what the client asked for. Bounded and
+        // sanitised because it is attacker-controlled and reaches `env` output.
+        self.pty_term = Some(PtyRequest {
+            term: sanitise_term(term),
+            cols: if col_width == 0 {
+                80
+            } else {
+                col_width.min(10_000)
+            },
+            rows: if row_height == 0 {
+                24
+            } else {
+                row_height.min(10_000)
+            },
+        });
         session.channel_success(channel)?;
         Ok(())
     }
@@ -970,10 +1266,22 @@ impl Handler for MimicHandler {
         &mut self,
         channel: ChannelId,
         variable_name: &str,
-        _variable_value: &str,
+        variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if variable_name == "LANG" || variable_name.starts_with("LC_") {
+            // Debian's stock *client* ssh_config ships `SendEnv LANG LC_*`, so
+            // ordinary clients hit this on every connection. Answering
+            // `channel_success` and then discarding the value is worse than
+            // refusing it: the server says "accepted" and `echo $LANG` still
+            // reports the built-in default.
+            const MAX_ACCEPTED_ENV: usize = 32;
+            if self.accepted_env.len() < MAX_ACCEPTED_ENV {
+                self.accepted_env.push((
+                    variable_name.to_string(),
+                    sanitise_env_value(variable_value),
+                ));
+            }
             session.channel_success(channel)?;
         } else {
             session.channel_failure(channel)?;
@@ -986,12 +1294,28 @@ impl Handler for MimicHandler {
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
-        _col_width: u32,
-        _row_height: u32,
+        col_width: u32,
+        row_height: u32,
         _pix_width: u32,
         _pix_height: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // A resize updates COLUMNS/LINES for anything run afterwards, the way
+        // bash's SIGWINCH handler does.
+        if let Some(pty) = self.pty_term.as_mut() {
+            if col_width > 0 {
+                pty.cols = col_width.min(10_000);
+            }
+            if row_height > 0 {
+                pty.rows = row_height.min(10_000);
+            }
+        }
+        if let Some(shell) = self.shell.as_mut() {
+            if let Some(pty) = self.pty_term.as_ref() {
+                shell.env.set("COLUMNS", &pty.cols.to_string());
+                shell.env.set("LINES", &pty.rows.to_string());
+            }
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -1072,17 +1396,17 @@ impl Handler for MimicHandler {
         session.channel_success(channel)?;
         let cmd = String::from_utf8_lossy(&data[..data.len().min(MAX_COMMAND_LEN)]);
         let cmd = cmd.trim().to_string();
-        event::command(self.session_id, self.peer, &cmd);
 
         // SCP transfer requests keep the channel open and drive a sub-protocol
         // over subsequent `data` frames rather than running a one-shot command.
         if let Some(mode) = scp::parse_scp(&cmd) {
             match mode {
                 ScpMode::Sink { target, recursive } => {
-                    event::command(
-                        self.session_id,
-                        self.peer,
+                    self.log_command(&cmd, CommandSource::Exec, None);
+                    self.log_command(
                         &format!("[scp upload to {target}]"),
+                        CommandSource::Transfer,
+                        None,
                     );
                     self.scp = Some(ScpSink::new(
                         target,
@@ -1095,6 +1419,7 @@ impl Handler for MimicHandler {
                 }
                 ScpMode::Source { path } => {
                     // Download-from-honeypot is not emulated: report not found.
+                    self.log_command(&cmd, CommandSource::Exec, Some(1));
                     let msg = format!("\x01scp: {path}: No such file or directory\n");
                     session.data(channel, msg.into_bytes())?;
                     self.end_channel(channel, session, 1)?;
@@ -1117,8 +1442,11 @@ impl Handler for MimicHandler {
         // A one-shot `exec` has no interactive stdin, so drop any prompt a
         // command left pending (e.g. `su` awaiting a password).
         self.shell().pending = None;
+        // Logged after the run so the event carries the exit status: a 127 is
+        // the signal that names a command worth emulating next.
+        self.log_command(&cmd, CommandSource::Exec, Some(result.status));
         self.drain_captures();
-        jitter().await;
+        jitter_for(result.text.len() + result.stdout.len() + result.stderr.len()).await;
         self.write_output(channel, &result, session)?;
         self.end_channel(channel, session, result.status as u32)?;
         Ok(())
@@ -1202,6 +1530,13 @@ impl Handler for MimicHandler {
                         let output = self.shell().resume(&password);
                         if self.deliver(channel, &output, session).await? {
                             return Ok(());
+                        }
+                        // One answer can leave another prompt outstanding —
+                        // `passwd` asks twice — so stay in echo-suppressed
+                        // collection rather than drawing `PS1` over it.
+                        if self.shell().pending.as_ref().is_some_and(|p| !p.echoes()) {
+                            self.password_buf = Some(Vec::new());
+                            continue;
                         }
                         let prompt = self.shell().prompt();
                         self.editor.set_prompt(&prompt);
@@ -1314,14 +1649,10 @@ impl Handler for MimicHandler {
         // channel; finish the exchange with a success status.
         if self.scp.take().is_some() {
             self.end_channel(channel, session, 0)?;
-        } else if let Some(sftp) = self.sftp.take() {
+        } else if self.sftp.is_some() {
             // Builds the shell if this is the first use, as above.
             let _ = self.shell();
-            let uploads =
-                sftp.into_pending_uploads(self.shell.as_mut().expect("shell just initialised"));
-            for upload in uploads {
-                self.store_sftp_upload(upload);
-            }
+            self.drain_sftp_uploads();
             self.end_channel(channel, session, 0)?;
         } else if self.shell_started && self.active_channel == Some(channel.number()) {
             // The client closed stdin. That is end-of-input to the shell just
@@ -1371,15 +1702,73 @@ impl Handler for MimicHandler {
 
 impl Drop for MimicHandler {
     fn drop(&mut self) {
-        event::connection_closed(self.session_id, self.peer);
+        // The last-resort drain. A session torn down by the watchdog, the idle
+        // timeout, or a vanished socket reaches here and nowhere else, so an
+        // upload still in flight is captured rather than lost.
+        self.drain_sftp_uploads();
+        let duration_secs = self.opened_at.elapsed().as_secs();
+        event::connection_closed(
+            self.session_id,
+            self.peer,
+            duration_secs,
+            self.command_count,
+        );
     }
 }
 
-/// Sleep for a small randomised interval. Real OpenSSH + bash responses carry
-/// natural jitter; perfectly uniform latency is a passive honeypot tell.
-async fn jitter() {
-    let ms = rand::random_range(2..=18);
-    tokio::time::sleep(Duration::from_millis(ms)).await;
+/// Keep only what a terminal name can legally hold, bounded.
+///
+/// `TERM` is attacker-controlled and reaches `env` output, so it is restricted
+/// to the character class terminfo names actually use. An empty or hostile value
+/// falls back to what a client that sent nothing would get.
+fn sanitise_term(term: &str) -> String {
+    let cleaned: String = term
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "xterm-256color".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Strip control characters from an accepted `env` value and bound its length.
+///
+/// `Env::set` bounds length too, but a locale value reaches the terminal through
+/// `env`/`printenv` output, so escape sequences come out here rather than at the
+/// far end.
+fn sanitise_env_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
+}
+
+/// Sleep for a short interval before answering, shaped by how much work the
+/// command implied.
+///
+/// Real shell latency is heavy-tailed and correlates with what ran: a builtin
+/// answers in microseconds, a filesystem walk takes far longer. A flat uniform
+/// delay applied to every command is its own fingerprint — a scanner timing
+/// fifty commands recovers a clean uniform distribution with no correlation to
+/// workload, which no real box produces. Scaling by output size is a cheap proxy
+/// for work done, and the multiplicative noise gives the right-skewed shape.
+///
+/// ponytail: output size is a proxy, not a cost model — `sleep 10` still
+/// returns promptly. Upgrade if commands gain modelled execution costs.
+async fn jitter_for(output_bytes: usize) {
+    // Base cost of a round trip through a shell, in microseconds.
+    let base = 900u64;
+    // Roughly a microsecond per byte formatted and written.
+    let work = (output_bytes as u64).saturating_mul(1).min(240_000);
+    // Multiplicative noise: the product of two uniforms is right-skewed, so the
+    // tail is long without a hard ceiling in the wrong place.
+    let noise = rand::random_range(40..=170) * rand::random_range(40..=170) / 100;
+    let micros = (base + work).saturating_mul(noise) / 100;
+    tokio::time::sleep(Duration::from_micros(micros.clamp(400, 450_000))).await;
 }
 
 /// Lay candidate strings out in newline-separated columns the way bash prints
@@ -1425,6 +1814,7 @@ mod tests {
         let guard = registry.try_acquire(peer.ip()).expect("slot available");
         MimicHandler {
             config,
+            persona: Arc::new(crate::persona::Persona::sample()),
             session_id: 1,
             peer,
             local: "127.0.0.1:2222".parse().unwrap(),
@@ -1441,6 +1831,11 @@ mod tests {
             password_buf: None,
             line_buf: Vec::new(),
             screen: None,
+            pty_term: None,
+            accepted_env: Vec::new(),
+            banner_logged: false,
+            opened_at: std::time::Instant::now(),
+            command_count: 0,
             _guard: guard,
         }
     }
@@ -2019,6 +2414,51 @@ mod tests {
             "the redraw timer outlived the display: {:?}",
             String::from_utf8_lossy(&quiet)
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `passwd` asks twice, and *both* answers must be collected with echo
+    /// suppressed. One answer leaving another prompt outstanding is the case
+    /// the prompt loop originally missed: it would have drawn `PS1` over the
+    /// second prompt, echoed the secret in clear on the attacker's terminal,
+    /// and then run it as a command line.
+    #[tokio::test]
+    async fn passwd_suppresses_echo_for_both_prompts() {
+        let (_handle, mut channel, dir) = shell_session("passwd-echo").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel.data(&b"passwd\r"[..]).await.expect("send passwd");
+        let first = read_for(&mut channel, Duration::from_millis(300)).await;
+        let first = String::from_utf8_lossy(&first).into_owned();
+        assert!(first.contains("New password: "), "{first:?}");
+
+        channel.data(&b"hunter2\r"[..]).await.expect("first answer");
+        let second = read_for(&mut channel, Duration::from_millis(300)).await;
+        let second = String::from_utf8_lossy(&second).into_owned();
+        assert!(
+            second.contains("Retype new password: "),
+            "second prompt missing: {second:?}"
+        );
+        assert!(
+            !second.contains("hunter2"),
+            "the first answer was echoed: {second:?}"
+        );
+        assert!(
+            !second.contains("root@debian"),
+            "PS1 was drawn over the second prompt: {second:?}"
+        );
+
+        channel
+            .data(&b"hunter2\r"[..])
+            .await
+            .expect("second answer");
+        let done = read_for(&mut channel, Duration::from_millis(300)).await;
+        let done = String::from_utf8_lossy(&done).into_owned();
+        assert!(done.contains("updated successfully"), "{done:?}");
+        assert!(!done.contains("hunter2"), "the secret was echoed: {done:?}");
+        // The shell comes back afterwards.
+        assert!(done.contains("root@debian"), "no prompt after: {done:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

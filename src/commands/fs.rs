@@ -707,39 +707,88 @@ struct GrepFlags {
     line_numbers: bool,
     count_only: bool,
     show_filename: bool,
+    /// `-q`: report only through the exit status.
+    quiet: bool,
+    /// `-l`: list the names of matching files instead of the matching lines.
+    files_with_matches: bool,
+    /// `-w`: the match must stand on non-word boundaries.
+    word_regexp: bool,
+    /// `-o`: print the matched text alone.
+    only_matching: bool,
 }
 
 /// `grep [OPTION]... PATTERN [FILE]...`
 ///
 /// A literal (non-regex) substring search — `-i` case-insensitive, `-v`
-/// invert, `-n` line numbers, `-c` count only, `-r`/`-R` recurse into
-/// directories.
+/// invert, `-n` line numbers, `-c` count only, `-l` names only, `-o` matched
+/// text only, `-q` status only, `-w` whole words, `-r`/`-R` recurse,
+/// `-s`/`-h`/`-H` and `-E`/`-F`/`-G`/`-P` accepted.
 ///
-/// ponytail: literal substring match only, not real BRE/ERE regex; upgrade if
-/// attacker tooling depends on regex features.
+/// ponytail: literal substring match only, not real BRE/ERE regex — so
+/// `-E`/`-F`/`-G`/`-P` select no behaviour and a pattern with metacharacters is
+/// matched as written. Unknown flags are *accepted* rather than rejected: real
+/// grep takes all of these, and hard-erroring on `grep -q` (a scripting staple)
+/// was a stronger tell than the missing regex ever was. Upgrade when attacker
+/// tooling is seen depending on regex features.
 pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
     let mut flags = GrepFlags::default();
     let mut recursive = false;
+    let mut suppress_errors = false;
+    let mut force_filename = false;
+    let mut no_filename = false;
     let mut pattern: Option<&str> = None;
     let mut paths: Vec<&str> = Vec::new();
+    let mut expect_pattern = false;
 
     for arg in args {
-        if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
+        if expect_pattern {
+            pattern = Some(arg);
+            expect_pattern = false;
+            continue;
+        }
+        if arg.starts_with("--") {
+            match arg.as_str() {
+                "--ignore-case" => flags.ignore_case = true,
+                "--invert-match" => flags.invert = true,
+                "--line-number" => flags.line_numbers = true,
+                "--count" => flags.count_only = true,
+                "--quiet" | "--silent" => flags.quiet = true,
+                "--files-with-matches" => flags.files_with_matches = true,
+                "--word-regexp" => flags.word_regexp = true,
+                "--only-matching" => flags.only_matching = true,
+                "--recursive" | "--dereference-recursive" => recursive = true,
+                "--no-messages" => suppress_errors = true,
+                "--with-filename" => force_filename = true,
+                "--no-filename" => no_filename = true,
+                // The matcher-selecting long forms and anything else: accepted.
+                _ => {}
+            }
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
             for ch in arg[1..].chars() {
                 match ch {
-                    'i' => flags.ignore_case = true,
+                    'i' | 'y' => flags.ignore_case = true,
                     'v' => flags.invert = true,
                     'n' => flags.line_numbers = true,
                     'c' => flags.count_only = true,
                     'r' | 'R' => recursive = true,
-                    other => {
-                        return CommandResult::err(
-                            format!(
-                                "grep: invalid option -- '{other}'\nUsage: grep [OPTION]... PATTERNS [FILE]...\n"
-                            ),
-                            2,
-                        );
-                    }
+                    'q' => flags.quiet = true,
+                    'l' => flags.files_with_matches = true,
+                    'w' => flags.word_regexp = true,
+                    'o' => flags.only_matching = true,
+                    's' => suppress_errors = true,
+                    'H' => force_filename = true,
+                    'h' => no_filename = true,
+                    // `-e PATTERN` takes its argument from the next operand.
+                    'e' => expect_pattern = true,
+                    // Matcher selection: no effect on a literal matcher, but
+                    // real grep accepts them and scripts pass them constantly.
+                    'E' | 'F' | 'G' | 'P' | 'a' | 'I' | 'U' | 'z' => {}
+                    // Anything left over is accepted too. Refusing is the
+                    // louder failure: it stops the attacker's pipeline dead
+                    // where a real grep would have run.
+                    _ => {}
                 }
             }
         } else if pattern.is_none() {
@@ -765,7 +814,17 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
         };
         let mut out = String::new();
         let mut any_match = false;
-        grep_text(input, "", &needle, flags, &mut out, &mut any_match);
+        grep_text(
+            input,
+            "(standard input)",
+            &needle,
+            flags,
+            &mut out,
+            &mut any_match,
+        );
+        if flags.quiet {
+            out.clear();
+        }
         return if any_match {
             CommandResult::ok(out)
         } else {
@@ -778,7 +837,8 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
     } else {
         pattern.to_string()
     };
-    flags.show_filename = paths.len() > 1 || recursive;
+    flags.show_filename = force_filename
+        || (!no_filename && (paths.len() > 1 || recursive || flags.files_with_matches));
 
     let mut out = String::new();
     let mut errs = String::new();
@@ -820,6 +880,15 @@ pub fn grep(shell: &Shell, args: &[String]) -> CommandResult {
         }
     }
 
+    // `-q` reports through the status alone; `-s` swallows the unreadable-file
+    // messages but not the status they came with.
+    if flags.quiet {
+        out.clear();
+        errs.clear();
+    }
+    if suppress_errors {
+        errs.clear();
+    }
     CommandResult::streams(out, errs, i32::from(!any_match))
 }
 
@@ -863,9 +932,24 @@ fn grep_text(
         } else {
             line.to_string()
         };
-        if hay.contains(needle) != flags.invert {
+        let hit = if flags.word_regexp {
+            word_match(&hay, needle)
+        } else {
+            hay.contains(needle)
+        };
+        if hit != flags.invert {
             count += 1;
             *any_match = true;
+            // `-l` names the file once and stops reading it; `-q` wants nothing
+            // but the status. Both still have to set `any_match` first.
+            if flags.files_with_matches {
+                out.push_str(path);
+                out.push('\n');
+                return;
+            }
+            if flags.quiet {
+                return;
+            }
             if !flags.count_only {
                 if flags.show_filename {
                     out.push_str(path);
@@ -875,8 +959,19 @@ fn grep_text(
                     out.push_str(&(i + 1).to_string());
                     out.push(':');
                 }
-                out.push_str(line);
-                out.push('\n');
+                // `-o` prints the matched text alone, once per occurrence —
+                // taken from the line as written, since under `-i` the haystack
+                // was lowercased to match and the original casing is what real
+                // grep prints.
+                if flags.only_matching && !flags.invert {
+                    for (i, m) in hay.match_indices(needle) {
+                        out.push_str(line.get(i..i + m.len()).unwrap_or(needle));
+                        out.push('\n');
+                    }
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
             }
         }
     }
@@ -888,6 +983,81 @@ fn grep_text(
         out.push_str(&count.to_string());
         out.push('\n');
     }
+}
+
+#[cfg(test)]
+mod grep_flag_tests {
+    use crate::shell::Shell;
+
+    fn run(shell: &mut Shell, line: &str) -> crate::shell::Output {
+        shell.execute(line)
+    }
+
+    /// The flags real grep accepts that MIMIC used to hard-error on. Each one
+    /// stopped an attacker's pipeline at a point a real box would have run.
+    #[test]
+    fn grep_accepts_the_flags_scripts_actually_pass() {
+        let mut shell = Shell::new("root", "debian");
+
+        // -q: the single most common scripting form, `grep -q x f && …`.
+        let hit = run(&mut shell, "grep -q root /etc/passwd");
+        assert_eq!(hit.status, 0);
+        assert_eq!(hit.text, "", "-q must print nothing");
+        let miss = run(&mut shell, "grep -q nosuchstring /etc/passwd");
+        assert_eq!(miss.status, 1);
+
+        // -E / -F / -G select a matcher; on a literal matcher they are no-ops,
+        // but refusing them is what a scanner notices.
+        assert_eq!(run(&mut shell, "grep -E root /etc/passwd").status, 0);
+        assert_eq!(run(&mut shell, "grep -F root /etc/passwd").status, 0);
+
+        // -l names the file, -c counts, -o prints the match alone.
+        assert_eq!(
+            run(&mut shell, "grep -l root /etc/passwd").stdout,
+            "/etc/passwd\n"
+        );
+        assert_eq!(run(&mut shell, "echo aXbXc | grep -o X").stdout, "X\nX\n");
+        // Under -i the match is case-insensitive but the text printed is the
+        // line's own casing, as real grep does.
+        assert_eq!(run(&mut shell, "echo aXbXc | grep -io x").stdout, "X\nX\n");
+
+        // -s swallows the error but keeps the status.
+        let quiet_err = run(&mut shell, "grep -s root /nosuchfile");
+        assert_eq!(quiet_err.status, 1);
+        assert_eq!(quiet_err.stderr, "");
+    }
+
+    #[test]
+    fn grep_w_matches_whole_words_only() {
+        let mut shell = Shell::new("root", "debian");
+        assert_eq!(run(&mut shell, "echo rooted | grep -w root").status, 1);
+        assert_eq!(run(&mut shell, "echo 'a root b' | grep -w root").status, 0);
+    }
+
+    #[test]
+    fn grep_dash_e_takes_its_pattern_from_the_next_operand() {
+        let mut shell = Shell::new("root", "debian");
+        let out = run(&mut shell, "grep -e root /etc/passwd");
+        assert_eq!(out.status, 0);
+        assert!(out.stdout.starts_with("root:x:0:0:"), "{:?}", out.stdout);
+    }
+}
+
+/// Whether `needle` occurs in `hay` bounded by non-word characters, which is
+/// what `grep -w` means. A word character is alphanumeric or `_`, as in GNU.
+fn word_match(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    hay.match_indices(needle).any(|(i, m)| {
+        let before = hay[..i].chars().next_back().is_none_or(|c| !is_word(c));
+        let after = hay[i + m.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word(c));
+        before && after
+    })
 }
 
 /// Recurse into a directory for `grep -r`, always showing filenames. Files
@@ -1810,6 +1980,14 @@ pub fn touch(shell: &mut Shell, args: &[String]) -> CommandResult {
                 if no_create && shell.vfs.child(parent, &name).is_none() {
                     continue;
                 }
+                if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full() {
+                    out.push_str(&format!(
+                        "touch: cannot touch '{path}': No space left on device
+"
+                    ));
+                    status = 1;
+                    continue;
+                }
                 shell.vfs.touch(parent, &name, uid, gid);
             }
             None => {
@@ -1894,6 +2072,14 @@ pub fn mkdir(shell: &mut Shell, args: &[String]) -> CommandResult {
                 if shell.vfs.child(parent, &name).is_some() {
                     out.push_str(&format!(
                         "mkdir: cannot create directory '{path}': File exists\n"
+                    ));
+                    status = 1;
+                } else if shell.vfs.is_full() {
+                    // A real kernel reports the failure; silently exiting 0 on
+                    // a directory that never appears is a honeypot tell.
+                    out.push_str(&format!(
+                        "mkdir: cannot create directory '{path}': No space left on device
+"
                     ));
                     status = 1;
                 } else {
@@ -2150,6 +2336,16 @@ pub fn cp(shell: &mut Shell, args: &[String]) -> CommandResult {
                 }
             }
         };
+        // At the node cap `deep_copy` silently returns the parent, so the copy
+        // would exit 0 on a file that never appears — both a bug and a tell,
+        // since real `cp` reports ENOSPC.
+        if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full() {
+            out.push_str(&format!(
+                "cp: cannot create regular file '{name}': No space left on device\n"
+            ));
+            status = 1;
+            continue;
+        }
         shell.vfs.deep_copy(src_id, parent, &name);
     }
     finish(out, status)

