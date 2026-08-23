@@ -26,6 +26,12 @@ const INSTALLED: &[(&str, &str, &str)] = &[
     ("dpkg", "1.21.22", "Debian package management system"),
     ("libc6", "2.36-9+deb12u4", "GNU C Library: Shared libraries"),
     (
+        "mawk",
+        "1.3.4.20200120-3.1",
+        "a pattern scanning and text processing language",
+    ),
+    ("netcat-openbsd", "1.219-1", "TCP/IP swiss army knife"),
+    (
         "openssh-server",
         "1:9.2p1-2+deb12u3",
         "secure shell (SSH) server, for secure access from remote machines",
@@ -35,6 +41,7 @@ const INSTALLED: &[(&str, &str, &str)] = &[
         "3.0.11-1~deb12u2",
         "Secure Sockets Layer toolkit - cryptographic utility",
     ),
+    ("perl-base", "5.36.0-7+deb12u1", "minimal Perl system"),
     (
         "python3",
         "3.11.2-1+b1",

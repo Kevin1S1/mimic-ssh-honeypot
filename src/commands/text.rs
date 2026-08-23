@@ -886,6 +886,320 @@ pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(out, errs, status)
 }
 
+/// `awk [-F SEP] [-v VAR=VAL] PROGRAM [FILE...]`
+///
+/// A deliberately small subset: `[pattern] { print ... }` rules, plus a bare
+/// pattern (which prints the line). That covers the shape awk actually takes in
+/// an attack script — `awk '{print $2}'`, `awk -F: '$3==0 {print $1}'`,
+/// `awk '/root/'` — which is pipeline plumbing, not programming. A pipeline
+/// dies at its first `command not found`, so awk's absence hid everything
+/// downstream of it; that is what this is here to stop.
+///
+/// Anything outside the subset is a syntax error rather than a wrong answer.
+/// Silently printing nothing for a program it did not understand would make
+/// awk look like it ran and found no matches, which is worse than admitting it
+/// could not parse the program.
+///
+// ponytail: no user functions, arrays, loops, or BEGIN/END bodies beyond
+// `print`. Upgrade when captured `command` events show programs being rejected
+// here — `status: 2` on an `awk` line is the signal.
+pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut sep: Option<String> = None;
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut program: Option<String> = None;
+    let mut files: Vec<&str> = Vec::new();
+    let mut iter = args.iter();
+
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-F" => sep = iter.next().cloned(),
+            "-v" => {
+                if let Some((k, v)) = iter.next().and_then(|s| s.split_once('=')) {
+                    vars.push((k.to_string(), v.to_string()));
+                }
+            }
+            "-f" => {
+                // `awk -f prog.awk` reads the program from a file. Attackers
+                // drop the program alongside the payload, so it is worth
+                // reading out of the VFS rather than refusing.
+                let Some(path) = iter.next() else { continue };
+                match shell.vfs.resolve(shell.cwd, path) {
+                    Some(id) => match &shell.vfs.node(id).kind {
+                        NodeKind::File { contents } => {
+                            program = Some(String::from_utf8_lossy(contents).into_owned())
+                        }
+                        _ => {
+                            return CommandResult::err(format!("awk: can't open file {path}\n"), 2)
+                        }
+                    },
+                    None => return CommandResult::err(format!("awk: can't open file {path}\n"), 2),
+                }
+            }
+            s if s.starts_with("-F") && s.len() > 2 => sep = Some(s[2..].to_string()),
+            s if s.starts_with("-v") && s.len() > 2 => {
+                if let Some((k, v)) = s[2..].split_once('=') {
+                    vars.push((k.to_string(), v.to_string()));
+                }
+            }
+            s if s.starts_with('-') && s.len() > 1 => {}
+            other if program.is_none() => program = Some(other.to_string()),
+            other => files.push(other),
+        }
+    }
+
+    let Some(program) = program else {
+        return CommandResult::err(
+            "usage: awk [-F fs][-v var=value][prog | -f progfile][file ...]\n",
+            2,
+        );
+    };
+
+    // `-v FS=:` is the other way to set the separator, and scripts use both.
+    let sep = vars
+        .iter()
+        .find(|(k, _)| k == "FS")
+        .map(|(_, v)| v.clone())
+        .or(sep);
+
+    let rules = match parse_awk(&program) {
+        Some(rules) => rules,
+        None => {
+            return CommandResult::err(
+                format!("awk: syntax error at source line 1\n context is\n\t{program}\n"),
+                2,
+            )
+        }
+    };
+
+    let (text, errs, status) = input_text(shell, "awk", &files);
+    if status != 0 {
+        return CommandResult::err(errs, status);
+    }
+
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let fields = split_fields(line, sep.as_deref());
+        for rule in &rules {
+            if !awk_matches(&rule.pattern, line, &fields, i as u64 + 1) {
+                continue;
+            }
+            match &rule.action {
+                // A bare pattern prints the whole line, like `awk '/root/'`.
+                None => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                Some(items) => {
+                    let rendered: Vec<String> = items
+                        .iter()
+                        .map(|it| awk_value(it, line, &fields, i as u64 + 1))
+                        .collect();
+                    out.push_str(&rendered.join(" "));
+                    out.push('\n');
+                }
+            }
+        }
+        // Dispatch caps the result afterwards, but awk can emit more than it
+        // read (`{print $0 $0}`), so stop at the cap rather than inflating
+        // first and trimming after.
+        if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
+            break;
+        }
+    }
+    cap(&mut out);
+    CommandResult::ok(out)
+}
+
+/// One `pattern { action }` rule. `action: None` is a bare pattern.
+struct AwkRule {
+    pattern: AwkPattern,
+    action: Option<Vec<String>>,
+}
+
+enum AwkPattern {
+    /// No pattern: the rule runs on every line.
+    Always,
+    /// `/regex/` — substring matching only; see `parse_awk`.
+    Contains(String),
+    /// `$N == "value"` / `$N != "value"`.
+    FieldEq {
+        field: usize,
+        value: String,
+        negate: bool,
+    },
+    /// `NR == N`.
+    LineIs(u64),
+}
+
+/// Parse the supported subset. Returns `None` for anything else, which the
+/// caller turns into a syntax error.
+fn parse_awk(program: &str) -> Option<Vec<AwkRule>> {
+    let mut rules = Vec::new();
+    for chunk in split_awk_rules(program) {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let (pattern_src, action_src) = match chunk.split_once('{') {
+            Some((p, rest)) => (p.trim(), Some(rest.trim_end().trim_end_matches('}').trim())),
+            None => (chunk, None),
+        };
+        // BEGIN/END need a program state this subset does not model, and
+        // guessing at them would produce output a real awk never printed.
+        if pattern_src.starts_with("BEGIN") || pattern_src.starts_with("END") {
+            return None;
+        }
+        let pattern = parse_awk_pattern(pattern_src)?;
+        let action = match action_src {
+            None => None,
+            Some(body) => Some(parse_awk_print(body)?),
+        };
+        rules.push(AwkRule { pattern, action });
+    }
+    if rules.is_empty() {
+        return None;
+    }
+    Some(rules)
+}
+
+/// Split a program into rules on top-level `}`, so `'/a/{print} /b/{print}'`
+/// parses as two rules and a `}` inside a string does not split anything.
+fn split_awk_rules(program: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut in_regex = false;
+    for c in program.chars() {
+        match c {
+            '"' if !in_regex => in_string = !in_string,
+            '/' if !in_string => in_regex = !in_regex,
+            _ => {}
+        }
+        current.push(c);
+        if c == '}' && !in_string && !in_regex {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn parse_awk_pattern(src: &str) -> Option<AwkPattern> {
+    let src = src.trim();
+    if src.is_empty() {
+        return Some(AwkPattern::Always);
+    }
+    // `/text/` — treated as a substring, not a regex. Anything with regex
+    // metacharacters is refused rather than silently matched as a literal,
+    // because a wrong match set is worse than an honest syntax error.
+    if let Some(body) = src.strip_prefix('/').and_then(|s| s.strip_suffix('/')) {
+        if body.contains(['*', '+', '?', '[', ']', '(', ')', '|', '\\', '{', '}']) {
+            return None;
+        }
+        return Some(AwkPattern::Contains(
+            body.trim_start_matches('^')
+                .trim_end_matches('$')
+                .to_string(),
+        ));
+    }
+    if let Some(rest) = src.strip_prefix("NR") {
+        let rest = rest.trim().strip_prefix("==")?.trim();
+        return rest.parse().ok().map(AwkPattern::LineIs);
+    }
+    if let Some(rest) = src.strip_prefix('$') {
+        let (negate, split) = if rest.contains("!=") {
+            (true, "!=")
+        } else {
+            (false, "==")
+        };
+        let (idx, value) = rest.split_once(split)?;
+        let field = idx.trim().parse().ok()?;
+        let value = value.trim().trim_matches('"').to_string();
+        return Some(AwkPattern::FieldEq {
+            field,
+            value,
+            negate,
+        });
+    }
+    None
+}
+
+/// Parse a `{ print a, b }` body into the items to print. Only `print` is
+/// supported; `printf`, assignments and control flow are refused.
+fn parse_awk_print(body: &str) -> Option<Vec<String>> {
+    let body = body.trim().trim_end_matches(';').trim();
+    if body.is_empty() || body == "print" {
+        return Some(vec!["$0".to_string()]);
+    }
+    let rest = body.strip_prefix("print ")?;
+    Some(
+        rest.split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    )
+}
+
+fn awk_matches(pattern: &AwkPattern, line: &str, fields: &[String], nr: u64) -> bool {
+    match pattern {
+        AwkPattern::Always => true,
+        AwkPattern::Contains(needle) => line.contains(needle.as_str()),
+        AwkPattern::LineIs(n) => *n == nr,
+        AwkPattern::FieldEq {
+            field,
+            value,
+            negate,
+        } => {
+            let actual = awk_field(*field, line, fields);
+            (actual == *value) != *negate
+        }
+    }
+}
+
+/// Resolve one `print` item: a field reference, `NR`/`NF`, a quoted string, or
+/// a literal passed through as awk would print an unset variable's name-free
+/// empty value only for bare identifiers.
+fn awk_value(item: &str, line: &str, fields: &[String], nr: u64) -> String {
+    if let Some(idx) = item.strip_prefix('$') {
+        if let Ok(n) = idx.trim().parse::<usize>() {
+            return awk_field(n, line, fields);
+        }
+    }
+    match item {
+        "NR" => nr.to_string(),
+        "NF" => fields.len().to_string(),
+        s if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 => {
+            s[1..s.len() - 1].to_string()
+        }
+        // An unset variable is the empty string in awk, and every bare
+        // identifier here is unset — this subset has no assignment.
+        _ => String::new(),
+    }
+}
+
+fn awk_field(n: usize, line: &str, fields: &[String]) -> String {
+    if n == 0 {
+        return line.to_string();
+    }
+    fields.get(n - 1).cloned().unwrap_or_default()
+}
+
+/// Split a line the way awk does: on runs of whitespace by default, or on each
+/// occurrence of an explicit `-F` separator.
+fn split_fields(line: &str, sep: Option<&str>) -> Vec<String> {
+    match sep {
+        None => line.split_whitespace().map(str::to_string).collect(),
+        Some(s) if s.is_empty() || s == " " => {
+            line.split_whitespace().map(str::to_string).collect()
+        }
+        // `-F '\t'` arrives as a two-character string from the shell.
+        Some("\\t") => line.split('\t').map(str::to_string).collect(),
+        Some(s) => line.split(s).map(str::to_string).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::shell::Shell;
@@ -1064,5 +1378,64 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "echo abc | rev"), "cba\n");
         assert_eq!(run(&mut shell, "echo hi | nl"), "     1\thi\n");
+    }
+    #[test]
+    fn awk_handles_the_pipeline_shapes_attackers_use() {
+        let mut shell = Shell::new("root", "debian");
+
+        // The single most common form, and the reason awk's absence mattered:
+        // a pipeline dies at its first `command not found`, so everything
+        // downstream of awk used to be invisible.
+        assert_eq!(
+            shell.execute("echo 'a b c' | awk '{print $2}'").stdout,
+            "b\n"
+        );
+        assert_eq!(
+            shell.execute("echo 'a b c' | awk '{print $3, $1}'").stdout,
+            "c a\n"
+        );
+        assert_eq!(
+            shell.execute("echo 'a b' | awk '{print $0}'").stdout,
+            "a b\n"
+        );
+
+        // Finding uid-0 accounts is textbook post-exploitation recon.
+        let roots = shell.execute("awk -F: '$3 == 0 {print $1}' /etc/passwd");
+        assert_eq!(roots.stdout, "root\n");
+
+        // A bare pattern prints the whole line.
+        assert!(shell
+            .execute("awk '/root/' /etc/passwd")
+            .stdout
+            .starts_with("root:x:0:0:"));
+
+        // NR and NF are the other two names worth supporting.
+        assert_eq!(
+            shell
+                .execute("printf 'x\\ny\\n' | awk 'NR == 2 {print $1}'")
+                .stdout,
+            "y\n"
+        );
+        assert_eq!(
+            shell.execute("echo 'a b c' | awk '{print NF}'").stdout,
+            "3\n"
+        );
+    }
+
+    #[test]
+    fn awk_admits_what_it_cannot_parse() {
+        let mut shell = Shell::new("root", "debian");
+        // Printing nothing would make awk look like it ran and matched no
+        // lines, which is a worse lie than an honest syntax error — and
+        // `status: 2` on an awk line is the signal for what to implement next.
+        for program in [
+            "BEGIN {x = 1} {print x}",
+            "{for (i = 1; i <= NF; i++) print $i}",
+            "{printf \"%s\\n\", $1}",
+        ] {
+            let result = shell.execute(&format!("echo a | awk '{program}'"));
+            assert_eq!(result.status, 2, "{program}");
+            assert!(result.stderr.contains("syntax error"), "{program}");
+        }
     }
 }

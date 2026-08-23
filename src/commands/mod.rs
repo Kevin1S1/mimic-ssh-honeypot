@@ -160,6 +160,8 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "wc" => CommandHandler::Read(fs::wc),
         "grep" => CommandHandler::Read(fs::grep),
         "find" => CommandHandler::Read(fs::find),
+        "stat" => CommandHandler::Read(fs::stat),
+        "du" => CommandHandler::Read(fs::du),
 
         // Text-processing plumbing. These are what shell one-liners are made
         // of: a pipeline dies at its first `command not found`, so their
@@ -177,6 +179,7 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "seq" => CommandHandler::Read(text::seq),
         "tee" => CommandHandler::Mut(text::tee),
         "xargs" => CommandHandler::Mut(text::xargs),
+        "awk" | "mawk" => CommandHandler::Read(text::awk),
         "sha256sum" => CommandHandler::Read(text::sha256sum),
         "sha512sum" => CommandHandler::Read(text::sha512sum),
 
@@ -188,6 +191,9 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "cp" => CommandHandler::Mut(fs::cp),
         "mv" => CommandHandler::Mut(fs::mv),
         "chmod" => CommandHandler::Mut(fs::chmod),
+        "chown" => CommandHandler::Mut(fs::chown),
+        "chgrp" => CommandHandler::Mut(fs::chgrp),
+        "ln" => CommandHandler::Mut(fs::ln),
         "tar" => CommandHandler::Mut(fs::tar),
 
         // System / identity commands.
@@ -258,6 +264,12 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "netstat" => CommandHandler::Read(net::netstat),
         "ss" => CommandHandler::Read(net::ss),
         "ip" => CommandHandler::Read(net::ip),
+        "nc" | "netcat" => CommandHandler::Mut(net::nc),
+
+        // Interpreter invocations. Nothing is ever interpreted — the payload is
+        // the intelligence, and it is already in the `command` event.
+        "python3" => CommandHandler::Mut(net::python3),
+        "perl" => CommandHandler::Mut(net::perl),
 
         // Package-manager stubs (in-memory package DB; nothing is ever installed).
         "apt" | "apt-get" => CommandHandler::Read(pkg::apt),

@@ -92,9 +92,9 @@ Home directories for non-root attackers are created automatically under `/home/<
 | Category | Commands |
 |---|---|
 | **Navigation** | `ls` (`-a`/`-A`/`-d`/`-l`/`-h`/`-1`), `cd` (`~`/`-`/`..`), `pwd` |
-| **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `tar` (`-c`/`-x`/`-t`/`-v`, dashless bundled flags) |
-| **Text** | `echo` (`-n`/`-e`), `printf`, `grep` (`-i`/`-v`/`-n`/`-c`/`-r`/`-q`/`-l`/`-w`/`-o`/`-s`/`-h`/`-H`/`-e`, with `-E`/`-F`/`-G`/`-P` accepted; literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`) |
-| **Text plumbing** | `sed` (`s///`, `d`, `p`, any delimiter, literal patterns), `cut` (`-d`/`-f`/`-c`), `tr` (`-d`/`-s`, ranges, POSIX classes), `sort` (`-r`/`-n`/`-u`), `uniq` (`-c`/`-d`/`-u`), `xargs` (`-n`), `tee` (`-a`), `rev`, `nl`, `seq`, `basename`, `dirname`, `base64` (`-d`/`-w0`), `sha256sum`, `sha512sum` |
+| **File ops** | `cat`, `touch`, `mkdir` (`-p`), `rm` (`-r`/`-f`), `rmdir`, `cp` (`-r`), `mv`, `chmod` (octal + symbolic), `chown`/`chgrp` (`-R`, root-only), `ln` (`-s`/`-f`), `tar` (`-c`/`-x`/`-t`/`-v`, dashless bundled flags) |
+| **Text** | `echo` (`-n`/`-e`), `printf`, `grep` (`-i`/`-v`/`-n`/`-c`/`-r`/`-q`/`-l`/`-w`/`-o`/`-s`/`-h`/`-H`/`-e`, with `-E`/`-F`/`-G`/`-P` accepted; literal substring match), `find` (`-name`/`-type`, glob `-name`), `head`/`tail` (`-n`/`-c`/`-N`), `wc` (`-l`/`-w`/`-c`), `stat` (`-c FORMAT`/`-t`), `du` (`-s`/`-h`/`-a`/`-k`/`-m`/`--max-depth`) |
+| **Text plumbing** | `sed` (`s///`, `d`, `p`, any delimiter, literal patterns), `cut` (`-d`/`-f`/`-c`), `tr` (`-d`/`-s`, ranges, POSIX classes), `sort` (`-r`/`-n`/`-u`), `uniq` (`-c`/`-d`/`-u`), `xargs` (`-n`), `tee` (`-a`), `rev`, `nl`, `seq`, `basename`, `dirname`, `base64` (`-d`/`-w0`), `sha256sum`, `sha512sum`, `awk`/`mawk` (`-F`/`-v`/`-f`; `[pattern] {print …}` rules — see below) |
 | **Accounts** | `passwd` (prompts twice, echo suppressed), `chpasswd`, `useradd`/`adduser` (`-m`/`-s`/`-u`), `userdel`/`deluser`, `groupadd`/`addgroup`, `getent` (`passwd`/`group`/`shadow`/`hosts`) |
 | **Services** | `systemctl` (`status`/`is-active`/`is-enabled`/`list-units`/`start`/`stop`/`enable`/`disable`/`daemon-reload`), `service`, `nohup`, `chattr`, `lsattr`, `sleep`, `sync`, `nologin` |
 | **Identity** | `whoami`, `id`, `groups`, `uname` (`-a`/`-s`/`-n`/`-r`/`-v`/`-m`/`-o`), `arch`, `hostname`, `nproc`, `lscpu`, `lsb_release` (`-a`/`-s`/`-i`/`-d`/`-r`/`-c`), `tty`, `date` (`+FORMAT`) |
@@ -102,7 +102,8 @@ Home directories for non-root attackers are created automatically under `/home/<
 | **Shells** | `bash`/`sh` (`-c LINE`, a script operand read from the VFS, or piped stdin — each line runs through the same shell that would have run it interactively), `scp` (local copy; remote operands fail as unreachable) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
 | **Processes** | `ps` (`aux`/`-ef`), `top` (holds the screen and repaints until `q`; `-b`/`-n` dump once), `kill`, `pkill`, `killall`, `pidof`, `pgrep` (`-l`), `free`, `uptime` |
-| **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip` |
+| **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`, `nc`/`netcat` |
+| **Interpreters** | `python3`, `perl` — invocation only; nothing is ever interpreted (see below) |
 | **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
 | **Shell built-ins** | `exit` (`[N]`), `logout` (`[N]`), `true`, `false`, `cd`, `export`, `unset` |
@@ -112,7 +113,11 @@ A session behaves according to whether it asked for a terminal. With a PTY it is
 
 Commands write to stdout and stderr separately, as real ones do: a pipeline carries only stdout onward, `$(…)` captures only stdout, `2>` catches only stderr, and an `exec` channel without a PTY sends stderr as `SSH_EXTENDED_DATA_STDERR` so `ssh host nosuchcmd 2>/dev/null` is silent. A channel that asked for a PTY gets the two merged onto the terminal, because a real one has a single stream.
 
-`wget` and `curl` log a `download` capture event with the target URL and write a placeholder file into the VFS. SCP and SFTP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit. `tar` reads and writes real POSIX ustar archives, so `tar czf t.tgz d && tar tzf t.tgz` round-trips inside the VFS; nothing is compressed, since no command in the emulator can tell (`-z`/`-j`/`-J` are accepted and ignored).
+`wget`, `curl`, `nc` and a `python3`/`perl` one-liner that reaches for the network all log a `download` capture event naming the remote endpoint, so one query recovers every host a session tried to contact; `wget` and `curl` additionally write a placeholder file into the VFS.
+
+**The interpreters run nothing.** `python3 -c` and `perl -e` are emulated at the *invocation*: the payload is already captured verbatim in the `command` event, which is where the intelligence is, and executing attacker code is the one thing this box exists not to do. A one-liner that opens a socket gets the traceback a failed connect produces — by far the most common real outcome, since the attacker's listener is usually already gone — and anything else exits quietly. Before this existed the same line came back `command not found` while `dpkg -l` listed `python3` as installed, which was a one-command contradiction. `nc` behaves the same way: no socket is opened, and a connect always reports `Connection refused`.
+
+**`awk` covers pipeline plumbing, not programming.** `{print $N}` rules, `-F`/`-v FS`, bare `/pattern/` matches, `$N == "v"` comparisons and `NR`/`NF` — the shapes awk actually takes in an attack script. Anything outside that subset is a **syntax error with `status: 2`**, deliberately: printing nothing would make awk look like it ran and matched nothing, which is a worse lie than an honest refusal, and the non-zero status is the signal for what to implement next. SCP and SFTP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit. `tar` reads and writes real POSIX ustar archives, so `tar czf t.tgz d && tar tzf t.tgz` round-trips inside the VFS; nothing is compressed, since no command in the emulator can tell (`-z`/`-j`/`-J` are accepted and ignored).
 
 
 ### SSH Banner
@@ -313,7 +318,7 @@ The remaining `WARN`s (`accept_error`, `quarantine_session_cap`,
 | `client_banner` | INFO | yes | The client's SSH version string, at first channel open. |
 | `auth_attempt` | INFO / **WARN** if `accepted` | yes | A credential was offered. Carries `password` (cleartext) or a public-key `fingerprint`. |
 | `command` | INFO | yes | A command line ran. Carries `source` and `status`. |
-| `download` | INFO | yes | `wget`/`curl` was used. No real request was made. |
+| `download` | INFO | yes | A remote endpoint was named (`wget`/`curl`/`nc`, or a `python3`/`perl` one-liner). No real request was made. |
 | `subsystem_request` | INFO | yes | A subsystem (e.g. SFTP) was requested. |
 | `upload` | WARN | yes | An SCP/SFTP payload was captured to the quarantine store. |
 | `quarantine_session_cap` | WARN | yes | The session hit its real-disk write cap; the payload is still in the VFS. |

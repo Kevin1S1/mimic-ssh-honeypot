@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `awk`/`mawk`, `nc`/`netcat`, `stat`, `du`, `ln`, `chown`/`chgrp`, `python3` and
+  `perl`. A pipeline dies at its first `command not found`, so `awk`'s absence
+  hid everything downstream of it; the rest are ordinary recon and persistence
+  plumbing that used to end a session early.
+- `nc` and a `python3`/`perl` one-liner that reaches for the network record the
+  endpoint as a `download` event, alongside `wget` and `curl`. One query now
+  recovers every remote host a session named.
+- `mawk`, `netcat-openbsd` and `perl-base` in the fake package database, so
+  `dpkg -l` agrees with what `/usr/bin` holds.
 - `log_retention_pruned` event, emitted when the retention sweep deletes rotated
   log files.
 - Every event carries the ECS classification fields `event_kind`,
