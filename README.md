@@ -87,6 +87,13 @@ A Debian 12 filesystem snapshot is loaded at startup into the in-memory VFS:
 
 Home directories for non-root attackers are created automatically under `/home/<username>`.
 
+`/usr/bin` and `/usr/sbin` list 400 real Debian 12 binary names, sourced from
+package filelists, matching `dpkg -l`. Most are listed for realism only — see
+"Emulated Commands" below for what actually runs. Running a listed-but-not-
+emulated name exits 0 with no output, the same outcome a real kernel gives an
+empty-but-executable file (`ENOEXEC` falls back to `/bin/sh`, and an empty
+script does nothing); an unlisted name still gets `command not found`.
+
 ### Emulated Commands
 
 | Category | Commands |

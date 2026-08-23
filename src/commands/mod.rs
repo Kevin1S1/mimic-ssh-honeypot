@@ -301,7 +301,24 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
             return CommandResult::err(format!("-bash: {cmd}: too many arguments\n"), 1);
         }
 
-        other => return CommandResult::err(format!("-bash: {other}: command not found\n"), 127),
+        other => {
+            // Listed in `/usr/bin`/`/usr/sbin` (see `vfs::snapshot::USR_BIN`)
+            // but not wired into this match: a genuinely empty file, same as
+            // the VFS actually holds for it. A real kernel's execve() on a
+            // zero-byte-but-executable file returns ENOEXEC, and bash's
+            // documented fallback re-execs it through `/bin/sh` as a script —
+            // an empty script does nothing and exits 0. That is consistent
+            // with `ls -l`/`stat`/`which`/`dpkg -S`, which all read the same
+            // empty-file fact, rather than inventing a separate behaviour.
+            // A name not listed at all is unknown to the box, not merely
+            // unimplemented, so it keeps the real `command not found`.
+            if crate::vfs::snapshot::USR_BIN.contains(&other)
+                || crate::vfs::snapshot::USR_SBIN.contains(&other)
+            {
+                return CommandResult::empty();
+            }
+            return CommandResult::err(format!("-bash: {other}: command not found\n"), 127);
+        }
     };
 
     let mut result = handler.run(shell, args);

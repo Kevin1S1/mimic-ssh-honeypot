@@ -9,28 +9,83 @@ use super::CommandResult;
 use crate::shell::Shell;
 
 /// A handful of packages a base Debian 12 install ships, for `dpkg -l` and
-/// `apt list --installed`.
+/// `apt list --installed`. Alphabetical by package name. The second group is
+/// the major contributors behind the `/usr/bin`/`/usr/sbin` density in
+/// `vfs::snapshot::USR_BIN`/`USR_SBIN` — `dpkg -l` has to agree that the
+/// packages behind those listed binaries are installed.
 const INSTALLED: &[(&str, &str, &str)] = &[
+    ("adduser", "3.131", "add and remove users and groups"),
     (
         "base-files",
         "12.4+deb12u5",
         "Debian base system miscellaneous files",
     ),
     ("bash", "5.2.15-2+b7", "GNU Bourne Again SHell"),
+    (
+        "bind9-dnsutils",
+        "1:9.18.28-1~deb12u2",
+        "Clients provided with BIND9",
+    ),
+    (
+        "bzip2",
+        "1.0.8-5+b1",
+        "high-quality block-sorting file compressor",
+    ),
     ("coreutils", "9.1-1", "GNU core utilities"),
+    ("cron", "3.0pl1-184", "process scheduling daemon"),
     (
         "curl",
         "7.88.1-10+deb12u5",
         "command line tool for transferring data with URL syntax",
     ),
+    (
+        "debianutils",
+        "5.7-0.5~deb12u1",
+        "Miscellaneous utilities specific to Debian",
+    ),
     ("dpkg", "1.21.22", "Debian package management system"),
+    (
+        "e2fsprogs",
+        "1.47.0-2",
+        "ext2/ext3/ext4 file system utilities",
+    ),
+    (
+        "findutils",
+        "4.9.0-4",
+        "utilities for finding files--find, xargs",
+    ),
+    ("gzip", "1.12-1", "GNU compression utilities"),
+    (
+        "iproute2",
+        "6.1.0-3",
+        "networking and traffic control tools",
+    ),
+    ("less", "590-2.1~deb12u2", "pager program similar to more"),
+    ("libc-bin", "2.36-9+deb12u4", "GNU C Library: Binaries"),
     ("libc6", "2.36-9+deb12u4", "GNU C Library: Shared libraries"),
+    ("man-db", "2.11.2-2", "tools for reading manual pages"),
     (
         "mawk",
         "1.3.4.20200120-3.1",
         "a pattern scanning and text processing language",
     ),
+    (
+        "nano",
+        "7.2-1",
+        "small, friendly text editor inspired by Pico",
+    ),
+    (
+        "ncurses-bin",
+        "6.4-4",
+        "terminal-related programs and man pages",
+    ),
+    ("net-tools", "2.10-0.1", "NET-3 networking toolkit"),
     ("netcat-openbsd", "1.219-1", "TCP/IP swiss army knife"),
+    (
+        "openssh-client",
+        "1:9.2p1-2+deb12u3",
+        "secure shell (SSH) client, for secure access to remote machines",
+    ),
     (
         "openssh-server",
         "1:9.2p1-2+deb12u3",
@@ -42,6 +97,7 @@ const INSTALLED: &[(&str, &str, &str)] = &[
         "Secure Sockets Layer toolkit - cryptographic utility",
     ),
     ("perl-base", "5.36.0-7+deb12u1", "minimal Perl system"),
+    ("procps", "2:3.3.17-7", "/proc file system utilities"),
     (
         "python3",
         "3.11.2-1+b1",
@@ -52,7 +108,18 @@ const INSTALLED: &[(&str, &str, &str)] = &[
         "1.9.13p3-1+deb12u1",
         "Provide limited super user privileges to specific users",
     ),
+    (
+        "tar",
+        "1.34+dfsg-1.2+deb12u1",
+        "GNU version of the tar archiving utility",
+    ),
+    (
+        "util-linux",
+        "2.38.1-5+deb12u3",
+        "miscellaneous system utilities",
+    ),
     ("wget", "1.21.3-1+deb12u1", "retrieves files from the web"),
+    ("xz-utils", "5.4.1-0.2", "XZ-format compression utilities"),
 ];
 
 /// `apt` / `apt-get`

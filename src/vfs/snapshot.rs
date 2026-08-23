@@ -8,9 +8,22 @@
 use super::Vfs;
 use crate::persona::Persona;
 
-/// Binaries in `/usr/bin` — one per non-builtin command the registry serves,
-/// so `ls /usr/bin`, `which`, Tab completion, and dispatch all agree.
-const USR_BIN: &[&str] = &[
+/// Binaries "installed" under `/usr/bin` — what `ls`, `which`, and tab
+/// completion see. This is the *listed* set, a superset of what
+/// `commands::dispatch` actually runs:
+/// `runnable_commands_resolve_under_usr_bin_or_usr_sbin` asserts
+/// `runnable ⊆ listed`, not equality. A name that is listed but not
+/// wired into dispatch resolves as a genuinely empty executable file
+/// (`fs.add_file(usr_bin, bin, &b""[..], ...)` below) — dispatch's fallback
+/// for it returns exit 0 with no output, the real ENOEXEC-into-`/bin/sh`
+/// outcome for a zero-byte executable, not an invented behaviour. See
+/// `dispatch_inner`'s `other =>` arm in `commands/mod.rs`.
+///
+/// The first block (through `xargs`) is the original runnable-backed list.
+/// Everything after is density added for realism only, grouped by the real
+/// Debian 12 (bookworm/amd64) package that ships each name, sourced from
+/// packages.debian.org filelists — not implemented, not fabricated names.
+pub(crate) const USR_BIN: &[&str] = &[
     "apt",
     "apt-get",
     "arch",
@@ -68,6 +81,7 @@ const USR_BIN: &[&str] = &[
     "pgrep",
     "pidof",
     "ping",
+    "ping6",
     "pkill",
     "printenv",
     "printf",
@@ -107,12 +121,341 @@ const USR_BIN: &[&str] = &[
     "which",
     "whoami",
     "xargs",
+    // coreutils (remaining /bin + /usr/bin names not already runnable above)
+    "[",
+    "b2sum",
+    "base32",
+    "basenc",
+    "chcon",
+    "cksum",
+    "comm",
+    "csplit",
+    "dd",
+    "dir",
+    "dircolors",
+    "expand",
+    "expr",
+    "factor",
+    "fmt",
+    "fold",
+    "hostid",
+    "install",
+    "join",
+    "link",
+    "logname",
+    "md5sum",
+    "md5sum.textutils",
+    "mkfifo",
+    "mknod",
+    "mktemp",
+    "nice",
+    "numfmt",
+    "od",
+    "paste",
+    "pathchk",
+    "pinky",
+    "pr",
+    "ptx",
+    "readlink",
+    "realpath",
+    "runcon",
+    "sha1sum",
+    "sha224sum",
+    "sha384sum",
+    "shred",
+    "shuf",
+    "split",
+    "stdbuf",
+    "stty",
+    "sum",
+    "tac",
+    "test",
+    "timeout",
+    "truncate",
+    "tsort",
+    "unexpand",
+    "unlink",
+    "users",
+    "vdir",
+    "who",
+    "yes",
+    // util-linux
+    "addpart",
+    "choom",
+    "chrt",
+    "delpart",
+    "fallocate",
+    "findmnt",
+    "flock",
+    "getopt",
+    "hardlink",
+    "i386",
+    "ionice",
+    "ipcmk",
+    "ipcrm",
+    "ipcs",
+    "lastb",
+    "linux32",
+    "linux64",
+    "lsblk",
+    "lsipc",
+    "lslocks",
+    "lslogins",
+    "lsmem",
+    "lsns",
+    "mcookie",
+    "mesg",
+    "more",
+    "mountpoint",
+    "namei",
+    "nsenter",
+    "partx",
+    "prlimit",
+    "rename.ul",
+    "resizepart",
+    "setarch",
+    "setpriv",
+    "setsid",
+    "setterm",
+    "taskset",
+    "uclampset",
+    "unshare",
+    "utmpdump",
+    "wdctl",
+    "whereis",
+    "x86_64",
+    // procps
+    "pidwait",
+    "pmap",
+    "pwdx",
+    "skill",
+    "slabtop",
+    "snice",
+    "tload",
+    "vmstat",
+    "watch",
+    // iproute2
+    "ctstat",
+    "lnstat",
+    "nstat",
+    "rdma",
+    "routel",
+    "rtstat",
+    // gzip
+    "gunzip",
+    "gzexe",
+    "gzip",
+    "uncompress",
+    "zcat",
+    "zcmp",
+    "zdiff",
+    "zegrep",
+    "zfgrep",
+    "zforce",
+    "zgrep",
+    "zless",
+    "zmore",
+    "znew",
+    // bzip2
+    "bunzip2",
+    "bzcat",
+    "bzcmp",
+    "bzdiff",
+    "bzegrep",
+    "bzexe",
+    "bzfgrep",
+    "bzgrep",
+    "bzip2",
+    "bzip2recover",
+    "bzless",
+    "bzmore",
+    // xz-utils
+    "lzmainfo",
+    "unxz",
+    "xz",
+    "xzcat",
+    "xzcmp",
+    "xzdiff",
+    "xzegrep",
+    "xzfgrep",
+    "xzgrep",
+    "xzless",
+    "xzmore",
+    // less
+    "less",
+    "lessecho",
+    "lessfile",
+    "lesskey",
+    "lesspipe",
+    // nano
+    "nano",
+    "rnano",
+    // man-db
+    "apropos",
+    "catman",
+    "lexgrog",
+    "man",
+    "man-recode",
+    "mandb",
+    "manpath",
+    "whatis",
+    // debianutils
+    "ischroot",
+    "run-parts",
+    "savelog",
+    "tempfile",
+    // openssh-client
+    "sftp",
+    "slogin",
+    "ssh",
+    "ssh-add",
+    "ssh-agent",
+    "ssh-argv0",
+    "ssh-copy-id",
+    "ssh-keygen",
+    "ssh-keyscan",
+    // bind9-dnsutils
+    "delv",
+    "dig",
+    "dnstap-read",
+    "mdig",
+    "nslookup",
+    "nsupdate",
+    // ncurses-bin
+    "captoinfo",
+    "infocmp",
+    "infotocap",
+    "reset",
+    "tabs",
+    "tic",
+    "toe",
+    "tput",
+    "tset",
+    // libc-bin
+    "getconf",
+    "iconv",
+    "ld.so",
+    "ldd",
+    "locale",
+    "localedef",
+    "pldd",
+    "tzselect",
+    "zdump",
 ];
 
-/// Binaries in `/usr/sbin`, matching the paths `which` reports for them.
-const USR_SBIN: &[&str] = &[
-    "addgroup", "adduser", "chpasswd", "deluser", "groupadd", "ip", "nologin", "service", "ss",
-    "useradd", "userdel",
+/// Binaries in `/usr/sbin`, matching the paths `which` reports for them. Same
+/// listed-vs-runnable split as [`USR_BIN`]: the original runnable-backed set
+/// first, then sourced density additions grouped by package.
+pub(crate) const USR_SBIN: &[&str] = &[
+    "addgroup",
+    "adduser",
+    "chpasswd",
+    "deluser",
+    "groupadd",
+    "ip",
+    "nologin",
+    "service",
+    "ss",
+    "useradd",
+    "userdel",
+    // coreutils
+    "chroot",
+    // util-linux
+    "agetty",
+    "blkdiscard",
+    "blkid",
+    "blkzone",
+    "blockdev",
+    "chcpu",
+    "chmem",
+    "ctrlaltdel",
+    "findfs",
+    "fsck",
+    "fsck.cramfs",
+    "fsck.minix",
+    "fsfreeze",
+    "fstrim",
+    "getty",
+    "isosize",
+    "ldattach",
+    "mkfs",
+    "mkfs.bfs",
+    "mkfs.cramfs",
+    "mkfs.minix",
+    "mkswap",
+    "pivot_root",
+    "readprofile",
+    "rtcwake",
+    "runuser",
+    "sulogin",
+    "swaplabel",
+    "switch_root",
+    "wipefs",
+    "zramctl",
+    // procps
+    "sysctl",
+    // iproute2
+    "arpd",
+    "bridge",
+    "dcb",
+    "devlink",
+    "genl",
+    "rtacct",
+    "rtmon",
+    "tc",
+    "tipc",
+    "vdpa",
+    // e2fsprogs
+    "badblocks",
+    "debugfs",
+    "dumpe2fs",
+    "e2freefrag",
+    "e2fsck",
+    "e2image",
+    "e2label",
+    "e2mmpstatus",
+    "e2scrub",
+    "e2scrub_all",
+    "e2undo",
+    "e4crypt",
+    "e4defrag",
+    "filefrag",
+    "fsck.ext2",
+    "fsck.ext3",
+    "fsck.ext4",
+    "mke2fs",
+    "mkfs.ext2",
+    "mkfs.ext3",
+    "mkfs.ext4",
+    "mklost+found",
+    "resize2fs",
+    "tune2fs",
+    // adduser
+    "delgroup",
+    // cron
+    "cron",
+    // man-db
+    "accessdb",
+    // debianutils
+    "add-shell",
+    "installkernel",
+    "remove-shell",
+    "update-shells",
+    // net-tools
+    "arp",
+    "ifconfig",
+    "ipmaddr",
+    "iptunnel",
+    "mii-tool",
+    "nameif",
+    "plipconfig",
+    "rarp",
+    "route",
+    "slattach",
+    // libc-bin
+    "iconvconfig",
+    "ldconfig",
+    "zic",
 ];
 
 /// `/etc/ssh/sshd_config` as Debian 12 ships it.
@@ -457,11 +800,12 @@ pub fn build(hostname: &str, persona: &Persona) -> Vfs {
     fs.mkdir(usr, "share", 0o755, 0, 0);
     fs.mkdir(usr, "include", 0o755, 0, 0);
     fs.mkdir(usr, "games", 0o755, 0, 0);
-    // The "binaries" behind the emulated commands. This list is exactly what
-    // the command registry can run: a name here that the shell then reports as
-    // `command not found` (or a command missing from `ls /usr/bin`) is a
-    // one-line honeypot check. `binaries_match_the_command_registry` fails the
-    // build if the two drift apart.
+    // The "binaries" behind the emulated commands, plus sourced density that
+    // is listed but not runnable (see `USR_BIN`'s doc comment). A runnable
+    // name missing here — `command not found` for a file the shell can
+    // actually run, or a command missing from `ls /usr/bin` — is a one-line
+    // honeypot check. `runnable_commands_resolve_under_usr_bin_or_usr_sbin`
+    // fails the build if a runnable name is missing from this snapshot.
     for bin in USR_BIN {
         fs.add_file(usr_bin, bin, &b""[..], 0o755, 0, 0);
     }
@@ -594,31 +938,32 @@ mod tests {
         }
     }
 
-    /// `ls /usr/bin` may only show binaries the shell can actually run, and
-    /// every runnable command must be there: `-bash: python3: command not
+    /// Every runnable command must resolve under `/usr/bin` or `/usr/sbin`
+    /// under the name `dispatch` recognises: `-bash: python3: command not
     /// found` for a file the attacker just saw listed identifies the honeypot
-    /// in two commands.
+    /// in two commands. The reverse does not have to hold — a listed name
+    /// with no dispatch arm is legitimate density, see [`USR_BIN`]'s doc
+    /// comment — so this checks `runnable ⊆ listed` only, resolved against a
+    /// *built* `Vfs` rather than the `USR_BIN`/`USR_SBIN` consts directly, so
+    /// a runnable name that never made it into the snapshot loop still fails.
     #[test]
-    fn binaries_match_the_command_registry() {
-        use std::collections::BTreeSet;
-
-        let listed: BTreeSet<&str> = USR_BIN.iter().chain(USR_SBIN).copied().collect();
-        let runnable: BTreeSet<&str> = crate::shell::complete::COMMANDS
+    fn runnable_commands_resolve_under_usr_bin_or_usr_sbin() {
+        let fs = build("srv1", &Persona::sample());
+        let runnable = crate::shell::complete::COMMANDS
             .iter()
             .copied()
-            .filter(|name| !crate::commands::system::BUILTINS.contains(name))
-            .collect();
+            .filter(|name| !crate::commands::system::BUILTINS.contains(name));
 
-        assert_eq!(
-            listed.difference(&runnable).collect::<Vec<_>>(),
-            Vec::<&&str>::new(),
-            "listed under /usr/bin or /usr/sbin but not runnable"
-        );
-        assert_eq!(
-            runnable.difference(&listed).collect::<Vec<_>>(),
-            Vec::<&&str>::new(),
-            "runnable but missing from /usr/bin and /usr/sbin"
-        );
+        for name in runnable {
+            let found = fs.resolve(fs.root(), &format!("/usr/bin/{name}")).is_some()
+                || fs
+                    .resolve(fs.root(), &format!("/usr/sbin/{name}"))
+                    .is_some();
+            assert!(
+                found,
+                "{name} is runnable but not listed under /usr/bin or /usr/sbin"
+            );
+        }
     }
 
     /// The box asserts each of these facts through one command; a missing file

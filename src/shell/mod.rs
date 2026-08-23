@@ -1541,10 +1541,11 @@ mod tests {
         assert_eq!(shell.execute("cat /etc/passwd | whoami").text, "root\n");
 
         // ls drops its column layout when its output is a pipe, so downstream
-        // stages see one name per line.
+        // stages see one name per line. `[` sorts first once the /usr/bin
+        // density from coreutils lands.
         assert_eq!(
             shell.execute("ls /usr/bin | head -n 2").text,
-            "apt\napt-get\n"
+            "[\naddpart\n"
         );
         assert!(shell.execute("ls /usr/bin").text.lines().count() == 1);
 

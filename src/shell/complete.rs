@@ -8,8 +8,12 @@
 use crate::shell::Shell;
 use crate::vfs::Vfs;
 
-/// Every command name the shell recognises, used for command-position
-/// completion. Kept in sync with the command registry.
+/// Every command name `commands::dispatch` has a match arm for. Rust cannot
+/// enumerate match arms, so this is a hand-maintained mirror, used only by
+/// [`crate::vfs::snapshot`]'s registry test — tab completion instead derives
+/// candidates from the VFS listing directly (see `complete_command`), so a
+/// listed-but-not-runnable name still completes the way real bash completes
+/// any PATH executable whether it works or not.
 pub const COMMANDS: &[&str] = &[
     "addgroup",
     "adduser",
@@ -35,6 +39,7 @@ pub const COMMANDS: &[&str] = &[
     "date",
     "deluser",
     "df",
+    "dir",
     "dirname",
     "dmesg",
     "dpkg",
@@ -80,6 +85,7 @@ pub const COMMANDS: &[&str] = &[
     "pgrep",
     "pidof",
     "ping",
+    "ping6",
     "pkill",
     "printenv",
     "printf",
@@ -146,16 +152,35 @@ pub enum Completion {
 /// completion.
 pub fn complete(shell: &Shell, word: &str, is_command: bool) -> Completion {
     if is_command && !word.contains('/') {
-        complete_command(word)
+        complete_command(shell, word)
     } else {
         complete_path(shell, word)
     }
 }
 
-fn complete_command(word: &str) -> Completion {
-    let mut names: Vec<&str> = COMMANDS
+/// Candidates are every name listed under `/usr/bin`/`/usr/sbin` in the VFS,
+/// plus the shell builtins — real bash tab-completes any name on `$PATH` or
+/// any builtin whether or not it actually does anything useful, so a name
+/// that is listed but not wired into `commands::dispatch` (see
+/// [`crate::vfs::snapshot`]'s `USR_BIN`) still has to complete.
+fn complete_command(shell: &Shell, word: &str) -> Completion {
+    let mut names: Vec<String> = Vec::new();
+    for dir in ["/usr/bin", "/usr/sbin"] {
+        if let Some(id) = shell.vfs.resolve(shell.vfs.root(), dir) {
+            if let Some(entries) = shell.vfs.entries(id) {
+                names.extend(entries.into_iter().map(|(name, _)| name));
+            }
+        }
+    }
+    names.extend(
+        crate::commands::system::BUILTINS
+            .iter()
+            .map(|s| s.to_string()),
+    );
+
+    let mut names: Vec<&str> = names
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|c| c.starts_with(word))
         .collect();
     names.sort_unstable();
@@ -305,9 +330,11 @@ mod tests {
     #[test]
     fn command_unique_completion() {
         let shell = Shell::new("root", "debian");
-        // "who" -> only "whoami"
+        // "whoam" -> only "whoami" ("who" itself is now also a listed binary,
+        // so it no longer uniquely completes — that's real bash's behaviour
+        // too once both names exist).
         assert_eq!(
-            complete(&shell, "who", true),
+            complete(&shell, "whoam", true),
             Completion::Single {
                 replacement: "whoami".to_string(),
                 add_space: true
@@ -318,13 +345,14 @@ mod tests {
     #[test]
     fn command_common_prefix() {
         let shell = Shell::new("root", "debian");
-        // "ap" -> apt, apt-get : common prefix "apt"
-        match complete(&shell, "ap", true) {
+        // "us" -> useradd, userdel, users : common prefix "user" ("ap" is no
+        // longer unambiguous now that "apropos" is also listed density).
+        match complete(&shell, "us", true) {
             Completion::Single {
                 replacement,
                 add_space,
             } => {
-                assert_eq!(replacement, "apt");
+                assert_eq!(replacement, "user");
                 assert!(!add_space);
             }
             other => panic!("unexpected: {other:?}"),
