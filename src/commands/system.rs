@@ -133,30 +133,46 @@ pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
 }
 
 /// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
-pub fn nproc(_shell: &Shell, _args: &[String]) -> CommandResult {
-    CommandResult::ok("1\n")
+pub fn nproc(shell: &Shell, _args: &[String]) -> CommandResult {
+    CommandResult::ok(format!("{}\n", shell.persona.cpu_cores))
 }
 
-/// `lscpu` — describes the same single-core Xeon presented by `/proc/cpuinfo`.
-pub fn lscpu(_shell: &Shell, _args: &[String]) -> CommandResult {
-    CommandResult::ok(
+/// `lscpu` — describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
+/// from the deployment persona so the three cannot drift apart.
+pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
+    let p = &shell.persona;
+    let cpu = &p.cpu;
+    let online = if p.cpu_cores == 1 {
+        "0".to_string()
+    } else {
+        format!("0-{}", p.cpu_cores - 1)
+    };
+    CommandResult::ok(format!(
         "Architecture:             x86_64\n\
          CPU op-mode(s):           32-bit, 64-bit\n\
          Byte Order:               Little Endian\n\
-         CPU(s):                   1\n\
-         On-line CPU(s) list:      0\n\
-         Vendor ID:                GenuineIntel\n\
-         Model name:               Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n\
-         CPU family:               6\n\
-         Model:                    85\n\
+         CPU(s):                   {cores}\n\
+         On-line CPU(s) list:      {online}\n\
+         Vendor ID:                {vendor}\n\
+         Model name:               {name}\n\
+         CPU family:               {family}\n\
+         Model:                    {model}\n\
          Thread(s) per core:       1\n\
-         Core(s) per socket:       1\n\
+         Core(s) per socket:       {cores}\n\
          Socket(s):                1\n\
-         Stepping:                 7\n\
-         BogoMIPS:                 5000.00\n\
+         Stepping:                 {stepping}\n\
+         BogoMIPS:                 {bogomips}\n\
          Hypervisor vendor:        KVM\n\
          Virtualization type:      full\n",
-    )
+        cores = p.cpu_cores,
+        online = online,
+        vendor = cpu.vendor,
+        name = cpu.name,
+        family = cpu.family,
+        model = cpu.model,
+        stepping = cpu.stepping,
+        bogomips = p.bogomips(),
+    ))
 }
 
 /// `bash`/`sh` — the shell this session already claims to be.
@@ -976,7 +992,7 @@ pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
 }
 
 /// `free [-h|-m|-g]`
-pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
+pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human");
     let mega = args.iter().any(|a| a == "-m");
     let giga = args.iter().any(|a| a == "-g");
@@ -987,8 +1003,16 @@ pub fn free(_shell: &Shell, args: &[String]) -> CommandResult {
     // check in one command.
     // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
     // left, exactly as procps derives them from `/proc/meminfo`.
-    let (total, used, free_mem, shared, buff, available) =
-        (2041208u64, 183336, 1503544, 992, 354328, 1764920);
+    // Derived from the persona's `MemTotal` with the same proportions
+    // `/proc/meminfo` uses, so the two agree for any deployment.
+    let total = shell.persona.mem_total_kb;
+    let free_mem = total * 73 / 100;
+    let available = total * 86 / 100;
+    let shared = 992u64;
+    // buff/cache = Buffers + Cached + SReclaimable.
+    let buff = total * 13 / 1000 + total * 139 / 1000 + total * 20 / 1000;
+    // used is whatever is left, so the row balances by construction.
+    let used = total.saturating_sub(free_mem).saturating_sub(buff);
 
     let fmt = |kb: u64| -> String {
         if human {
@@ -1150,28 +1174,59 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
 }
 
 /// `df [-h]`
-pub fn df(_shell: &Shell, args: &[String]) -> CommandResult {
+pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
-    // Every tmpfs size here is derivable from `MemTotal` (2041208 kB) the way
-    // the kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
+    // Every tmpfs size is derived from the persona's `MemTotal` the way the
+    // kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
     // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
     // `free` reports is a two-command honeypot check.
+    let mem = shell.persona.mem_total_kb;
+    let disk = shell.persona.disk_total_kb;
+    let udev = mem / 2 - 5270;
+    let run = mem / 10;
+    let shm = mem / 2;
+    let used = disk * 16 / 100;
+    let avail = disk - used - (disk / 20);
+    let pct = (used * 100).div_ceil(disk.max(1));
+    let uid = shell.uid;
+
     let out = if human {
-        "Filesystem      Size  Used Avail Use% Mounted on\n\
-         udev            992M     0  992M   0% /dev\n\
-         tmpfs           200M  960K  199M   1% /run\n\
-         /dev/sda1        40G  6.3G   31G  17% /\n\
-         tmpfs           997M     0  997M   0% /dev/shm\n\
-         tmpfs           5.0M     0  5.0M   0% /run/lock\n\
-         tmpfs           200M     0  200M   0% /run/user/0\n"
+        format!(
+            "Filesystem      Size  Used Avail Use% Mounted on\n\
+             udev            {udev:>4}     0  {udev:>4}   0% /dev\n\
+             tmpfs           {run:>4}  960K  {run:>4}   1% /run\n\
+             /dev/sda1       {disk:>4}  {used:>4}  {avail:>4}  {pct}% /\n\
+             tmpfs           {shm:>4}     0  {shm:>4}   0% /dev/shm\n\
+             tmpfs           5.0M     0  5.0M   0% /run/lock\n\
+             tmpfs           {run:>4}     0  {run:>4}   0% /run/user/{uid}\n",
+            udev = human_kib(udev),
+            run = human_kib(run),
+            shm = human_kib(shm),
+            disk = human_kib(disk),
+            used = human_kib(used),
+            avail = human_kib(avail),
+            pct = pct,
+            uid = uid,
+        )
     } else {
-        "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
-         udev             1015532       0   1015532   0% /dev\n\
-         tmpfs             204120     960    203160   1% /run\n\
-         /dev/sda1       41019672 6552432  32352140  17% /\n\
-         tmpfs            1020604       0   1020604   0% /dev/shm\n\
-         tmpfs               5120       0      5120   0% /run/lock\n\
-         tmpfs             204116       0    204116   0% /run/user/0\n"
+        format!(
+            "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
+             udev          {udev:>10}       0  {udev:>8}   0% /dev\n\
+             tmpfs         {run:>10}     960  {run_avail:>8}   1% /run\n\
+             /dev/sda1     {disk:>10} {used:>7}  {avail:>8}  {pct}% /\n\
+             tmpfs         {shm:>10}       0  {shm:>8}   0% /dev/shm\n\
+             tmpfs               5120       0      5120   0% /run/lock\n\
+             tmpfs         {run:>10}       0  {run:>8}   0% /run/user/{uid}\n",
+            udev = udev,
+            run = run,
+            run_avail = run - 960,
+            disk = disk,
+            used = used,
+            avail = avail,
+            pct = pct,
+            shm = shm,
+            uid = uid,
+        )
     };
     CommandResult::ok(out)
 }
@@ -1589,11 +1644,73 @@ mod tests {
         assert!(run(&mut shell, "top -b").contains("Tasks:"));
         assert!(run(&mut shell, "free").contains("Mem:"));
         // procps' scaling: a decimal place only below 10, so `1.9Gi` but
-        // `346Mi` — never `346.0Mi`.
+        // `346Mi` — never `346.0Mi`. Asserted as the rule rather than against
+        // pinned figures, because the numbers now come from the deployment
+        // persona and differ per sensor by design.
         let human = run(&mut shell, "free -h");
-        assert!(human.contains("1.9Gi"), "unexpected `free -h`: {human}");
-        assert!(human.contains("346Mi"), "unexpected `free -h`: {human}");
         assert!(!human.contains(".0Mi"), "unexpected `free -h`: {human}");
+        assert!(!human.contains(".0Gi"), "unexpected `free -h`: {human}");
+        assert!(human.contains("Gi") || human.contains("Mi"), "{human}");
+    }
+
+    /// Whatever RAM a deployment claims, every command that reports it must
+    /// report the same figure. `free` disagreeing with `/proc/meminfo` is a
+    /// two-command honeypot check, and the persona exists to make the two
+    /// impossible to set independently.
+    #[test]
+    fn memory_figures_agree_across_commands_for_every_persona() {
+        for seed in 0..16u64 {
+            let persona = crate::persona::Persona::from_seed(seed);
+            let total = persona.mem_total_kb;
+            let mut shell = Shell::with_persona("root", "debian", persona);
+
+            let meminfo = run(&mut shell, "cat /proc/meminfo");
+            assert!(
+                meminfo.contains(&format!("MemTotal:        {total} kB")),
+                "seed={seed} meminfo={meminfo}"
+            );
+
+            // `free` prints kB totals in its first column.
+            let free_out = run(&mut shell, "free");
+            let mem_line = free_out
+                .lines()
+                .find(|l| l.starts_with("Mem:"))
+                .expect("a Mem: row");
+            let reported: u64 = mem_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .expect("a total column");
+            assert_eq!(reported, total, "seed={seed}: free disagrees with meminfo");
+        }
+    }
+
+    /// The same, for the CPU: `nproc`, `lscpu` and `/proc/cpuinfo` all read the
+    /// persona, so none of them can name a processor the others do not.
+    #[test]
+    fn cpu_figures_agree_across_commands_for_every_persona() {
+        for seed in 0..16u64 {
+            let persona = crate::persona::Persona::from_seed(seed);
+            let (cores, name) = (persona.cpu_cores, persona.cpu.name);
+            let mut shell = Shell::with_persona("root", "debian", persona);
+
+            assert_eq!(run(&mut shell, "nproc").trim(), cores.to_string());
+
+            let lscpu_out = run(&mut shell, "lscpu");
+            assert!(lscpu_out.contains(name), "seed={seed}: {lscpu_out}");
+            assert!(
+                lscpu_out.contains(&format!("CPU(s):                   {cores}")),
+                "seed={seed}: {lscpu_out}"
+            );
+
+            let cpuinfo = run(&mut shell, "cat /proc/cpuinfo");
+            assert!(cpuinfo.contains(name), "seed={seed}");
+            assert_eq!(
+                cpuinfo.matches("processor\t: ").count(),
+                cores as usize,
+                "seed={seed}: one cpuinfo block per core"
+            );
+        }
     }
 
     #[test]

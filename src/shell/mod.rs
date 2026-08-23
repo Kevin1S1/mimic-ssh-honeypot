@@ -13,6 +13,7 @@ pub mod line;
 pub mod parser;
 
 use crate::commands;
+use crate::persona::Persona;
 use crate::vfs::{snapshot, NodeId, Vfs};
 use env::Env;
 
@@ -242,6 +243,10 @@ pub struct Shell {
     /// substitution captures its body's stdout through a pipe, so nothing
     /// inside one is writing to a terminal however the stage itself looks.
     subst_depth: u32,
+    /// This deployment's fabricated hardware identity. Every command that
+    /// reports a hardware fact reads it from here, so `lscpu`, `free`, `df`,
+    /// `dmesg` and `/proc` cannot contradict each other.
+    pub persona: Persona,
     /// A here-document body waiting to become the next pipeline's stdin.
     heredoc_stdin: Option<String>,
     /// A completed here-document, opening line and body together, waiting for
@@ -251,11 +256,22 @@ pub struct Shell {
 
 impl Shell {
     /// Construct a fresh shell for `username` on a freshly built Debian
-    /// snapshot. `root` (and the empty username) get uid 0 and `/root`; any
-    /// other user is treated as a normal account (uid 1000) with a home under
-    /// `/home`, created on demand.
+    /// snapshot, using the default persona.
+    ///
+    /// Production goes through [`Shell::with_persona`] so each sensor gets its
+    /// own hardware identity; this is the convenience form for tests and any
+    /// caller with no seed to derive one from.
     pub fn new(username: &str, hostname: &str) -> Self {
-        let mut vfs = snapshot::build(hostname);
+        Self::with_persona(username, hostname, Persona::sample())
+    }
+
+    /// Construct a fresh shell whose emulated hardware comes from `persona`.
+    ///
+    /// `root` (and the empty username) get uid 0 and `/root`; any other user is
+    /// treated as a normal account (uid 1000) with a home under `/home`,
+    /// created on demand.
+    pub fn with_persona(username: &str, hostname: &str, persona: Persona) -> Self {
+        let mut vfs = snapshot::build(hostname, &persona);
         let user = if username.is_empty() {
             "root"
         } else {
@@ -295,6 +311,7 @@ impl Shell {
             subst_depth: 0,
             heredoc_stdin: None,
             heredoc_log: None,
+            persona,
             history: Vec::new(),
             captures: Vec::new(),
             pending: None,

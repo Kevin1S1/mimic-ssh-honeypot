@@ -173,6 +173,16 @@ impl Vfs {
 
     // --- Mutation helpers -------------------------------------------------
 
+    /// Whether the arena has reached its hard node cap.
+    ///
+    /// Callers that create nodes check this first so they can report the error
+    /// a real kernel would return. Without it an insert past the cap is dropped
+    /// and `parent` handed back, so `mkdir foo` exits 0 while `ls` never shows
+    /// `foo` — a contradiction the box should not produce, and a silent one.
+    pub fn is_full(&self) -> bool {
+        self.nodes.len() >= MAX_VFS_NODES
+    }
+
     /// Insert a freshly built node under `parent`, returning its id. The
     /// caller must ensure `parent` is a directory. If the arena is at its hard
     /// node cap, the insert is dropped and `parent` is returned unchanged.

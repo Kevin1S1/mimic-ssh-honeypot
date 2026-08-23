@@ -390,18 +390,21 @@ pub fn ss(_shell: &Shell, args: &[String]) -> CommandResult {
 }
 
 /// `ip [OPTION] OBJECT { COMMAND }`
-pub fn ip(_shell: &Shell, args: &[String]) -> CommandResult {
+pub fn ip(shell: &Shell, args: &[String]) -> CommandResult {
     let object = args
         .iter()
         .find(|a| !a.starts_with('-'))
         .map(String::as_str);
+    let p = &shell.persona;
     match object {
-        Some("a") | Some("addr") | Some("address") | None => CommandResult::ok(ip_addr()),
-        Some("l") | Some("link") => CommandResult::ok(ip_link()),
-        Some("r") | Some("route") => CommandResult::ok(ip_route()),
-        Some("n") | Some("neigh") => {
-            CommandResult::ok("10.0.0.1 dev eth0 lladdr 0a:1b:2c:3d:4e:5f REACHABLE\n")
-        }
+        Some("a") | Some("addr") | Some("address") | None => CommandResult::ok(ip_addr(p)),
+        Some("l") | Some("link") => CommandResult::ok(ip_link(p)),
+        Some("r") | Some("route") => CommandResult::ok(ip_route(p)),
+        Some("n") | Some("neigh") => CommandResult::ok(format!(
+            "{} dev eth0 lladdr {} REACHABLE\n",
+            p.gateway(),
+            p.mac
+        )),
         Some(other) => CommandResult::err(
             format!("Object \"{other}\" is unknown, try \"ip help\".\n"),
             1,
@@ -409,34 +412,66 @@ pub fn ip(_shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-fn ip_addr() -> String {
-    "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n\
-    \x20   link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\
-    \x20   inet 127.0.0.1/8 scope host lo\n\
-    \x20      valid_lft forever preferred_lft forever\n\
-    \x20   inet6 ::1/128 scope host\n\
-    \x20      valid_lft forever preferred_lft forever\n\
-    2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n\
-    \x20   link/ether 0a:1b:2c:3d:4e:5f brd ff:ff:ff:ff:ff:ff\n\
-    \x20   inet 10.0.0.5/24 brd 10.0.0.255 scope global dynamic eth0\n\
-    \x20      valid_lft 84235sec preferred_lft 84235sec\n\
-    \x20   inet6 fe80::81b:2cff:fe3d:4e5f/64 scope link\n\
-    \x20      valid_lft forever preferred_lft forever\n"
-        .to_string()
+/// The EUI-64 link-local address the kernel derives from an interface MAC.
+///
+/// A `fe80::` address that does not match the `link/ether` line two rows above
+/// it is a tell for anyone who knows how SLAAC works, so it is computed rather
+/// than written down.
+fn link_local(mac: &str) -> String {
+    let o: Vec<u8> = mac
+        .split(':')
+        .filter_map(|b| u8::from_str_radix(b, 16).ok())
+        .collect();
+    if o.len() != 6 {
+        return "fe80::1".to_string();
+    }
+    // Flip the universal/local bit and insert ff:fe in the middle, per RFC 4291.
+    let first = o[0] ^ 0x02;
+    format!(
+        "fe80::{:x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",
+        first, o[1], o[2], o[3], o[4], o[5]
+    )
 }
 
-fn ip_link() -> String {
-    "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n\
-    \x20   link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\
-    2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\n\
-    \x20   link/ether 0a:1b:2c:3d:4e:5f brd ff:ff:ff:ff:ff:ff\n"
-        .to_string()
+fn ip_addr(p: &crate::persona::Persona) -> String {
+    format!(
+        "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n\
+        \x20   link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\
+        \x20   inet 127.0.0.1/8 scope host lo\n\
+        \x20      valid_lft forever preferred_lft forever\n\
+        \x20   inet6 ::1/128 scope host\n\
+        \x20      valid_lft forever preferred_lft forever\n\
+        2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n\
+        \x20   link/ether {mac} brd ff:ff:ff:ff:ff:ff\n\
+        \x20   inet {ip}/24 brd {bcast} scope global dynamic eth0\n\
+        \x20      valid_lft 84235sec preferred_lft 84235sec\n\
+        \x20   inet6 {ll}/64 scope link\n\
+        \x20      valid_lft forever preferred_lft forever\n",
+        mac = p.mac,
+        ip = p.ipv4,
+        bcast = p.broadcast(),
+        ll = link_local(&p.mac),
+    )
 }
 
-fn ip_route() -> String {
-    "default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.5 metric 100\n\
-     10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5 metric 100\n"
-        .to_string()
+fn ip_link(p: &crate::persona::Persona) -> String {
+    format!(
+        "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n\
+        \x20   link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\
+        2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\n\
+        \x20   link/ether {mac} brd ff:ff:ff:ff:ff:ff\n",
+        mac = p.mac,
+    )
+}
+
+fn ip_route(p: &crate::persona::Persona) -> String {
+    format!(
+        "default via {gw} dev eth0 proto dhcp src {ip} metric 100\n\
+         {subnet}.0/24 dev eth0 proto kernel scope link src {ip} metric 100\n",
+        gw = p.gateway(),
+        ip = p.ipv4,
+        subnet = p.subnet,
+    )
 }
 
 /// Truncate a string to `max` chars for fixed-width columns.

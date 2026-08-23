@@ -1810,6 +1810,14 @@ pub fn touch(shell: &mut Shell, args: &[String]) -> CommandResult {
                 if no_create && shell.vfs.child(parent, &name).is_none() {
                     continue;
                 }
+                if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full() {
+                    out.push_str(&format!(
+                        "touch: cannot touch '{path}': No space left on device
+"
+                    ));
+                    status = 1;
+                    continue;
+                }
                 shell.vfs.touch(parent, &name, uid, gid);
             }
             None => {
@@ -1894,6 +1902,14 @@ pub fn mkdir(shell: &mut Shell, args: &[String]) -> CommandResult {
                 if shell.vfs.child(parent, &name).is_some() {
                     out.push_str(&format!(
                         "mkdir: cannot create directory '{path}': File exists\n"
+                    ));
+                    status = 1;
+                } else if shell.vfs.is_full() {
+                    // A real kernel reports the failure; silently exiting 0 on
+                    // a directory that never appears is a honeypot tell.
+                    out.push_str(&format!(
+                        "mkdir: cannot create directory '{path}': No space left on device
+"
                     ));
                     status = 1;
                 } else {

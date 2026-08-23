@@ -6,6 +6,7 @@
 //! `/proc/cpuinfo`, ...). Everything is static and in-memory.
 
 use super::Vfs;
+use crate::persona::Persona;
 
 /// Binaries in `/usr/bin` — one per non-builtin command the registry serves,
 /// so `ls /usr/bin`, `which`, Tab completion, and dispatch all agree.
@@ -161,53 +162,96 @@ if [ -d \"$HOME/bin\" ] ; then\n\
     PATH=\"$HOME/bin:$PATH\"\n\
 fi\n";
 
-/// `/proc/cpuinfo` for a single-core virtual machine.
-const CPUINFO: &str = "processor\t: 0\n\
-vendor_id\t: GenuineIntel\n\
-cpu family\t: 6\n\
-model\t\t: 85\n\
-model name\t: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n\
-stepping\t: 7\n\
-microcode\t: 0x5003604\n\
-cpu MHz\t\t: 2500.000\n\
-cache size\t: 36608 KB\n\
-physical id\t: 0\n\
-siblings\t: 1\n\
-core id\t\t: 0\n\
-cpu cores\t: 1\n\
-apicid\t\t: 0\n\
-initial apicid\t: 0\n\
-fpu\t\t: yes\n\
-fpu_exception\t: yes\n\
-cpuid level\t: 13\n\
-wp\t\t: yes\n\
-flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single pti fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves ida arat pku ospke\n\
-bugs\t\t: spectre_v1 spectre_v2 spec_store_bypass mds swapgs taa itlb_multihit mmio_stale_data retbleed\n\
-bogomips\t: 5000.00\n\
-clflush size\t: 64\n\
-cache_alignment\t: 64\n\
-address sizes\t: 46 bits physical, 48 bits virtual\n\
-power management:\n\n";
+/// `/proc/cpuinfo`, rendered for this deployment's CPU and core count.
+///
+/// `lscpu`, `nproc` and `dmesg` read the same [`Persona`], so the four cannot
+/// disagree about what processor this box has.
+pub fn cpuinfo(persona: &Persona) -> String {
+    let cpu = &persona.cpu;
+    let mut out = String::new();
+    for core in 0..persona.cpu_cores {
+        out.push_str(&format!(
+            "processor\t: {core}\n\
+             vendor_id\t: {vendor}\n\
+             cpu family\t: {family}\n\
+             model\t\t: {model}\n\
+             model name\t: {name}\n\
+             stepping\t: {stepping}\n\
+             microcode\t: {microcode}\n\
+             cpu MHz\t\t: {mhz}.000\n\
+             cache size\t: {cache} KB\n\
+             physical id\t: 0\n\
+             siblings\t: {cores}\n\
+             core id\t\t: {core}\n\
+             cpu cores\t: {cores}\n\
+             apicid\t\t: {core}\n\
+             initial apicid\t: {core}\n\
+             fpu\t\t: yes\n\
+             fpu_exception\t: yes\n\
+             cpuid level\t: 13\n\
+             wp\t\t: yes\n\
+             flags\t\t: {flags}\n\
+             bugs\t\t: {bugs}\n\
+             bogomips\t: {bogomips}\n\
+             clflush size\t: 64\n\
+             cache_alignment\t: 64\n\
+             address sizes\t: 46 bits physical, 48 bits virtual\n\
+             power management:\n\n",
+            core = core,
+            vendor = cpu.vendor,
+            family = cpu.family,
+            model = cpu.model,
+            name = cpu.name,
+            stepping = cpu.stepping,
+            microcode = cpu.microcode,
+            mhz = cpu.mhz,
+            cache = cpu.cache_kb,
+            cores = persona.cpu_cores,
+            flags = cpu.flags,
+            bugs = cpu.bugs,
+            bogomips = persona.bogomips(),
+        ));
+    }
+    out
+}
 
-/// `/proc/meminfo` for a ~2 GiB VM.
-const MEMINFO: &str = "MemTotal:        2041208 kB\n\
-MemFree:         1503544 kB\n\
-MemAvailable:    1764920 kB\n\
-Buffers:           28104 kB\n\
-Cached:           284992 kB\n\
-SwapCached:            0 kB\n\
-Active:           296340 kB\n\
-Inactive:         148512 kB\n\
-SwapTotal:             0 kB\n\
-SwapFree:              0 kB\n\
-Dirty:                88 kB\n\
-Writeback:             0 kB\n\
-AnonPages:        131800 kB\n\
-Mapped:            73548 kB\n\
-Shmem:               992 kB\n\
-Slab:              58420 kB\n\
-SReclaimable:      41232 kB\n\
-SUnreclaim:        17188 kB\n";
+/// `/proc/meminfo`, with every figure derived from this deployment's
+/// `MemTotal` so `free` and `df`'s tmpfs rows stay consistent with it.
+pub fn meminfo(persona: &Persona) -> String {
+    let total = persona.mem_total_kb;
+    // Proportions taken from an idle Debian 12 VM, scaled to this box's RAM.
+    let free = total * 73 / 100;
+    let available = total * 86 / 100;
+    let buffers = total * 13 / 1000;
+    let cached = total * 139 / 1000;
+    let active = total * 145 / 1000;
+    let inactive = total * 72 / 1000;
+    let anon = total * 64 / 1000;
+    let mapped = total * 36 / 1000;
+    let slab = total * 28 / 1000;
+    let sreclaim = total * 20 / 1000;
+    let sunreclaim = slab - sreclaim;
+    format!(
+        "MemTotal:        {total} kB\n\
+         MemFree:         {free} kB\n\
+         MemAvailable:    {available} kB\n\
+         Buffers:           {buffers} kB\n\
+         Cached:           {cached} kB\n\
+         SwapCached:            0 kB\n\
+         Active:           {active} kB\n\
+         Inactive:         {inactive} kB\n\
+         SwapTotal:             0 kB\n\
+         SwapFree:              0 kB\n\
+         Dirty:                88 kB\n\
+         Writeback:             0 kB\n\
+         AnonPages:        {anon} kB\n\
+         Mapped:            {mapped} kB\n\
+         Shmem:               992 kB\n\
+         Slab:              {slab} kB\n\
+         SReclaimable:      {sreclaim} kB\n\
+         SUnreclaim:        {sunreclaim} kB\n"
+    )
+}
 
 /// `/proc/version`.
 const VERSION: &str = "Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n";
@@ -225,7 +269,7 @@ fn hosts_file(hostname: &str) -> String {
 }
 
 /// Build and return a fully populated Debian 12 snapshot for `hostname`.
-pub fn build(hostname: &str) -> Vfs {
+pub fn build(hostname: &str, persona: &Persona) -> Vfs {
     let mut fs = Vfs::new();
     let root = fs.root();
 
@@ -294,10 +338,12 @@ pub fn build(hostname: &str) -> Vfs {
         0,
     );
     fs.add_file(etc, "issue", "Debian GNU/Linux 12 \\n \\l\n\n", 0o644, 0, 0);
+    // Derived per deployment: a constant here would be a single-command,
+    // zero-false-positive check for anyone who has read this source.
     fs.add_file(
         etc,
         "machine-id",
-        "1a2b3c4d5e6f70819aabbccddeeff001\n",
+        format!("{}\n", persona.machine_id),
         0o444,
         0,
         0,
@@ -308,8 +354,8 @@ pub fn build(hostname: &str) -> Vfs {
     fs.mkdir(etc, "network", 0o755, 0, 0);
 
     // /proc files.
-    fs.add_file(proc, "cpuinfo", CPUINFO, 0o444, 0, 0);
-    fs.add_file(proc, "meminfo", MEMINFO, 0o444, 0, 0);
+    fs.add_file(proc, "cpuinfo", cpuinfo(persona), 0o444, 0, 0);
+    fs.add_file(proc, "meminfo", meminfo(persona), 0o444, 0, 0);
     fs.add_file(proc, "version", VERSION, 0o444, 0, 0);
     // Derived from the same boot anchor as the `uptime`/`top`/`w` banners so
     // `cat /proc/uptime` can't contradict them. The idle field is the busier
@@ -412,7 +458,7 @@ mod tests {
 
     #[test]
     fn hostname_is_consistent_across_files() {
-        let fs = build("web-prod-01");
+        let fs = build("web-prod-01", &Persona::sample());
 
         assert_eq!(read(&fs, "/etc/hostname"), "web-prod-01\n");
 
@@ -426,7 +472,7 @@ mod tests {
 
     #[test]
     fn proc_uptime_matches_command_banner() {
-        let fs = build("srv1");
+        let fs = build("srv1", &Persona::sample());
         let first = read(&fs, "/proc/uptime");
         let secs: f64 = first
             .split_whitespace()
@@ -451,7 +497,7 @@ mod tests {
     /// started, and — unlike a file the attacker creates — never "now".
     #[test]
     fn snapshot_files_carry_the_install_date() {
-        let mut fs = build("srv1");
+        let mut fs = build("srv1", &Persona::sample());
         let etc = fs.resolve(fs.root(), "/etc/passwd").expect("/etc/passwd");
         assert_eq!(fs.node(etc).meta.mtime, crate::clock::install_time());
         assert!(fs.node(etc).meta.mtime < crate::clock::now());
@@ -464,7 +510,7 @@ mod tests {
 
     #[test]
     fn common_paths_exist_with_expected_content() {
-        let fs = build("srv1");
+        let fs = build("srv1", &Persona::sample());
         let root = fs.root();
 
         assert!(read(&fs, "/etc/os-release").contains("bookworm"));
@@ -477,7 +523,7 @@ mod tests {
 
     #[test]
     fn shadow_holds_no_real_credentials() {
-        let fs = build("srv1");
+        let fs = build("srv1", &Persona::sample());
         let shadow = read(&fs, "/etc/shadow");
         assert!(shadow.contains("root:!:"), "root must be locked");
         assert!(

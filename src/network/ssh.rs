@@ -49,6 +49,15 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
     // Persist host keys so the server fingerprint stays stable across restarts.
     let host_keys = super::hostkey::load_or_create(&config.host_key_dir)?;
 
+    // This deployment's fabricated hardware identity, seeded from the host key
+    // so it is stable across restarts (like the fingerprint) but different on
+    // every sensor. Reading the key material is real I/O and belongs here; the
+    // persona itself is pure data the emulation layers consume.
+    let persona = Arc::new(crate::persona::Persona::from_seed(persona_seed(
+        &host_keys,
+        &config.sensor_name,
+    )));
+
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::Password);
     methods.push(MethodKind::PublicKey);
@@ -138,6 +147,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
 
         let handler = MimicHandler {
             config: Arc::clone(&config),
+            persona: Arc::clone(&persona),
             session_id,
             peer,
             local,
@@ -204,6 +214,28 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             }
         });
     }
+}
+
+/// Derive this deployment's persona seed from its host keys and sensor name.
+///
+/// The host key is already the thing that must not change between restarts, so
+/// binding the emulated hardware to it gives the persona the same stability for
+/// free — and two sensors never share a key, so they never share an identity.
+fn persona_seed(keys: &[russh::keys::PrivateKey], sensor_name: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mimic-persona-v1");
+    hasher.update(sensor_name.as_bytes());
+    for key in keys {
+        // The *public* half is enough to be unique per deployment, and keeps
+        // private key material out of every derived value.
+        if let Ok(blob) = key.public_key().to_openssh() {
+            hasher.update(blob.as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 8];
+    seed.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(seed)
 }
 
 /// Resolve once the process is asked to stop.
@@ -337,6 +369,9 @@ struct MimicHandler {
     opened_at: std::time::Instant,
     /// How many `command` events this session has emitted.
     command_count: u64,
+    /// This deployment's fabricated hardware identity, handed to every shell
+    /// this connection builds.
+    persona: Arc<crate::persona::Persona>,
     /// Holds this connection's slot in the global/per-IP limiter; releasing it
     /// on drop frees the slot for the next connection.
     _guard: ConnectionGuard,
@@ -704,7 +739,11 @@ impl MimicHandler {
     /// username and configured hostname.
     fn shell(&mut self) -> &mut Shell {
         if self.shell.is_none() {
-            let mut shell = Shell::new(&self.username, &self.config.hostname);
+            let mut shell = Shell::with_persona(
+                &self.username,
+                &self.config.hostname,
+                (*self.persona).clone(),
+            );
             // Every real sshd exports the connection details into the session
             // environment; a shell without them is a one-line honeypot tell.
             // The values are the client's own address and the socket it dialled,
@@ -1722,6 +1761,7 @@ mod tests {
         let guard = registry.try_acquire(peer.ip()).expect("slot available");
         MimicHandler {
             config,
+            persona: Arc::new(crate::persona::Persona::sample()),
             session_id: 1,
             peer,
             local: "127.0.0.1:2222".parse().unwrap(),
