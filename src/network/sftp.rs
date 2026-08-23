@@ -44,6 +44,7 @@ const SSH_FX_OK: u32 = 0;
 const SSH_FX_EOF: u32 = 1;
 const SSH_FX_NO_SUCH_FILE: u32 = 2;
 const SSH_FX_FAILURE: u32 = 4;
+const SSH_FX_BAD_MESSAGE: u32 = 5;
 const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 
 // SFTP open flags
@@ -277,13 +278,19 @@ impl SftpSession {
 
         match msg_type {
             SSH_FXP_REALPATH => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let canonical = normalize_path(&cwd_str, path);
                 put_name_pkt(out, id, &[(&canonical, &canonical, None)]);
             }
             SSH_FXP_STAT => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 if let Some(node_id) = shell.vfs.resolve(shell.cwd, &abs) {
@@ -295,7 +302,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_LSTAT => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 if abs == "/" {
@@ -318,7 +328,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_OPENDIR => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let dir_node = shell.vfs.resolve(shell.cwd, &abs);
@@ -369,7 +382,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_READDIR => {
-                let handle = get_bytes(&mut cursor).unwrap_or(&[]);
+                let Some(handle) = get_bytes(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 if let Some(SftpHandle::Dir { entries, offset }) = self.handles.get_mut(handle) {
                     if *offset >= entries.len() {
                         put_status(out, id, SSH_FX_EOF, "End of file");
@@ -388,8 +404,11 @@ impl SftpSession {
                 }
             }
             SSH_FXP_OPEN => {
-                let path = get_str(&mut cursor).unwrap_or("");
-                let pflags = get_u32(&mut cursor).unwrap_or(0);
+                let (Some(path), Some(pflags)) = (get_str(&mut cursor), get_u32(&mut cursor))
+                else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let attrs = get_attrs(&mut cursor);
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
@@ -424,16 +443,16 @@ impl SftpSession {
                 } else if pflags & SSH_FXF_READ != 0 {
                     if let Some(node_id) = shell.vfs.resolve(shell.cwd, &abs) {
                         let node = shell.vfs.node(node_id);
-                        if let NodeKind::File { contents } = &node.kind {
+                        if let Some(data) = node.file_bytes() {
                             // Opening a read handle copies the whole file, so it
                             // is charged against the same budget writes are:
                             // 64 handles on one large file is the same
                             // amplification from the other direction.
-                            if !self.can_buffer(contents.len(), max_upload_bytes) {
+                            if !self.can_buffer(data.len(), max_upload_bytes) {
                                 put_status(out, id, SSH_FX_FAILURE, "Too many open handles");
                                 return;
                             }
-                            let data = contents.clone();
+                            let data = data.into_owned();
                             let meta = node.meta.clone();
                             self.buffered_bytes += data.len();
                             let handle_bytes = self.alloc_handle();
@@ -451,9 +470,15 @@ impl SftpSession {
                 }
             }
             SSH_FXP_READ => {
-                let handle = get_bytes(&mut cursor).unwrap_or(&[]);
-                let raw_offset = get_u64(&mut cursor).unwrap_or(0);
-                let len = get_u32(&mut cursor).unwrap_or(0) as usize;
+                let (Some(handle), Some(raw_offset), Some(len)) = (
+                    get_bytes(&mut cursor),
+                    get_u64(&mut cursor),
+                    get_u32(&mut cursor),
+                ) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
+                let len = len as usize;
 
                 if let Some(SftpHandle::ReadFile { data, .. }) = self.handles.get(handle) {
                     if raw_offset > usize::MAX as u64 || (raw_offset as usize) >= data.len() {
@@ -468,9 +493,14 @@ impl SftpSession {
                 }
             }
             SSH_FXP_WRITE => {
-                let handle = get_bytes(&mut cursor).unwrap_or(&[]);
-                let raw_offset = get_u64(&mut cursor).unwrap_or(0);
-                let chunk = get_bytes(&mut cursor).unwrap_or(&[]);
+                let (Some(handle), Some(raw_offset), Some(chunk)) = (
+                    get_bytes(&mut cursor),
+                    get_u64(&mut cursor),
+                    get_bytes(&mut cursor),
+                ) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
 
                 // Checked before the mutable borrow below so the session-wide
                 // budget is visible; `grow_to` charges what it actually adds.
@@ -536,7 +566,10 @@ impl SftpSession {
                 self.buffered_bytes += grew;
             }
             SSH_FXP_CLOSE => {
-                let handle = get_bytes(&mut cursor).unwrap_or(&[]);
+                let Some(handle) = get_bytes(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 if let Some(h) = self.handles.remove(handle) {
                     // Closing a handle returns its bytes to the session budget,
                     // so a client transferring many files in sequence is never
@@ -588,7 +621,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_FSTAT => {
-                let handle = get_bytes(&mut cursor).unwrap_or(&[]);
+                let Some(handle) = get_bytes(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 match self.handles.get(handle) {
                     Some(SftpHandle::ReadFile { meta, data }) => {
                         put_attrs_pkt(out, id, meta, data.len() as u64);
@@ -607,7 +643,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_SETSTAT => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let attrs = get_attrs(&mut cursor);
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
@@ -629,7 +668,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_FSETSTAT => {
-                let handle = get_bytes(&mut cursor).unwrap_or(&[]);
+                let Some(handle) = get_bytes(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let attrs = get_attrs(&mut cursor);
                 if let Some(SftpHandle::WriteFile { mode, .. }) = self.handles.get_mut(handle) {
                     if let Some(attrs) = attrs {
@@ -645,7 +687,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_REMOVE => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
@@ -664,7 +709,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_MKDIR => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let attrs = get_attrs(&mut cursor);
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
@@ -684,7 +732,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_RMDIR => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
@@ -712,8 +763,11 @@ impl SftpSession {
                 }
             }
             SSH_FXP_RENAME => {
-                let oldpath = get_str(&mut cursor).unwrap_or("");
-                let newpath = get_str(&mut cursor).unwrap_or("");
+                let (Some(oldpath), Some(newpath)) = (get_str(&mut cursor), get_str(&mut cursor))
+                else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let old_abs = normalize_path(&cwd_str, oldpath);
                 let new_abs = normalize_path(&cwd_str, newpath);
@@ -735,7 +789,10 @@ impl SftpSession {
                 }
             }
             SSH_FXP_READLINK => {
-                let path = get_str(&mut cursor).unwrap_or("");
+                let Some(path) = get_str(&mut cursor) else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs = normalize_path(&cwd_str, path);
                 let (parent_path, name) = Vfs::split_path(&abs);
@@ -759,8 +816,12 @@ impl SftpSession {
                 }
             }
             SSH_FXP_SYMLINK => {
-                let linkpath = get_str(&mut cursor).unwrap_or("");
-                let targetpath = get_str(&mut cursor).unwrap_or("");
+                let (Some(linkpath), Some(targetpath)) =
+                    (get_str(&mut cursor), get_str(&mut cursor))
+                else {
+                    put_status(out, id, SSH_FX_BAD_MESSAGE, "Malformed packet");
+                    return;
+                };
                 let cwd_str = shell.vfs.path_of(shell.cwd);
                 let abs_link = normalize_path(&cwd_str, linkpath);
                 let (parent_path, name) = Vfs::split_path(&abs_link);
@@ -1428,5 +1489,24 @@ mod tests {
         let _id = get_u32(&mut cur).unwrap();
         let code = get_u32(&mut cur).unwrap();
         assert_eq!(code, SSH_FX_EOF);
+    }
+
+    #[test]
+    fn sftp_truncated_or_malformed_packets_return_bad_message() {
+        let mut session = SftpSession::new();
+        let mut shell = test_shell();
+
+        // Packet with SSH_FXP_STAT but no path string bytes at all
+        let malformed_stat = make_pkt(SSH_FXP_STAT, |p| {
+            put_u32(p, 42);
+            // omitted path
+        });
+        let (out, _) = session.feed(&malformed_stat, &mut shell, 1024);
+        assert_eq!(out[4], SSH_FXP_STATUS);
+        let mut cur = &out[5..];
+        let id = get_u32(&mut cur).unwrap();
+        assert_eq!(id, 42);
+        let code = get_u32(&mut cur).unwrap();
+        assert_eq!(code, SSH_FX_BAD_MESSAGE);
     }
 }

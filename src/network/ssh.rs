@@ -89,6 +89,8 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
     // allocated, so a connection flood is shed cheaply.
     let registry = ConnectionRegistry::new(config.max_sessions, config.per_ip_connections);
     let session_counter = Arc::new(AtomicU64::new(1));
+    let initial_quarantine_bytes = measure_dir_size(&config.quarantine_dir);
+    let global_quarantine_bytes = Arc::new(AtomicU64::new(initial_quarantine_bytes));
 
     let listener = TcpListener::bind((config.listen_addr, config.port))
         .await
@@ -161,6 +163,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             scp: None,
             sftp: None,
             quarantine_bytes: 0,
+            global_quarantine_bytes: Arc::clone(&global_quarantine_bytes),
             password_buf: None,
             line_buf: Vec::new(),
             screen: None,
@@ -367,6 +370,8 @@ struct MimicHandler {
     /// store. Bounds disk growth from a flood of distinct small uploads (the
     /// content-addressed dedup only bounds *repeated* payloads).
     quarantine_bytes: u64,
+    /// Shared tracker for total real-disk quarantine usage across all active sessions.
+    global_quarantine_bytes: Arc<AtomicU64>,
     /// When `Some`, the shell is waiting on a password line (e.g. after `su`):
     /// input bytes are collected here with echo suppressed until Enter, then
     /// handed to [`Shell::resume`].
@@ -435,6 +440,21 @@ impl Drop for ScreenHold {
 /// small files could otherwise grow the quarantine store without limit for the
 /// duration of a session.
 const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
+
+/// Default global ceiling on real-disk quarantine writes across all sessions,
+/// as a multiple of `max_upload_bytes`.
+const QUARANTINE_GLOBAL_MULTIPLIER: u64 = 64;
+
+fn measure_dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
 
 impl MimicHandler {
     fn try_open_channel(&mut self, channel: u32) -> bool {
@@ -916,28 +936,41 @@ impl MimicHandler {
         let dest_path = self.write_to_vfs(&target, recursive, &file);
 
         // Write to the quarantine store (real I/O is permitted in this layer),
-        // unless this session has already hit its cumulative disk-write cap.
+        // unless this session (or global store) has already hit its cumulative disk-write cap.
         // The VFS mirror above is unaffected — it has its own independent
         // node/byte caps — so the attacker's session still looks consistent.
-        let cap = self
+        let session_cap = self
             .config
             .max_upload_bytes
             .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
-        let stored_path = if self.quarantine_bytes.saturating_add(file.data.len() as u64) > cap {
-            event::quarantine_session_cap(session_id, peer);
-            String::new()
-        } else {
-            match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
-                Ok((p, written)) => {
-                    self.quarantine_bytes += written;
-                    p
+        let global_cap = self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
+            self.config
+                .max_upload_bytes
+                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
+        });
+        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
+
+        let stored_path =
+            if self.quarantine_bytes.saturating_add(file.data.len() as u64) > session_cap {
+                event::quarantine_session_cap(session_id, peer);
+                String::new()
+            } else if current_global.saturating_add(file.data.len() as u64) > global_cap {
+                event::quarantine_global_cap(session_id, peer);
+                String::new()
+            } else {
+                match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
+                    Ok((p, written)) => {
+                        self.quarantine_bytes += written;
+                        self.global_quarantine_bytes
+                            .fetch_add(written, Ordering::Relaxed);
+                        p
+                    }
+                    Err(err) => {
+                        event::quarantine_error(session_id, peer, &err.to_string());
+                        String::new()
+                    }
                 }
-                Err(err) => {
-                    event::quarantine_error(session_id, peer, &err.to_string());
-                    String::new()
-                }
-            }
-        };
+            };
 
         event::upload(
             session_id,
@@ -963,21 +996,33 @@ impl MimicHandler {
         hasher.update(&upload.data);
         let stored_sha256 = hex(&hasher.finalize());
 
-        let cap = self
+        let session_cap = self
             .config
             .max_upload_bytes
             .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
+        let global_cap = self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
+            self.config
+                .max_upload_bytes
+                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
+        });
+        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
+
         let stored_path = if self
             .quarantine_bytes
             .saturating_add(upload.data.len() as u64)
-            > cap
+            > session_cap
         {
             event::quarantine_session_cap(session_id, peer);
+            String::new()
+        } else if current_global.saturating_add(upload.data.len() as u64) > global_cap {
+            event::quarantine_global_cap(session_id, peer);
             String::new()
         } else {
             match write_quarantine(&quarantine_dir, &stored_sha256, &upload.data) {
                 Ok((p, written)) => {
                     self.quarantine_bytes += written;
+                    self.global_quarantine_bytes
+                        .fetch_add(written, Ordering::Relaxed);
                     p
                 }
                 Err(err) => {
@@ -1847,6 +1892,7 @@ mod tests {
             scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
             sftp: None,
             quarantine_bytes: 0,
+            global_quarantine_bytes: Arc::new(AtomicU64::new(0)),
             password_buf: None,
             line_buf: Vec::new(),
             screen: None,
@@ -1944,6 +1990,83 @@ mod tests {
             "tracked quarantine_bytes {} exceeded cap {cap}",
             handler.quarantine_bytes
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_disk_writes_are_capped_globally() {
+        let dir = std::env::temp_dir().join(format!(
+            "mimic-quarantine-global-cap-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let max_upload_bytes = 1024u64;
+        let global_cap = 2000u64;
+        let shared_global = Arc::new(AtomicU64::new(0));
+
+        let mut handler1 = test_handler(dir.clone(), max_upload_bytes);
+        handler1.config = Arc::new(Config {
+            quarantine_dir: dir.clone(),
+            max_upload_bytes,
+            quarantine_max_total_bytes: Some(global_cap),
+            ..Config::default()
+        });
+        handler1.global_quarantine_bytes = Arc::clone(&shared_global);
+
+        let mut handler2 = test_handler(dir.clone(), max_upload_bytes);
+        handler2.config = Arc::new(Config {
+            quarantine_dir: dir.clone(),
+            max_upload_bytes,
+            quarantine_max_total_bytes: Some(global_cap),
+            ..Config::default()
+        });
+        handler2.global_quarantine_bytes = Arc::clone(&shared_global);
+
+        // Upload in handler1
+        handler1.store_upload(CompletedFile {
+            name: "h1_file".to_string(),
+            rel_dir: String::new(),
+            mode: 0o644,
+            data: vec![1u8; 1000],
+            size: 1000,
+            payload_sha256: String::new(),
+            truncated: false,
+        });
+
+        // Upload in handler2 (second session, distinct content)
+        handler2.store_upload(CompletedFile {
+            name: "h2_file1".to_string(),
+            rel_dir: String::new(),
+            mode: 0o644,
+            data: vec![2u8; 1000],
+            size: 1000,
+            payload_sha256: String::new(),
+            truncated: false,
+        });
+
+        // Third upload in handler2 should hit global cap (1000 + 1000 + 1000 > 2000)
+        handler2.store_upload(CompletedFile {
+            name: "h2_file2".to_string(),
+            rel_dir: String::new(),
+            mode: 0o644,
+            data: vec![3u8; 1000],
+            size: 1000,
+            payload_sha256: String::new(),
+            truncated: false,
+        });
+
+        let total_on_disk: u64 = std::fs::read_dir(&dir)
+            .expect("quarantine dir created")
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().expect("metadata").len())
+            .sum();
+        assert!(
+            total_on_disk <= global_cap,
+            "quarantine disk usage {total_on_disk} exceeded global cap {global_cap}"
+        );
+        assert_eq!(total_on_disk, 2000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

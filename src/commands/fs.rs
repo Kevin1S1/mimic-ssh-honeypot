@@ -211,6 +211,7 @@ fn long_entry(vfs: &Vfs, id: NodeId, name: &str, flags: &LsFlags) -> String {
 fn allocated_kib(vfs: &Vfs, id: NodeId) -> u64 {
     match &vfs.node(id).kind {
         NodeKind::File { contents } => (contents.len() as u64).div_ceil(4096) * 4,
+        NodeKind::DynamicFile { generator } => (generator().len() as u64).div_ceil(4096) * 4,
         NodeKind::Directory { .. } => 4,
         NodeKind::Symlink { .. } => 0,
     }
@@ -220,6 +221,7 @@ fn allocated_kib(vfs: &Vfs, id: NodeId) -> u64 {
 pub(crate) fn node_size(node: &crate::vfs::Node) -> u64 {
     match &node.kind {
         NodeKind::File { contents } => contents.len() as u64,
+        NodeKind::DynamicFile { generator } => generator().len() as u64,
         NodeKind::Symlink { target } => target.len() as u64,
         NodeKind::Directory { .. } => 4096,
     }
@@ -414,18 +416,11 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
             status = 1;
             continue;
         }
-        match &node.kind {
-            NodeKind::Directory { .. } => {
-                errs.push_str(&format!("cat: {arg}: Is a directory\n"));
-                status = 1;
-            }
-            NodeKind::File { contents } => {
-                out.push_str(&String::from_utf8_lossy(contents));
-            }
-            NodeKind::Symlink { .. } => {
-                // resolve() already follows symlinks, so this is unreachable in
-                // practice; treat as empty to be safe.
-            }
+        if let Some(bytes) = node.file_bytes() {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        } else if node.meta.is_dir() {
+            errs.push_str(&format!("cat: {arg}: Is a directory\n"));
+            status = 1;
         }
     }
 
@@ -528,7 +523,7 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
             status = 1;
             continue;
         }
-        let NodeKind::File { contents } = &node.kind else {
+        let Some(bytes) = node.file_bytes() else {
             errs.push_str(&format!("{cmd}: error reading '{path}': Is a directory\n"));
             status = 1;
             continue;
@@ -539,7 +534,7 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
             }
             out.push_str(&format!("==> {path} <==\n"));
         }
-        out.push_str(&select_slice(contents, count, by_bytes, from_end));
+        out.push_str(&select_slice(&bytes, count, by_bytes, from_end));
     }
 
     CommandResult::streams(out, errs, status)
@@ -651,20 +646,20 @@ pub fn wc(shell: &Shell, args: &[String]) -> CommandResult {
             status = 1;
             continue;
         }
-        let NodeKind::File { contents } = &node.kind else {
+        let Some(bytes) = node.file_bytes() else {
             errs.push_str(&format!("wc: {path}: Is a directory\n"));
             status = 1;
             continue;
         };
-        let text = String::from_utf8_lossy(contents);
+        let text = String::from_utf8_lossy(&bytes);
         let lines = text.bytes().filter(|&b| b == b'\n').count();
         let words = text.split_whitespace().count();
-        let bytes = contents.len();
+        let byte_count = bytes.len();
         tl += lines;
         tw += words;
-        tc += bytes;
+        tc += byte_count;
         counted += 1;
-        out.push_str(&format_wc(lines, words, bytes, show_l, show_w, show_c));
+        out.push_str(&format_wc(lines, words, byte_count, show_l, show_w, show_c));
         out.push_str(&format!(" {path}\n"));
     }
 
@@ -902,11 +897,11 @@ fn grep_file(
     out: &mut String,
     any_match: &mut bool,
 ) {
-    let NodeKind::File { contents } = &vfs.node(id).kind else {
+    let Some(bytes) = vfs.node(id).file_bytes() else {
         return;
     };
     grep_text(
-        &String::from_utf8_lossy(contents),
+        &String::from_utf8_lossy(&bytes),
         path,
         needle,
         flags,
@@ -1389,6 +1384,23 @@ fn tar_walk(shell: &Shell, id: NodeId, name: &str, build: &mut TarBuild) {
             tar_write_header(name, "", &node.meta, b'0', contents.len(), &mut build.bytes);
             build.bytes.extend_from_slice(contents);
             let pad = contents.len().next_multiple_of(TAR_BLOCK) - contents.len();
+            build.bytes.resize(build.bytes.len() + pad, 0);
+            if build.verbose {
+                build.log.push_str(&format!("{name}\n"));
+            }
+        }
+        NodeKind::DynamicFile { generator } => {
+            if !node.meta.readable_by(shell.uid, shell.gid) {
+                build
+                    .errs
+                    .push_str(&format!("tar: {name}: Cannot open: Permission denied\n"));
+                build.status = 2;
+                return;
+            }
+            let bytes = generator();
+            tar_write_header(name, "", &node.meta, b'0', bytes.len(), &mut build.bytes);
+            build.bytes.extend_from_slice(&bytes);
+            let pad = bytes.len().next_multiple_of(TAR_BLOCK) - bytes.len();
             build.bytes.resize(build.bytes.len() + pad, 0);
             if build.verbose {
                 build.log.push_str(&format!("{name}\n"));
@@ -2915,7 +2927,7 @@ fn stat_kind(node: &crate::vfs::Node) -> &'static str {
         NodeKind::Directory { .. } => "directory",
         NodeKind::Symlink { .. } => "symbolic link",
         NodeKind::File { contents } if contents.is_empty() => "regular empty file",
-        NodeKind::File { .. } => "regular file",
+        NodeKind::File { .. } | NodeKind::DynamicFile { .. } => "regular file",
     }
 }
 

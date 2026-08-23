@@ -50,6 +50,11 @@ pub struct Config {
     /// consumed off the wire (to keep the SCP protocol in sync) but truncated
     /// on disk to bound memory and storage use.
     pub max_upload_bytes: u64,
+    /// Global ceiling in bytes across all quarantine files on disk. When the
+    /// quarantine store reaches this size, new uploads are still recorded in
+    /// logs and the virtual filesystem, but physical disk writes are skipped
+    /// to prevent disk exhaustion. Default: `max_upload_bytes * 64`.
+    pub quarantine_max_total_bytes: Option<u64>,
     /// Directory where SSH host keys are persisted. Keys are generated on first
     /// start and reused afterwards so the server fingerprint stays stable across
     /// restarts (a changing fingerprint is a honeypot tell).
@@ -128,6 +133,7 @@ impl Default for Config {
             max_session_secs: 1800,
             quarantine_dir: PathBuf::from("quarantine"),
             max_upload_bytes: 8 * 1024 * 1024,
+            quarantine_max_total_bytes: None,
             host_key_dir: PathBuf::from("host_keys"),
             auth: AuthConfig::default(),
             logging: LoggingConfig::default(),

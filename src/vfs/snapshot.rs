@@ -866,23 +866,12 @@ pub fn build(hostname: &str, persona: &Persona) -> Vfs {
     fs.add_file(proc, "cpuinfo", cpuinfo(persona), 0o444, 0, 0);
     fs.add_file(proc, "meminfo", meminfo(persona), 0o444, 0, 0);
     fs.add_file(proc, "version", VERSION, 0o444, 0, 0);
-    // Derived from the same boot anchor as the `uptime`/`top`/`w` banners so
-    // `cat /proc/uptime` can't contradict them. The idle field is the busier
-    // "0.98 of one core idle" ratio a mostly-quiet single-core box shows.
-    //
-    // ponytail: a snapshot file is a fixed string, so this is the uptime at
-    // session start and does not tick within a session the way the banners do;
-    // upgrade when the VFS grows generated files.
-    let up = crate::clock::uptime_secs();
-    fs.add_file(
-        proc,
-        "uptime",
-        format!("{up}.42 {:.2}\n", up as f64 * 0.9846),
-        0o444,
-        0,
-        0,
-    );
-    fs.add_file(proc, "loadavg", "0.08 0.03 0.01 1/128 9241\n", 0o444, 0, 0);
+    // Derived dynamically from the same boot anchor as the `uptime`/`top`/`w`
+    // banners so `cat /proc/uptime` ticks with elapsed time and can't contradict
+    // them. The idle field is the busier "0.98 of one core idle" ratio a
+    // mostly-quiet single-core box shows.
+    fs.add_dynamic_file(proc, "uptime", proc_uptime, 0o444, 0, 0);
+    fs.add_dynamic_file(proc, "loadavg", proc_loadavg, 0o444, 0, 0);
 
     // /var subtree.
     let var_log = fs.mkdir(var, "log", 0o755, 0, 0);
@@ -925,17 +914,25 @@ pub fn build(hostname: &str, persona: &Persona) -> Vfs {
     fs
 }
 
+fn proc_uptime() -> Vec<u8> {
+    let up = crate::clock::uptime_secs();
+    format!("{up}.42 {:.2}\n", up as f64 * 0.9846).into_bytes()
+}
+
+fn proc_loadavg() -> Vec<u8> {
+    b"0.08 0.03 0.01 1/128 9241\n".to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::nodes::NodeKind;
 
     fn read(fs: &Vfs, path: &str) -> String {
         let id = fs.resolve(fs.root(), path).expect("path should resolve");
-        match &fs.node(id).kind {
-            NodeKind::File { contents } => String::from_utf8_lossy(contents).into_owned(),
-            _ => panic!("{path} is not a regular file"),
-        }
+        fs.node(id)
+            .file_bytes()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| panic!("{path} is not a file"))
     }
 
     /// Every runnable command must resolve under `/usr/bin` or `/usr/sbin`
@@ -1046,6 +1043,18 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .expect("/proc/uptime second field should be a number");
         assert!(idle < secs, "idle {idle} should be below uptime {secs}");
+    }
+
+    #[test]
+    fn proc_uptime_is_dynamic_and_matches_clock() {
+        let fs = build("srv1", &Persona::sample());
+        let read1 = read(&fs, "/proc/uptime");
+        let secs1: f64 = read1
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        assert_eq!(secs1.floor() as i64, crate::clock::uptime_secs());
     }
 
     /// The snapshot is the box as installed: dated before this process

@@ -311,7 +311,7 @@ achieved something: a login that worked, and a payload that landed. Failed
 logins, commands and connections stay `INFO` — on an internet-facing sensor they
 are the background radiation, and raising them would drown the two that matter.
 The remaining `WARN`s (`accept_error`, `quarantine_session_cap`,
-`quarantine_error`) are the sensor itself degrading. So
+`quarantine_global_cap`, `quarantine_error`) are the sensor itself degrading. So
 `level=WARN` alone is a usable alert filter with no lookup table.
 
 | `event` | Level | Session-scoped | What it means |
@@ -329,6 +329,7 @@ The remaining `WARN`s (`accept_error`, `quarantine_session_cap`,
 | `subsystem_request` | INFO | yes | A subsystem (e.g. SFTP) was requested. |
 | `upload` | WARN | yes | An SCP/SFTP payload was captured to the quarantine store. |
 | `quarantine_session_cap` | WARN | yes | The session hit its real-disk write cap; the payload is still in the VFS. |
+| `quarantine_global_cap` | WARN | yes | The honeypot hit its global quarantine storage cap; the payload is still in the VFS. |
 | `quarantine_error` | WARN | yes | **A payload capture failed.** The one to page on when the sensor itself is the problem. |
 | `session_timeout` | INFO | yes | *We* cut the session off, rather than the attacker leaving. |
 | `connection_closed` | INFO | yes | Session ended. Carries `duration_secs` and `command_count`. |

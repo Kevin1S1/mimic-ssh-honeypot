@@ -9,16 +9,18 @@
 
 use super::CommandResult;
 use crate::shell::Shell;
-use crate::vfs::NodeKind;
 
 /// Read a VFS file as text, or an empty string when it is missing.
 fn read_text(shell: &Shell, path: &str) -> String {
     shell
         .vfs
         .resolve(shell.cwd, path)
-        .and_then(|id| match &shell.vfs.node(id).kind {
-            NodeKind::File { contents } => Some(String::from_utf8_lossy(contents).into_owned()),
-            _ => None,
+        .and_then(|id| {
+            shell
+                .vfs
+                .node(id)
+                .file_bytes()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
         })
         .unwrap_or_default()
 }

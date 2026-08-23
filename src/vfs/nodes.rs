@@ -117,6 +117,8 @@ pub enum NodeKind {
     File { contents: Vec<u8> },
     /// A symbolic link to another path (absolute or relative).
     Symlink { target: String },
+    /// A virtual file whose content is dynamically generated upon read (e.g. `/proc/uptime`).
+    DynamicFile { generator: fn() -> Vec<u8> },
 }
 
 /// A single filesystem entry.
@@ -130,4 +132,17 @@ pub struct Node {
     pub kind: NodeKind,
     /// Ownership and permissions.
     pub meta: Metadata,
+}
+
+impl Node {
+    /// Return the contents of the file as bytes (borrowed slice for regular files,
+    /// freshly generated vector for dynamic files), or `None` if this node is
+    /// a directory or symlink.
+    pub fn file_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match &self.kind {
+            NodeKind::File { contents } => Some(std::borrow::Cow::Borrowed(contents)),
+            NodeKind::DynamicFile { generator } => Some(std::borrow::Cow::Owned(generator())),
+            _ => None,
+        }
+    }
 }

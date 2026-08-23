@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Global quarantine disk quota (`quarantine_max_total_bytes`): bounds total real-disk storage usage across all concurrent and sequential sessions, preventing multi-connection disk exhaustion. Emits `quarantine_global_cap` when the limit is reached while continuing in-memory VFS mirroring.
+- Central forensic log field sanitisation: non-printable control characters (including ANSI escape sequences, bell, backspace, and NUL bytes) in attacker-controlled strings are hex-escaped to prevent terminal injection attacks on log viewers and SIEM operators.
+
 ### Added
+- Dynamic virtual files in VFS (`/proc/uptime` and `/proc/loadavg`): `/proc/uptime` now dynamically computes uptime at read time instead of remaining a static snapshot string, defeating sleep-and-reread honeypot fingerprinting.
 - `/usr/bin`/`/usr/sbin` density: 400 real Debian 12 binary names (up from
   109), sourced from packages.debian.org filelists for coreutils, util-linux,
   procps, iproute2, e2fsprogs, gzip, bzip2, xz-utils, less, nano, man-db,
@@ -53,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup table to route alerts. Everything else keeps its level.
 - The Filebeat recipe in `README.md` renames the ECS fields instead of adding
   them, so the shipper config cannot drift from what the sensor emits.
+
+### Fixed
+- SFTP decoder returns `SSH_FX_BAD_MESSAGE` (status 5) on truncated or malformed
+  packets rather than silently falling back to default values.
 
 ### Security
 - `SECURITY.md` documents that `python3`/`perl` emulate the invocation only and

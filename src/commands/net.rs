@@ -98,10 +98,12 @@ fn drop_file(shell: &mut Shell, dest: &str, contents: Vec<u8>) -> (String, u64) 
     if let Some(parent) = shell.vfs.resolve(shell.cwd, dir) {
         if shell.vfs.node(parent).meta.is_dir() {
             let id = shell.vfs.add_file(parent, name, contents, 0o644, uid, gid);
-            let written = match &shell.vfs.node(id).kind {
-                crate::vfs::NodeKind::File { contents } => contents.len() as u64,
-                _ => 0,
-            };
+            let written = shell
+                .vfs
+                .node(id)
+                .file_bytes()
+                .map(|b| b.len() as u64)
+                .unwrap_or(0);
             return (shell.vfs.path_of(parent) + "/" + name, written);
         }
     }

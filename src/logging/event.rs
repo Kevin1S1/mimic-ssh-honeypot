@@ -42,6 +42,38 @@ fn peer_parts(peer: SocketAddr) -> (String, u16) {
     (peer.ip().to_string(), peer.port())
 }
 
+/// Sanitise a string field before logging to prevent ANSI terminal injection
+/// and control character confusion in downstream log viewers.
+///
+/// Printable characters and standard whitespace (`\n`, `\r`, `\t`) are preserved;
+/// other control characters (including ESC `\x1b`, backspace `\x08`, bell `\x07`,
+/// NUL `\x00`) are hex-escaped as `\xHH` so the raw bytes are visible for
+/// forensics without being interpreted by an operator's terminal.
+pub fn sanitise_field(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s
+        .chars()
+        .any(|c| (c.is_control() && c != '\t' && c != '\n' && c != '\r') || c == '\x7f')
+    {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if (c.is_control() && c != '\t' && c != '\n' && c != '\r') || c == '\x7f' {
+            let u = c as u32;
+            if u <= 0xff {
+                use std::fmt::Write;
+                let _ = write!(out, "\\x{u:02x}");
+            } else {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{{{u:x}}}");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// The ECS envelope stamped on every event.
 ///
 /// Emitting these means a consumer maps nothing: previously the Filebeat recipe
@@ -92,6 +124,7 @@ pub fn connection_opened(session_id: u64, peer: SocketAddr) {
 /// else available, so it is worth its own event rather than a field on one.
 pub fn client_banner(session_id: u64, peer: SocketAddr, banner: &str) {
     let (src_ip, src_port) = peer_parts(peer);
+    let banner = sanitise_field(banner);
     emit!(
         info,
         "client_banner",
@@ -99,7 +132,7 @@ pub fn client_banner(session_id: u64, peer: SocketAddr, banner: &str) {
         peer = %peer,
         src_ip,
         src_port,
-        banner,
+        banner = %banner,
     );
 }
 
@@ -129,7 +162,8 @@ pub fn log_retention_pruned(removed: usize, retention_days: usize) {
 
 /// `accept()` failed. Transient (fd exhaustion, and similar), not fatal.
 pub fn accept_error(error: &str) {
-    emit!(warn, "accept_error", error,);
+    let error = sanitise_field(error);
+    emit!(warn, "accept_error", error = %error,);
 }
 
 /// A session hit the absolute lifetime cap and was disconnected.
@@ -159,10 +193,25 @@ pub fn quarantine_session_cap(session_id: u64, peer: SocketAddr) {
     );
 }
 
+/// The honeypot reached its global quarantine-write cap; later uploads
+/// across sessions are logged but not stored on disk until reset/pruned.
+pub fn quarantine_global_cap(session_id: u64, peer: SocketAddr) {
+    let (src_ip, src_port) = peer_parts(peer);
+    emit!(
+        warn,
+        "quarantine_global_cap",
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+    );
+}
+
 /// Writing a captured payload to the quarantine store failed. This is the only
 /// signal that a capture was lost, so it carries the full field set.
 pub fn quarantine_error(session_id: u64, peer: SocketAddr, error: &str) {
     let (src_ip, src_port) = peer_parts(peer);
+    let error = sanitise_field(error);
     emit!(
         warn,
         "quarantine_error",
@@ -170,7 +219,7 @@ pub fn quarantine_error(session_id: u64, peer: SocketAddr, error: &str) {
         peer = %peer,
         src_ip,
         src_port,
-        error,
+        error = %error,
     );
 }
 
@@ -190,6 +239,10 @@ pub fn auth_attempt(
     accepted: bool,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
+    let username = sanitise_field(username);
+    let method = sanitise_field(method);
+    let password = sanitise_field(secret.unwrap_or(""));
+    let key_fingerprint = sanitise_field(fingerprint.unwrap_or(""));
     // A credential that worked is the moment the box stopped being a doorbell
     // and started being a shell. Failed attempts are the background radiation of
     // any internet-facing sensor and would drown it at the same level.
@@ -202,10 +255,10 @@ pub fn auth_attempt(
                 peer = %peer,
                 src_ip,
                 src_port,
-                username,
-                method,
-                password = secret.unwrap_or(""),
-                key_fingerprint = fingerprint.unwrap_or(""),
+                username = %username,
+                method = %method,
+                password = %password,
+                key_fingerprint = %key_fingerprint,
                 accepted,
             )
         };
@@ -221,13 +274,14 @@ pub fn auth_attempt(
 /// limit was reached. `reason` is `"global_limit"` or `"per_ip_limit"`.
 pub fn connection_rejected(peer: SocketAddr, reason: &str) {
     let (src_ip, src_port) = peer_parts(peer);
+    let reason = sanitise_field(reason);
     emit!(
         info,
         "connection_rejected",
         peer = %peer,
         src_ip,
         src_port,
-        reason,
+        reason = %reason,
     );
 }
 
@@ -257,6 +311,9 @@ pub fn connection_closed(
 /// the body was "saved" to (or `-` for stdout). No real request was made.
 pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: &str) {
     let (src_ip, src_port) = peer_parts(peer);
+    let tool = sanitise_field(tool);
+    let url = sanitise_field(url);
+    let dest = sanitise_field(dest);
     emit!(
         info,
         "download",
@@ -264,9 +321,9 @@ pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: 
         peer = %peer,
         src_ip,
         src_port,
-        tool,
-        url,
-        dest,
+        tool = %tool,
+        url = %url,
+        dest = %dest,
     );
 }
 
@@ -318,6 +375,7 @@ pub fn command(
     status: Option<i32>,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
+    let command = sanitise_field(command);
     emit!(
         info,
         "command",
@@ -325,7 +383,7 @@ pub fn command(
         peer = %peer,
         src_ip,
         src_port,
-        command,
+        command = %command,
         source = source.as_str(),
         status = status.unwrap_or(-1),
     );
@@ -334,6 +392,7 @@ pub fn command(
 /// An SSH subsystem request (such as `sftp`) was received from the client.
 pub fn subsystem_request(session_id: u64, peer: SocketAddr, subsystem: &str, accepted: bool) {
     let (src_ip, src_port) = peer_parts(peer);
+    let subsystem = sanitise_field(subsystem);
     emit!(
         info,
         "subsystem_request",
@@ -341,7 +400,7 @@ pub fn subsystem_request(session_id: u64, peer: SocketAddr, subsystem: &str, acc
         peer = %peer,
         src_ip,
         src_port,
-        subsystem,
+        subsystem = %subsystem,
         accepted,
     );
 }
@@ -367,6 +426,11 @@ pub fn upload(
     truncated: bool,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
+    let name = sanitise_field(name);
+    let dest = sanitise_field(dest);
+    let sha256 = sanitise_field(sha256);
+    let stored_sha256 = sanitise_field(stored_sha256);
+    let stored_path = sanitise_field(stored_path);
     // An attacker who got a payload onto the box is past reconnaissance, so
     // this routes with the quarantine failures rather than with the noise.
     emit!(
@@ -376,12 +440,12 @@ pub fn upload(
         peer = %peer,
         src_ip,
         src_port,
-        name,
-        dest,
+        name = %name,
+        dest = %dest,
         size,
-        sha256,
-        stored_sha256,
-        stored_path,
+        sha256 = %sha256,
+        stored_sha256 = %stored_sha256,
+        stored_path = %stored_path,
         truncated,
     );
 }
@@ -516,12 +580,13 @@ mod tests {
                 false,
             );
             quarantine_session_cap(1, peer());
+            quarantine_global_cap(1, peer());
             quarantine_error(1, peer(), "disk full");
             session_timeout(1, peer());
             connection_closed(1, peer(), 1, 1);
             log_retention_pruned(2, 30);
         });
-        assert_eq!(events.len(), 17, "one line per event, every type covered");
+        assert_eq!(events.len(), 18, "one line per event, every type covered");
 
         for event in &events {
             let f = fields(event);
@@ -634,9 +699,23 @@ mod tests {
         assert!(!payload.contains('\u{1b}'), "escape byte must be escaped");
         assert!(!payload.contains('\u{0000}'), "NUL must be escaped");
 
-        // Round-tripped values are preserved exactly for forensic fidelity.
+        // Round-tripped values preserve printable chars and hex-escape control bytes
+        // to protect terminals from ANSI injection.
         let auth = fields(&events[0]);
         assert_eq!(auth["username"], malicious_user);
-        assert_eq!(auth["password"], malicious_pass);
+        assert_eq!(
+            auth["password"],
+            "p\rass\\x1b[31mword\\x07\twith\\x00controls"
+        );
+    }
+
+    #[test]
+    fn sanitise_field_escapes_terminal_control_sequences() {
+        assert_eq!(sanitise_field("normal_text_123"), "normal_text_123");
+        assert_eq!(sanitise_field("hello\tworld\n"), "hello\tworld\n");
+        assert_eq!(
+            sanitise_field("\x1b[31;1mRED\x1b[0m\x08\x07"),
+            "\\x1b[31;1mRED\\x1b[0m\\x08\\x07"
+        );
     }
 }

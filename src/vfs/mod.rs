@@ -259,6 +259,26 @@ impl Vfs {
         id
     }
 
+    /// Create a dynamic / virtual file whose content is evaluated on read.
+    pub fn add_dynamic_file(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        generator: fn() -> Vec<u8>,
+        perms: u32,
+        uid: u32,
+        gid: u32,
+    ) -> NodeId {
+        let kind = NodeKind::DynamicFile { generator };
+        let meta = Metadata::new(S_IFREG, perms, uid, gid);
+        if let Some(existing) = self.child(parent, name) {
+            self.nodes[existing].kind = kind;
+            self.nodes[existing].meta = meta;
+            return existing;
+        }
+        self.insert(parent, name, kind, meta)
+    }
+
     /// Overwrite or extend an existing regular file's contents, keeping its
     /// permissions and ownership. Returns `false` — leaving the file untouched
     /// — if `id` is not a regular file, or if the write would push the arena
@@ -467,6 +487,14 @@ impl Vfs {
                 dst_parent,
                 dst_name,
                 contents,
+                meta.mode & 0o7777,
+                meta.uid,
+                meta.gid,
+            ),
+            NodeKind::DynamicFile { generator } => self.add_dynamic_file(
+                dst_parent,
+                dst_name,
+                generator,
                 meta.mode & 0o7777,
                 meta.uid,
                 meta.gid,
