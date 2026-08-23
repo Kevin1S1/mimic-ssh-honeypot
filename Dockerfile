@@ -13,8 +13,9 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo fetch --locked
 
 COPY src ./src
-RUN cargo build --release --locked --bin mimic \
-    && strip target/release/mimic
+# `[profile.release]` already sets `strip = true`, so the binary arrives here
+# stripped; a second pass was a no-op that read as an oversight.
+RUN cargo build --release --locked --bin mimic
 
 # ── Runtime stage ────────────────────────────────────────────────────
 # distroless/cc-debian12:nonroot — ~20 MB, no shell, no package manager.

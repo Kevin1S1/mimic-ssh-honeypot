@@ -67,6 +67,8 @@ dir = "/data/logs"
 #   accept_after — succeed once a session has made `accept_after` attempts
 #   credentials  — only the username/password pairs listed below succeed
 mode = "accept_after"
+# Must be 1..=6. The server enforces Debian's MaxAuthTries of 6, so a larger
+# value would disconnect the client before the accepting attempt is reached.
 accept_after = 2
 
 # Used only when mode = "credentials":

@@ -25,8 +25,8 @@ When an attacker attempts to download a malicious payload via `wget` or `curl`, 
 
 ### 5. Safe SCP and SFTP Quarantining
 The only time the honeypot touches the real disk based on attacker input is during an SCP or SFTP upload. This is heavily sanitized:
-- Path separators (`/`, `\`) and `..` are replaced with `_` in that order — separators first, so the dotless replacement can never let `..` re-form after the collapse.
-- Control bytes (including NUL) are stripped to prevent log/VFS injection.
+- Control bytes (including NUL) are stripped **first**, to prevent log/VFS injection and to stop them reconstituting a separator or `..` after the replacements below. Stripping them last was a real ordering bug: `".\0."` holds no literal `..`, so it survived the collapse untouched and the filter then produced exactly `..`.
+- Path separators (`/`, `\`) and `..` are then replaced with `_` in that order — separators first, so the dotless replacement can never let `..` re-form after the collapse.
 - Files are deduplicated and saved by their SHA-256 hash, so the attacker-supplied name never influences the stored path on disk.
 - The upload size is strictly capped to prevent disk exhaustion.
 - A per-session cap on cumulative real-disk quarantine writes (`max_upload_bytes` × 32) bounds disk growth from a flood of many distinct small files within one session — content-addressed dedup alone only bounds *repeated* payloads. Files past the cap still land safely in the in-memory VFS (which has its own independent bounds); only the real-disk copy is skipped.
@@ -89,7 +89,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 |---|---|---|---|---|
 | T1 | Remote code execution | Any typed command / exec request | No `std::process` reachable from emulation layers; build-enforced by `escape_vectors` test | None by design |
 | T2 | Real filesystem read/write | `cat`, `rm`, `cp`, path traversal | All ops act on the in-memory `Vfs`; real FS decoupled | None by design |
-| T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; fuzz/robustness tests on the line editor | Unknown bug in a dependency |
+| T3 | Memory-safety exploit | Malformed packets, parser edge cases | `#![forbid(unsafe_code)]`; Rust ownership; unit tests covering malformed UTF-8, control-byte floods, oversized lines and truncated packets in the line editor and the SFTP/SCP decoders | Unknown bug in a dependency |
 | T4 | Pivot / DDoS amplification | `wget`/`curl`/`ping` to attacker host | Network commands are faked; no real socket opened | None by design |
 | T5 | Disk exhaustion | SCP / SFTP upload flood | Size-capped, SHA-256 content-addressed (dedup), filename sanitised (separators → `_`, then `..` → `_`, control bytes dropped), written `0600` non-exec, per-session quarantine disk-write cap (`max_upload_bytes` × 32) | Bounded per session; capped total across sessions only by the daily reset |
 | T6 | RAM exhaustion | Recursive `mkdir`, `cp`-amplified uploads, huge env, long lines, history, large command output, SSH channel flood | Shipped defaults cap connections at 32 globally/4 per IP under a 1 GiB process ceiling; each connection permits one active channel; VFS ≤ 2k nodes and ≤ 8 MiB content bytes; uploads ≤ 8 MiB; bounded env, command line (4096, interactive and exec) and history (1000); per-command output capped at 1 MiB (`MAX_COMMAND_OUTPUT_BYTES`) in dispatch | Bounded per session and by deployment memory controls |
@@ -97,7 +97,7 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 | T8 | Hung / zombie sessions | Slowloris, idle hold | Idle timeout + absolute `max_session_secs` cap | Bounded |
 | T9 | Daemon crash via one session | Panic-inducing input | Each session isolated in its own task; release builds unwind (no `panic = "abort"`) so a panicking session is contained and the listener survives | Bounded to one session; a stack overflow still aborts the process, so unbounded recursion is prevented separately (acyclic arena, depth caps) |
 | T10 | Honeypot fingerprinting | Banner/KEX/timing/`/proc`/missing-feature probes | Debian 12 OpenSSH-shaped handshake, persistent host key, readline emulation, response jitter, recon-command coverage, randomised daily restart (not at fixed time), explicit `SSH_MSG_CHANNEL_SUCCESS`/`FAILURE` replies to `pty-req`/`env`/`window-change`/subsystem/agent requests (matching real sshd instead of leaving them unanswered) | Ongoing — anti-detection is an evolving discipline; TCP/IP-stack fingerprinting (TTL, window sizes) is host-kernel territory, addressed by host `sysctl`/firewall tuning, not the application |
-| T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); log directory (`logging.dir`) restricted to `0700` since captured passwords are stored cleartext; quarantine purged daily | Operator data-handling duty |
+| T11 | Credential/payload leakage | Captured data at rest | Quarantine files inert (`0600`, no exec bit); log directory (`logging.dir`) restricted to `0700` since captured passwords are stored cleartext; quarantine purged daily. **The `0600`/`0700` modes apply on Unix deployment targets only** — Windows is a development platform and the `#[cfg(not(unix))]` fallbacks write with default permissions | Operator data-handling duty |
 | T12 | Accumulated state / forensic contamination | Previous attacker's files, history, or VFS artifacts visible to next attacker | Daily process restart clears all in-memory state; quarantine wiped on disk; random restart time prevents uptime-based detection | Bounded to one daily cycle |
 | T13 | Whole-process hang or abort from an emulated command | Cyclic VFS move (`mv a a/b`), pathological `find -name` glob | `Vfs::rename` keeps the arena acyclic and `path_of` is arena-bounded; `glob_match` is an iterative single-backtrack matcher instead of exponential recursion | Bounded — no unbounded walk or match remains on an attacker-reachable path |
 
@@ -110,6 +110,45 @@ Everything an attacker sends crosses a single trust boundary into the **network 
 6. **One session cannot affect another** or the listener (task isolation + RAII connection slots + unwinding release builds).
 7. **The VFS arena stays acyclic and every walk over it terminates** — no emulated command may construct state that makes path rendering or a recursive walk run forever.
 8. **Ephemeral state does not persist across daily resets** — quarantine data, VFS modifications, and session artifacts are wiped daily; only host keys survive to maintain fingerprint stability.
+
+### Every attacker-driven bound, in one place
+
+Invariant 4 says every attacker-controlled allocation is bounded. The bounds
+themselves live across eight files, which makes the claim hard to audit and made
+the one gap that did exist (the SFTP request path) hard to notice. They are:
+
+| Bound | Value | Enforced in | Protects against |
+|---|---|---|---|
+| Global connections | 32 (`max_sessions`) | `network/limiter.rs` | Connection flood |
+| Per-IP connections | 4 (`per_ip_connections`) | `network/limiter.rs` | Single-source flood |
+| Active channels per connection | 1 | `network/ssh.rs` | Channel flood past the limiter |
+| Auth attempts per connection | 6 (`max_auth_attempts`) | `network/ssh.rs` | Password spraying on one socket |
+| Session lifetime | `max_session_secs` | `network/ssh.rs` watchdog | Indefinite resource hold |
+| Command line (interactive and exec) | 4096 bytes | `network/ssh.rs`, `shell/line.rs` | Parser/log bloat |
+| Shell history | 1000 entries | `shell/line.rs` | Per-session growth |
+| Environment | 256 vars × 4096 bytes | `shell/env.rs` | `export` flood |
+| Command output (stdout + stderr, shared) | 1 MiB | `commands/mod.rs` dispatch | Output amplification |
+| Filter input (`sed`, `tr`, `base64`, …) | 1 MiB | `commands/text.rs` | Transforms that inflate their input |
+| `tr` set expansion | 1024 chars | `commands/text.rs` | 2 bytes of argument → 1.1M-char set |
+| Script lines run by `sh` | 4096 | `commands/system.rs` | CPU burn with no output to truncate |
+| Command nesting (`sudo`, `sh -c`, `$( )`) | 16 | `commands/mod.rs`, `shell/mod.rs` | Stack overflow (aborts the process) |
+| VFS nodes | 2,000 | `vfs/mod.rs` | Recursive `mkdir` |
+| VFS content | 8 MiB | `vfs/mod.rs` | Upload/`cp` amplification |
+| VFS copy depth | 64 | `vfs/mod.rs` | Deep-copy recursion |
+| Symlink resolution depth | 40 | `vfs/mod.rs` | Symlink loops |
+| Heredoc body | 1 MiB | `shell/mod.rs` | Unbounded line accumulation |
+| Upload size | 8 MiB (`max_upload_bytes`) | `network/scp.rs`, `network/sftp.rs` | Single-file exhaustion |
+| SFTP handles per session | 64 | `network/sftp.rs` | Handle flood |
+| SFTP buffered bytes per session | `max_upload_bytes` | `network/sftp.rs` | Sparse-write amplification across handles |
+| SFTP response per `feed()` | 1 MiB | `network/sftp.rs` | Pipelined-read amplification |
+| SFTP packet | 256 KiB | `network/sftp.rs` | Oversized single packet |
+| SCP control line | 8 KiB | `network/scp.rs` | Unbounded control message |
+| SCP directory depth | 32 | `network/scp.rs` | Deep-tree recursion |
+| Quarantine disk writes per session | `max_upload_bytes` × 32 | `network/ssh.rs` | Disk growth from many distinct payloads |
+
+Deliberate ceilings that are *not* security bounds — emulation shortcuts with a
+known cost to realism — are marked `// ponytail:` in the source and explained in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 Any change that would weaken one of these invariants must be rejected — security takes priority over realism or features.
 
