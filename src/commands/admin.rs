@@ -233,8 +233,8 @@ pub fn useradd(shell: &mut Shell, args: &[String]) -> CommandResult {
         "/etc/shadow",
         &format!("{shadow}{name}:!:19999:0:99999:7:::\n"),
     );
-    if make_home {
-        shell.vfs.mkdir_p(&home, 0o755, uid, uid);
+    if make_home && shell.vfs.mkdir_p(&home, 0o755, uid, uid).is_none() {
+        return CommandResult::err(format!("useradd: cannot create directory {home}\n"), 12);
     }
     CommandResult::empty()
 }

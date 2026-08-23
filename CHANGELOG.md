@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- Uploads are no longer materialised in a directory other than the one the
+  `upload` event reports. `Vfs::mkdir_p` returned the last ancestor that did
+  exist when the node cap stopped it from creating the rest of the chain, so an
+  attacker who filled the arena could make the emulated filesystem and the
+  forensic record disagree about where a payload landed. It now returns
+  `Option<NodeId>`; the SFTP and SCP paths skip the mirror rather than write to
+  the wrong place, and SCP logs the path the attacker asked for.
 - `SECURITY.md` no longer claims fuzz testing of the line editor. There is no
   `fuzz/` target, no `cargo-fuzz`, and no property-testing dependency; the T3
   mitigation now names the unit tests that do exist. Every other claim in that

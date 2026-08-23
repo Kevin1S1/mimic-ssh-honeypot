@@ -217,10 +217,16 @@ impl SftpSession {
             {
                 if size > 0 || !data.is_empty() {
                     let (dir_path, _) = Vfs::split_path(&dest_path);
-                    let parent = shell.vfs.mkdir_p(dir_path, 0o755, shell.uid, shell.gid);
-                    shell
-                        .vfs
-                        .add_file(parent, &name, data.clone(), mode, shell.uid, shell.gid);
+                    // Mirroring into the VFS is best-effort: it has its own
+                    // caps, and the capture below does not depend on it. What
+                    // it must never do is fall back to an ancestor directory,
+                    // which would put the file somewhere other than the
+                    // `dest_path` the `upload` event records.
+                    if let Some(parent) = shell.vfs.mkdir_p(dir_path, 0o755, shell.uid, shell.gid) {
+                        shell
+                            .vfs
+                            .add_file(parent, &name, data.clone(), mode, shell.uid, shell.gid);
+                    }
                     let payload_sha256 = super::ssh::hex(&hasher.finalize());
                     completed.push(SftpCompletedUpload {
                         name,
@@ -552,10 +558,19 @@ impl SftpSession {
                     } = h
                     {
                         let (dir_path, _) = Vfs::split_path(&dest_path);
-                        let parent = shell.vfs.mkdir_p(dir_path, 0o755, shell.uid, shell.gid);
-                        shell
-                            .vfs
-                            .add_file(parent, &name, data.clone(), mode, shell.uid, shell.gid);
+                        // Best-effort mirror; see `into_pending_uploads`.
+                        if let Some(parent) =
+                            shell.vfs.mkdir_p(dir_path, 0o755, shell.uid, shell.gid)
+                        {
+                            shell.vfs.add_file(
+                                parent,
+                                &name,
+                                data.clone(),
+                                mode,
+                                shell.uid,
+                                shell.gid,
+                            );
+                        }
                         let payload_sha256 = super::ssh::hex(&hasher.finalize());
                         completed.push(SftpCompletedUpload {
                             name,
