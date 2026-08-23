@@ -188,7 +188,7 @@ host_key_dir      = "/data/host_keys"  # persisted Ed25519 + RSA keys
 # Optional log file output. Events always go to stdout; when `dir` is set they
 # are also written to a daily-rotated file there for log shippers / manual reads.
 dir            = "/data/logs"    # omit to keep stdout-only logging
-# retention_days = 30            # omit to keep logs forever; set to cap retention
+# retention_days = 30            # omit to keep logs forever; set to delete files older than N days
 
 [auth]
 # accept_all   – every password succeeds immediately (maximum interaction)
@@ -225,7 +225,7 @@ dir            = "/data/logs"   # writes mimic.YYYY-MM-DD.jsonl here
 ```
 
 - The file is named `mimic.<date>.jsonl` and rotates once per day; each day gets its own file, so a shipper can tail `${dir}/mimic.*.jsonl`.
-- **Logs are never deleted by default** — every rotated file is kept indefinitely. Set `retention_days = N` to keep only the most recent `N` daily files; older ones are pruned automatically on rotation.
+- **Logs are never deleted by default** — every rotated file is kept indefinitely. Set `retention_days = N` to delete rotated files once they are more than `N` days old. Pruning runs at startup and hourly thereafter, and again whenever the appender rotates, so the window holds across restarts and downtime rather than only while the sensor runs every day. Only this appender's own `mimic.<date>.jsonl` files are ever removed — pointing `dir` at a directory holding other data is safe. Removals are logged as a `log_retention_pruned` event.
 - Stdout logging stays on regardless, so `docker compose logs -f` / `journalctl -u mimic -f` keep working alongside the files.
 - In Docker, point `dir` at a path on the writable `/data` volume (the compose stack pre-creates `/data/logs`); the container's root filesystem is read-only.
 - The directory is set to `0700` on Unix at startup: captured passwords are stored in cleartext, so the log files must not be readable by other local users on the host. This matters most for bare-metal/systemd deployments that share the machine with other accounts.
@@ -286,7 +286,7 @@ docker logs mimic | jq 'select(.fields.event=="download") | .fields.url'
 
 ### Every event, and what carries it
 
-Fifteen event types share one envelope. `sensor_name` and `boot_id` are on all
+Sixteen event types share one envelope. `sensor_name` and `boot_id` are on all
 of them; everything that happens inside a session also carries `session_id`,
 `peer`, `src_ip` and `src_port`.
 
@@ -295,6 +295,7 @@ of them; everything that happens inside a session also carries `session_id`,
 | `listening` | INFO | no | The listener bound. Emitted once per process start. |
 | `shutdown` | INFO | no | SIGTERM/SIGINT received; buffered log lines are flushed. |
 | `accept_error` | WARN | no | The accept loop failed on one connection. |
+| `log_retention_pruned` | INFO | no | The retention sweep deleted rotated log files past `logging.retention_days`. |
 | `connection_rejected` | INFO | **no `session_id`** | Refused before a session existed (`per_ip_limit` / `global_limit`). |
 | `connection_opened` | INFO | yes | A session was created. |
 | `client_banner` | INFO | yes | The client's SSH version string, at first channel open. |

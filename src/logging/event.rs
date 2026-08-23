@@ -98,6 +98,19 @@ pub fn shutdown() {
     );
 }
 
+/// The retention sweep deleted rotated log files that aged past
+/// `logging.retention_days`. Emitted only when something was actually removed,
+/// so a quiet sensor stays quiet.
+pub fn log_retention_pruned(removed: usize, retention_days: usize) {
+    info!(
+        event = "log_retention_pruned",
+        sensor_name = sensor_name(),
+        boot_id = boot_id(),
+        removed,
+        retention_days,
+    );
+}
+
 /// `accept()` failed. Transient (fd exhaustion, and similar), not fatal.
 pub fn accept_error(error: &str) {
     tracing::warn!(
