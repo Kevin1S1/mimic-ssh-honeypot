@@ -239,7 +239,7 @@ Pipe to `jq`, or ship to your SIEM with one of the recipes below.
 
 ```jsonc
 // New connection
-{"timestamp":"…","level":"INFO","fields":{"event":"connection_opened","sensor_name":"mimic","boot_id":"3f9c…","session_id":42,"peer":"1.2.3.4:54321","src_ip":"1.2.3.4","src_port":54321}}
+{"timestamp":"…","level":"INFO","fields":{"event":"connection_opened","sensor_name":"mimic","boot_id":"3f9c…","event_kind":"event","event_category":"intrusion_detection","event_dataset":"mimic.ssh","ecs_version":"8.11.0","session_id":42,"peer":"1.2.3.4:54321","src_ip":"1.2.3.4","src_port":54321}}
 
 // Connection refused (over limit)
 {"fields":{"event":"connection_rejected","sensor_name":"mimic","boot_id":"3f9c…","peer":"1.2.3.4:54322","src_ip":"1.2.3.4","src_port":54322,"reason":"per_ip_limit"}}
@@ -286,9 +286,21 @@ docker logs mimic | jq 'select(.fields.event=="download") | .fields.url'
 
 ### Every event, and what carries it
 
-Sixteen event types share one envelope. `sensor_name` and `boot_id` are on all
-of them; everything that happens inside a session also carries `session_id`,
-`peer`, `src_ip` and `src_port`.
+Sixteen event types share one envelope. `sensor_name`, `boot_id`, `event_kind`,
+`event_category`, `event_dataset` and `ecs_version` are on all of them;
+everything that happens inside a session also carries `session_id`, `peer`,
+`src_ip` and `src_port`.
+
+The last four are the ECS classification fields, emitted by the sensor rather
+than bolted on by each operator's shipper — see [Elastic / ECS](#elastic--ecs).
+
+**Level is meant to be routable.** Two events are `WARN` because the attacker
+achieved something: a login that worked, and a payload that landed. Failed
+logins, commands and connections stay `INFO` — on an internet-facing sensor they
+are the background radiation, and raising them would drown the two that matter.
+The remaining `WARN`s (`accept_error`, `quarantine_session_cap`,
+`quarantine_error`) are the sensor itself degrading. So
+`level=WARN` alone is a usable alert filter with no lookup table.
 
 | `event` | Level | Session-scoped | What it means |
 |---|---|---|---|
@@ -299,13 +311,13 @@ of them; everything that happens inside a session also carries `session_id`,
 | `connection_rejected` | INFO | **no `session_id`** | Refused before a session existed (`per_ip_limit` / `global_limit`). |
 | `connection_opened` | INFO | yes | A session was created. |
 | `client_banner` | INFO | yes | The client's SSH version string, at first channel open. |
-| `auth_attempt` | INFO | yes | A credential was offered. Carries `password` (cleartext) or a public-key `fingerprint`. |
+| `auth_attempt` | INFO / **WARN** if `accepted` | yes | A credential was offered. Carries `password` (cleartext) or a public-key `fingerprint`. |
 | `command` | INFO | yes | A command line ran. Carries `source` and `status`. |
 | `download` | INFO | yes | `wget`/`curl` was used. No real request was made. |
 | `subsystem_request` | INFO | yes | A subsystem (e.g. SFTP) was requested. |
-| `upload` | INFO | yes | An SCP/SFTP payload was captured to the quarantine store. |
+| `upload` | WARN | yes | An SCP/SFTP payload was captured to the quarantine store. |
 | `quarantine_session_cap` | WARN | yes | The session hit its real-disk write cap; the payload is still in the VFS. |
-| `quarantine_error` | WARN | yes | **A payload capture failed.** The one event worth paging on. |
+| `quarantine_error` | WARN | yes | **A payload capture failed.** The one to page on when the sensor itself is the problem. |
 | `session_timeout` | INFO | yes | *We* cut the session off, rather than the attacker leaving. |
 | `connection_closed` | INFO | yes | Session ended. Carries `duration_secs` and `command_count`. |
 
@@ -385,7 +397,9 @@ without further mapping.
 ### Elastic / ECS
 
 `filebeat.yml` — the `peer` string is already split into `src_ip`/`src_port` by
-the honeypot, so no ingest-pipeline grok is needed:
+the honeypot and the ECS classification fields are emitted by it too, so this is
+pure renaming: no grok, and nothing synthesised in the shipper that could drift
+from what the sensor actually is.
 
 ```yaml
 filebeat.inputs:
@@ -404,10 +418,11 @@ processors:
         - { from: "fields.username",   to: "user.name" }
         - { from: "fields.event",      to: "event.action" }
         - { from: "fields.session_id", to: "event.id" }
+        - { from: "fields.event_kind", to: "event.kind" }
+        - { from: "fields.event_category", to: "event.category" }
+        - { from: "fields.event_dataset", to: "event.dataset" }
+        - { from: "fields.ecs_version", to: "ecs.version" }
       ignore_missing: true
-  - add_fields:
-      target: event
-      fields: { dataset: "mimic.ssh", category: "intrusion_detection", kind: "event" }
 ```
 
 

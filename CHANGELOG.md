@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `log_retention_pruned` event, emitted when the retention sweep deletes rotated
   log files.
+- Every event carries the ECS classification fields `event_kind`,
+  `event_category`, `event_dataset` and `ecs_version`. They were previously
+  synthesised by the Filebeat recipe in `README.md`, which helped only Elastic
+  users and kept the values in each operator's shipper config rather than in the
+  sensor that knows them.
+
+### Changed
+- `auth_attempt` with `accepted: true` and `upload` are logged at `WARN` instead
+  of `INFO`. A login that worked and a payload that landed are not the same
+  urgency as a connection opening, and without the split an operator needs a
+  lookup table to route alerts. Everything else keeps its level.
+- The Filebeat recipe in `README.md` renames the ECS fields instead of adding
+  them, so the shipper config cannot drift from what the sensor emits.
 
 ### Security
 - `logging.retention_days` now means days. It was passed straight to

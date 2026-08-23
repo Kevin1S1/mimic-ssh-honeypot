@@ -3,7 +3,6 @@
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
-use tracing::info;
 
 /// Process-wide sensor name, set once at startup.
 static SENSOR_NAME: OnceLock<String> = OnceLock::new();
@@ -43,13 +42,42 @@ fn peer_parts(peer: SocketAddr) -> (String, u16) {
     (peer.ip().to_string(), peer.port())
 }
 
+/// The ECS envelope stamped on every event.
+///
+/// Emitting these means a consumer maps nothing: previously the Filebeat recipe
+/// in `README.md` synthesised them with `add_fields`, which only helped Elastic
+/// users and put the values in every operator's shipper config instead of in the
+/// sensor that knows them.
+const EVENT_KIND: &str = "event";
+const EVENT_CATEGORY: &str = "intrusion_detection";
+const EVENT_DATASET: &str = "mimic.ssh";
+const ECS_VERSION: &str = "8.11.0";
+
+/// Emit one event line at `$level` with the common envelope filled in.
+///
+/// The envelope is eight fields on sixteen events; writing it out at each call
+/// site is how one of them ends up missing a field that a dashboard groups by.
+macro_rules! emit {
+    ($level:ident, $event:literal, $($rest:tt)*) => {
+        tracing::$level!(
+            event = $event,
+            sensor_name = sensor_name(),
+            boot_id = boot_id(),
+            event_kind = EVENT_KIND,
+            event_category = EVENT_CATEGORY,
+            event_dataset = EVENT_DATASET,
+            ecs_version = ECS_VERSION,
+            $($rest)*
+        )
+    };
+}
+
 /// A new TCP/SSH connection was accepted.
 pub fn connection_opened(session_id: u64, peer: SocketAddr) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "connection_opened",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "connection_opened",
         session_id,
         peer = %peer,
         src_ip,
@@ -64,10 +92,9 @@ pub fn connection_opened(session_id: u64, peer: SocketAddr) {
 /// else available, so it is worth its own event rather than a field on one.
 pub fn client_banner(session_id: u64, peer: SocketAddr, banner: &str) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "client_banner",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "client_banner",
         session_id,
         peer = %peer,
         src_ip,
@@ -78,10 +105,9 @@ pub fn client_banner(session_id: u64, peer: SocketAddr, banner: &str) {
 
 /// The listener is up and accepting connections.
 pub fn listening(addr: &str, port: u16, max_sessions: usize, per_ip_connections: usize) {
-    info!(
-        event = "listening",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "listening",
         addr,
         port,
         max_sessions,
@@ -91,43 +117,27 @@ pub fn listening(addr: &str, port: u16, max_sessions: usize, per_ip_connections:
 
 /// The process was asked to stop and is shutting the listener down.
 pub fn shutdown() {
-    info!(
-        event = "shutdown",
-        sensor_name = sensor_name(),
-        boot_id = boot_id()
-    );
+    emit!(info, "shutdown",);
 }
 
 /// The retention sweep deleted rotated log files that aged past
 /// `logging.retention_days`. Emitted only when something was actually removed,
 /// so a quiet sensor stays quiet.
 pub fn log_retention_pruned(removed: usize, retention_days: usize) {
-    info!(
-        event = "log_retention_pruned",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
-        removed,
-        retention_days,
-    );
+    emit!(info, "log_retention_pruned", removed, retention_days,);
 }
 
 /// `accept()` failed. Transient (fd exhaustion, and similar), not fatal.
 pub fn accept_error(error: &str) {
-    tracing::warn!(
-        event = "accept_error",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
-        error,
-    );
+    emit!(warn, "accept_error", error,);
 }
 
 /// A session hit the absolute lifetime cap and was disconnected.
 pub fn session_timeout(session_id: u64, peer: SocketAddr) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "session_timeout",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "session_timeout",
         session_id,
         peer = %peer,
         src_ip,
@@ -139,10 +149,9 @@ pub fn session_timeout(session_id: u64, peer: SocketAddr) {
 /// session are logged but not stored on disk.
 pub fn quarantine_session_cap(session_id: u64, peer: SocketAddr) {
     let (src_ip, src_port) = peer_parts(peer);
-    tracing::warn!(
-        event = "quarantine_session_cap",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        warn,
+        "quarantine_session_cap",
         session_id,
         peer = %peer,
         src_ip,
@@ -154,10 +163,9 @@ pub fn quarantine_session_cap(session_id: u64, peer: SocketAddr) {
 /// signal that a capture was lost, so it carries the full field set.
 pub fn quarantine_error(session_id: u64, peer: SocketAddr, error: &str) {
     let (src_ip, src_port) = peer_parts(peer);
-    tracing::warn!(
-        event = "quarantine_error",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        warn,
+        "quarantine_error",
         session_id,
         peer = %peer,
         src_ip,
@@ -182,30 +190,40 @@ pub fn auth_attempt(
     accepted: bool,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "auth_attempt",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
-        session_id,
-        peer = %peer,
-        src_ip,
-        src_port,
-        username,
-        method,
-        password = secret.unwrap_or(""),
-        key_fingerprint = fingerprint.unwrap_or(""),
-        accepted,
-    );
+    // A credential that worked is the moment the box stopped being a doorbell
+    // and started being a shell. Failed attempts are the background radiation of
+    // any internet-facing sensor and would drown it at the same level.
+    macro_rules! attempt {
+        ($level:ident) => {
+            emit!(
+                $level,
+                "auth_attempt",
+                session_id,
+                peer = %peer,
+                src_ip,
+                src_port,
+                username,
+                method,
+                password = secret.unwrap_or(""),
+                key_fingerprint = fingerprint.unwrap_or(""),
+                accepted,
+            )
+        };
+    }
+    if accepted {
+        attempt!(warn)
+    } else {
+        attempt!(info)
+    }
 }
 
 /// A connection was refused before the SSH handshake because a concurrency
 /// limit was reached. `reason` is `"global_limit"` or `"per_ip_limit"`.
 pub fn connection_rejected(peer: SocketAddr, reason: &str) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "connection_rejected",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "connection_rejected",
         peer = %peer,
         src_ip,
         src_port,
@@ -223,10 +241,9 @@ pub fn connection_closed(
     command_count: u64,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "connection_closed",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "connection_closed",
         session_id,
         peer = %peer,
         src_ip,
@@ -240,10 +257,9 @@ pub fn connection_closed(
 /// the body was "saved" to (or `-` for stdout). No real request was made.
 pub fn download(session_id: u64, peer: SocketAddr, tool: &str, url: &str, dest: &str) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "download",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "download",
         session_id,
         peer = %peer,
         src_ip,
@@ -302,10 +318,9 @@ pub fn command(
     status: Option<i32>,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "command",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "command",
         session_id,
         peer = %peer,
         src_ip,
@@ -319,10 +334,9 @@ pub fn command(
 /// An SSH subsystem request (such as `sftp`) was received from the client.
 pub fn subsystem_request(session_id: u64, peer: SocketAddr, subsystem: &str, accepted: bool) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "subsystem_request",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    emit!(
+        info,
+        "subsystem_request",
         session_id,
         peer = %peer,
         src_ip,
@@ -353,10 +367,11 @@ pub fn upload(
     truncated: bool,
 ) {
     let (src_ip, src_port) = peer_parts(peer);
-    info!(
-        event = "upload",
-        sensor_name = sensor_name(),
-        boot_id = boot_id(),
+    // An attacker who got a payload onto the box is past reconnaissance, so
+    // this routes with the quarantine failures rather than with the noise.
+    emit!(
+        warn,
+        "upload",
         session_id,
         peer = %peer,
         src_ip,
@@ -468,6 +483,75 @@ mod tests {
         assert_eq!(closed["event"], "connection_closed");
         assert_eq!(closed["session_id"], 1);
         assert_eq!(closed["sensor_name"], "mimic");
+    }
+
+    /// Every event carries the same envelope, and the two that a SOC should be
+    /// able to page on are the two that are not INFO. Both properties are the
+    /// kind that rot silently: a new event added without the envelope, or a
+    /// successful login quietly demoted, breaks routing without failing
+    /// anything else.
+    #[test]
+    fn every_event_carries_the_envelope_and_the_right_level() {
+        let (_, events) = capture(|| {
+            listening("0.0.0.0", 22, 100, 10);
+            shutdown();
+            accept_error("too many open files");
+            connection_opened(1, peer());
+            client_banner(1, peer(), "SSH-2.0-libssh2_1.9.0");
+            auth_attempt(1, peer(), "root", "password", Some("a"), None, false);
+            auth_attempt(1, peer(), "root", "password", Some("b"), None, true);
+            connection_rejected(peer(), "per_ip_limit");
+            command(1, peer(), "id", CommandSource::Exec, Some(0));
+            download(1, peer(), "curl", "http://x/y", "-");
+            subsystem_request(1, peer(), "sftp", true);
+            upload(
+                1,
+                peer(),
+                "x.sh",
+                "/tmp/x.sh",
+                3,
+                "aa",
+                "aa",
+                "/q/aa",
+                false,
+            );
+            quarantine_session_cap(1, peer());
+            quarantine_error(1, peer(), "disk full");
+            session_timeout(1, peer());
+            connection_closed(1, peer(), 1, 1);
+            log_retention_pruned(2, 30);
+        });
+        assert_eq!(events.len(), 17, "one line per event, every type covered");
+
+        for event in &events {
+            let f = fields(event);
+            let name = &f["event"];
+            assert_eq!(f["sensor_name"], "mimic", "{name}");
+            assert!(f["boot_id"].is_string(), "{name}");
+            assert_eq!(f["event_kind"], "event", "{name}");
+            assert_eq!(f["event_category"], "intrusion_detection", "{name}");
+            assert_eq!(f["event_dataset"], "mimic.ssh", "{name}");
+            assert_eq!(f["ecs_version"], "8.11.0", "{name}");
+        }
+
+        let level_of = |name: &str, accepted: Option<bool>| {
+            events
+                .iter()
+                .find(|e| {
+                    fields(e)["event"] == name
+                        && accepted.is_none_or(|a| fields(e)["accepted"] == a)
+                })
+                .map(|e| e["level"].as_str().unwrap().to_string())
+                .unwrap_or_else(|| panic!("no {name} event"))
+        };
+
+        // Worth routing on: someone got in, or got a payload onto the box.
+        assert_eq!(level_of("auth_attempt", Some(true)), "WARN");
+        assert_eq!(level_of("upload", None), "WARN");
+        // The same event that failed is background noise, and stays INFO.
+        assert_eq!(level_of("auth_attempt", Some(false)), "INFO");
+        assert_eq!(level_of("command", None), "INFO");
+        assert_eq!(level_of("connection_opened", None), "INFO");
     }
 
     #[test]
