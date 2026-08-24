@@ -11,7 +11,7 @@
 //! or the pipeline, never from a real file.
 
 use super::{CommandResult, MAX_COMMAND_OUTPUT_BYTES};
-use crate::shell::Shell;
+use crate::shell::{Screen, Shell};
 
 /// Read the operands as files, or fall back to the pipeline's stdin when there
 /// are none — the convention every filter here follows, and what real
@@ -1212,9 +1212,172 @@ fn split_fields(line: &str, sep: Option<&str>) -> Vec<String> {
     }
 }
 
+/// Visible buffer rows before the status/footer line(s) — `vi`/`nano` fill
+/// unused rows with `~`/blank lines up to here. Like
+/// [`TopScreen`](super::system::TopScreen), this has no real awareness of the
+/// client's terminal height (`pty-req`'s rows never reach this layer); it
+/// targets a plausible common size rather than the one the client asked for.
+const EDITOR_ROWS: usize = 23;
+
+/// Which editor a [`EditorScreen`] renders as. The two use unrelated layouts
+/// and quit keys, but share everything else about being a screen-holding
+/// read-only stub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorKind {
+    Vi,
+    Nano,
+}
+
+/// One `vi`/`nano` display: a read-only view of the file it was invoked on
+/// (or a blank buffer for a bare invocation), held until the client quits it.
+///
+/// ponytail: read-only — no keystroke inserts text, and nothing is ever
+/// written back to the VFS, so `i`nsert mode, `^O` (Write Out) and `:wq` save
+/// nothing (they still quit; see the network layer's quit handling). Upgrade
+/// to a real per-keystroke buffer if a payload dropped through an editor
+/// rather than `wget`/`cat <<EOF` turns out to matter.
+#[derive(Clone)]
+pub struct EditorScreen {
+    kind: EditorKind,
+    path: String,
+    lines: Vec<String>,
+    exists: bool,
+}
+
+impl EditorScreen {
+    /// Which editor this is. `vi` and `nano` render and quit differently, and
+    /// the network layer needs to know which without holding this whole value
+    /// (see `network::ssh::ScreenHold`).
+    pub fn kind(&self) -> EditorKind {
+        self.kind
+    }
+
+    /// Render the whole display as of now. It never changes after this — see
+    /// this type's `ponytail` note — so, unlike `top`, nothing ever calls this
+    /// twice for one hold.
+    pub fn render(&self) -> String {
+        match self.kind {
+            EditorKind::Vi => self.render_vi(),
+            EditorKind::Nano => self.render_nano(),
+        }
+    }
+
+    fn render_vi(&self) -> String {
+        let mut out = String::new();
+        let shown = self.lines.len().min(EDITOR_ROWS);
+        for line in &self.lines[..shown] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        for _ in shown..EDITOR_ROWS {
+            out.push_str("~\n");
+        }
+        // A bare `vi` opens an unnamed buffer; real vi's status line stays
+        // blank until the buffer is named with `:w file`.
+        if !self.path.is_empty() {
+            if self.exists {
+                let bytes: usize = self.lines.iter().map(|l| l.len() + 1).sum();
+                out.push_str(&format!(
+                    "\"{}\" {}L, {}B\n",
+                    self.path,
+                    self.lines.len(),
+                    bytes
+                ));
+            } else {
+                out.push_str(&format!("\"{}\" [New File]\n", self.path));
+            }
+        }
+        out
+    }
+
+    fn render_nano(&self) -> String {
+        let title = if self.path.is_empty() {
+            "New Buffer"
+        } else {
+            &self.path
+        };
+        // No version number: real nano always shows one, but a wrong one
+        // (unverifiable against the actual bookworm package) is a sharper
+        // fingerprint than a missing one — see `USR_BIN`'s doc comment on not
+        // inventing details this box cannot source.
+        let mut out = format!("  GNU nano    {title}\n");
+        let shown = self.lines.len().min(EDITOR_ROWS);
+        for line in &self.lines[..shown] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        for _ in shown..EDITOR_ROWS {
+            out.push('\n');
+        }
+        out.push_str(
+            "^G Help      ^O Write Out ^W Where Is  ^K Cut       ^T Execute   ^C Location\n\
+             ^X Exit      ^R Read File ^\\ Replace   ^U Paste     ^J Justify   ^_ Go To Line\n",
+        );
+        out
+    }
+}
+
+/// Build the [`EditorScreen`] for `vi`/`nano FILE`, reading the target from
+/// the VFS the same way `cat` does. `None` is a bare invocation with no
+/// operand: an unnamed, empty buffer.
+fn open_editor(shell: &Shell, kind: EditorKind, arg: Option<&str>) -> EditorScreen {
+    let Some(arg) = arg else {
+        return EditorScreen {
+            kind,
+            path: String::new(),
+            lines: Vec::new(),
+            exists: false,
+        };
+    };
+    let node = shell.vfs.resolve(shell.cwd, arg);
+    let lines = node
+        .and_then(|id| shell.vfs.node(id).file_bytes())
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    EditorScreen {
+        kind,
+        path: arg.to_string(),
+        lines,
+        exists: node.is_some(),
+    }
+}
+
+/// Shared body of [`vi`] and [`nano`]: takes the terminal only on an
+/// interactive PTY, the same gate `top` uses. There is no real full-screen
+/// editor behaviour for a pipe or a one-shot `exec` to fall back to, so those
+/// get nothing, exactly like any other listed-but-unimplemented binary (see
+/// `vfs::snapshot::USR_BIN`'s doc comment).
+fn open_screen(shell: &mut Shell, kind: EditorKind, args: &[String]) -> CommandResult {
+    if !(shell.interactive && shell.stdout_is_tty) {
+        return CommandResult::empty();
+    }
+    let arg = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str);
+    let screen = open_editor(shell, kind, arg);
+    shell.screen = Some(Screen::Editor(screen));
+    CommandResult::empty()
+}
+
+/// `vi [FILE]` — see [`open_screen`].
+pub fn vi(shell: &mut Shell, args: &[String]) -> CommandResult {
+    open_screen(shell, EditorKind::Vi, args)
+}
+
+/// `nano [FILE]` — see [`open_screen`].
+pub fn nano(shell: &mut Shell, args: &[String]) -> CommandResult {
+    open_screen(shell, EditorKind::Nano, args)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::shell::Shell;
+    use crate::shell::{Screen, Shell};
 
     fn run(shell: &mut Shell, line: &str) -> String {
         let out = shell.execute(line);
@@ -1470,5 +1633,90 @@ mod tests {
             assert_eq!(result.status, 2, "{program}");
             assert!(result.stderr.contains("syntax error"), "{program}");
         }
+    }
+
+    #[test]
+    fn vi_and_nano_take_the_screen_only_on_an_interactive_tty() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("echo hi > /tmp/f");
+
+        for cmd in ["vi /tmp/f", "nano /tmp/f"] {
+            let out = run(&mut shell, cmd);
+            assert_eq!(out, "", "{cmd} should write nothing itself");
+            assert!(
+                shell.screen.take().is_some(),
+                "{cmd} should hold the screen"
+            );
+        }
+
+        // A pipe, a redirect, and a one-shot `exec` are not a terminal: real
+        // vi/nano have no full-screen behaviour to fall back to there, so
+        // they get nothing, exactly like any other listed-but-unimplemented
+        // binary rather than an invented dump.
+        assert_eq!(run(&mut shell, "vi /tmp/f | wc -l"), "0\n");
+        assert!(shell.screen.is_none(), "a pipe should not hold the screen");
+        run(&mut shell, "nano /tmp/f > /tmp/out");
+        assert!(
+            shell.screen.is_none(),
+            "a redirect should not hold the screen"
+        );
+        assert_eq!(shell.execute("cat /tmp/out").stdout, "");
+
+        shell.interactive = false;
+        assert_eq!(run(&mut shell, "vi /tmp/f"), "");
+        assert!(shell.screen.is_none(), "exec should not hold the screen");
+        shell.interactive = true;
+
+        // A substitution runs in a subshell with no terminal of its own.
+        assert_eq!(shell.execute("echo [$(vi /tmp/f)]").text, "[]\n");
+        assert!(
+            shell.screen.is_none(),
+            "a substitution should not hold the screen"
+        );
+    }
+
+    #[test]
+    fn vi_renders_a_read_only_view_of_the_target() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("printf 'one\\ntwo\\n' > /tmp/f");
+
+        run(&mut shell, "vi /tmp/f");
+        let Screen::Editor(editor) = shell.screen.take().expect("vi should hold the screen") else {
+            panic!("vi should hold a Screen::Editor");
+        };
+        let rendered = editor.render();
+        assert!(rendered.contains("one\ntwo\n"));
+        assert!(rendered.contains("~\n"), "unused rows should show as ~");
+        assert!(rendered.contains("\"/tmp/f\" 2L,"));
+
+        // A path that does not exist yet is a new buffer, like real vi.
+        run(&mut shell, "vi /tmp/nope");
+        let Screen::Editor(editor) = shell.screen.take().unwrap() else {
+            panic!("vi should hold a Screen::Editor");
+        };
+        assert!(editor.render().contains("\"/tmp/nope\" [New File]"));
+
+        // A bare invocation is an unnamed, empty buffer with no status line.
+        run(&mut shell, "vi");
+        let Screen::Editor(editor) = shell.screen.take().unwrap() else {
+            panic!("vi should hold a Screen::Editor");
+        };
+        assert!(!editor.render().contains('"'));
+    }
+
+    #[test]
+    fn nano_renders_a_title_bar_and_shortcuts() {
+        let mut shell = Shell::new("root", "debian");
+        shell.execute("echo hi > /tmp/f");
+        run(&mut shell, "nano /tmp/f");
+        let Screen::Editor(editor) = shell.screen.take().expect("nano should hold the screen")
+        else {
+            panic!("nano should hold a Screen::Editor");
+        };
+        let rendered = editor.render();
+        assert!(rendered.contains("GNU nano"));
+        assert!(rendered.contains("/tmp/f"));
+        assert!(rendered.contains("^X Exit"));
+        assert!(rendered.contains("hi\n"));
     }
 }

@@ -70,6 +70,7 @@ pub(crate) const USR_BIN: &[&str] = &[
     "mkdir",
     "mount",
     "mv",
+    "nano",
     "nc",
     "netcat",
     "netstat",
@@ -115,6 +116,7 @@ pub(crate) const USR_BIN: &[&str] = &[
     "uname",
     "uniq",
     "uptime",
+    "vi",
     "w",
     "wc",
     "wget",
@@ -288,7 +290,6 @@ pub(crate) const USR_BIN: &[&str] = &[
     "lesskey",
     "lesspipe",
     // nano
-    "nano",
     "rnano",
     // man-db
     "apropos",

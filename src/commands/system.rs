@@ -9,7 +9,7 @@
 
 use super::CommandResult;
 use crate::clock;
-use crate::shell::{Pending, Shell};
+use crate::shell::{Pending, Screen, Shell};
 use crate::vfs::snapshot::{USR_BIN, USR_SBIN};
 
 /// Emulated kernel release (`uname -r`).
@@ -1052,7 +1052,7 @@ pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
     if !batch && shell.interactive && shell.stdout_is_tty {
         // The display paints itself once the network layer picks it up, so the
         // command writes nothing: a frame here would be painted twice.
-        shell.screen = Some(screen);
+        shell.screen = Some(Screen::Top(screen));
         return CommandResult::empty();
     }
     CommandResult::ok(screen.render())
@@ -1584,7 +1584,7 @@ pub fn date(_shell: &Shell, args: &[String]) -> CommandResult {
 #[cfg(test)]
 mod tests {
     use crate::clock;
-    use crate::shell::Shell;
+    use crate::shell::{Screen, Shell};
 
     fn run(shell: &mut Shell, line: &str) -> String {
         shell.execute(line).text
@@ -1881,7 +1881,10 @@ mod tests {
         let out = run(&mut shell, "top");
         assert_eq!(out, "");
         let screen = shell.screen.take().expect("top should hold the screen");
-        assert!(screen.render().contains("Tasks:"));
+        let Screen::Top(top) = screen else {
+            panic!("top should hold a Screen::Top");
+        };
+        assert!(top.render().contains("Tasks:"));
 
         // Batch mode and an iteration count are the one-shot dump.
         for line in ["top -b", "top -bn1", "top -n 1", "top --batch"] {

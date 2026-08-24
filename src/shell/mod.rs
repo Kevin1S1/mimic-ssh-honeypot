@@ -164,6 +164,24 @@ impl Pending {
     }
 }
 
+/// A full-screen display or terminal hold a command asked to take over with.
+/// The network layer takes it after the line runs and owns the redraw timer
+/// and keystroke handling — this layer never has a clock or a channel of its
+/// own — so each variant only holds what a display needs to compute, never how
+/// it is delivered.
+#[derive(Clone)]
+pub enum Screen {
+    /// `top`: repaints on a timer until `q` or Ctrl-C.
+    Top(commands::system::TopScreen),
+    /// `vi`/`nano`: a read-only view of the target file, held until the
+    /// editor's own quit sequence.
+    Editor(commands::text::EditorScreen),
+    /// `nc -l`: holds the terminal with no display of its own — exactly what a
+    /// real listener shows before a client connects — until Ctrl-C or
+    /// disconnect.
+    Listen,
+}
+
 /// Environment variables describing the SSH connection itself. The network
 /// layer seeds them; they survive `su`, as they do on a real box, because they
 /// belong to the connection rather than to the logged-in identity.
@@ -215,7 +233,7 @@ struct Subshell {
     uid: u32,
     gid: u32,
     pending: Option<Pending>,
-    screen: Option<commands::system::TopScreen>,
+    screen: Option<Screen>,
 }
 
 /// Per-session shell.
@@ -278,10 +296,9 @@ pub struct Shell {
     /// An interactive prompt a command is waiting on (e.g. `su` reading a
     /// password). `None` between commands.
     pub pending: Option<Pending>,
-    /// A full-screen display a command asked to hold the terminal with (`top`).
-    /// The network layer takes it after the line runs and owns the redraw timer
-    /// — this layer never has a clock of its own.
-    pub screen: Option<commands::system::TopScreen>,
+    /// A full-screen display a command asked to hold the terminal with (`top`,
+    /// `vi`/`nano`, `nc -l`). The network layer takes it after the line runs.
+    pub screen: Option<Screen>,
     /// How many command substitutions are open around the running command. A
     /// substitution captures its body's stdout through a pipe, so nothing
     /// inside one is writing to a terminal however the stage itself looks.
