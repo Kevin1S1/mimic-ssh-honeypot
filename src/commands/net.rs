@@ -12,7 +12,7 @@
 //! Nothing is ever interpreted — see [`python3`].
 
 use super::CommandResult;
-use crate::shell::{Capture, Shell};
+use crate::shell::{Capture, Screen, Shell};
 
 /// A deterministic but plausible "resolved" address for any hostname, so repeat
 /// lookups in a session stay consistent without performing real DNS.
@@ -561,10 +561,14 @@ pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
         if port_flag {
             return CommandResult::err("nc: cannot use -p and -l\n", 1);
         }
-        // ponytail: a real `nc -l PORT` holds the terminal until interrupted.
-        // Returning immediately is a tell on an interactive channel. Upgrade
-        // when the screen-hold in `top` is generalised beyond its own frame
-        // type; until then, bind shells are the rarer half of nc's use here.
+        // A real listener blocks in accept(2) until a client connects or it is
+        // interrupted; since no socket is ever opened here, holding the
+        // terminal until Ctrl-C is the whole of what is left to emulate. Only
+        // on an interactive PTY — the same gate `top` uses — because a pipe or
+        // a one-shot `exec` has no terminal to hold.
+        if shell.interactive && shell.stdout_is_tty {
+            shell.screen = Some(Screen::Listen);
+        }
         return CommandResult::empty();
     }
 
@@ -858,7 +862,7 @@ fn python_version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::url_parts;
-    use crate::shell::{Capture, Shell};
+    use crate::shell::{Capture, Screen, Shell};
 
     fn run(shell: &mut Shell, line: &str) -> String {
         shell.execute(line).text
@@ -985,6 +989,32 @@ mod tests {
         let result = shell.execute("nc -lvp 4444");
         assert_eq!(result.status, 1);
         assert!(result.stderr.contains("cannot use -p and -l"));
+    }
+
+    #[test]
+    fn nc_listen_holds_the_screen_only_on_an_interactive_tty() {
+        let mut shell = Shell::new("root", "debian");
+
+        assert_eq!(run(&mut shell, "nc -l 4444"), "");
+        assert!(
+            matches!(shell.screen.take(), Some(Screen::Listen)),
+            "nc -l should hold the screen on a terminal"
+        );
+
+        // A pipe, a redirect, and a one-shot `exec` are not a terminal: a
+        // real listener backgrounded with no controlling tty does not hold
+        // one either.
+        run(&mut shell, "nc -l 4444 | cat");
+        assert!(shell.screen.is_none(), "a pipe should not hold the screen");
+        run(&mut shell, "nc -l 4444 > /tmp/out");
+        assert!(
+            shell.screen.is_none(),
+            "a redirect should not hold the screen"
+        );
+        shell.interactive = false;
+        run(&mut shell, "nc -l 4444");
+        assert!(shell.screen.is_none(), "exec should not hold the screen");
+        shell.interactive = true;
     }
 
     #[test]

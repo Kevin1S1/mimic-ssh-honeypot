@@ -14,7 +14,7 @@ use crate::network::scp::{self, ScpMode, ScpSink};
 use crate::network::sftp::{self, SftpSession};
 use crate::shell::complete::{self, Completion};
 use crate::shell::line::{is_continuation, LineEditor, Reaction};
-use crate::shell::{Capture, Output, Shell};
+use crate::shell::{Capture, Output, Screen, Shell};
 
 use anyhow::{Context, Result};
 use russh::server::{Auth, ChannelOpenHandle, Config as ServerConfig, Handler, Msg, Session};
@@ -421,17 +421,67 @@ const SCREEN_REFRESH: Duration = Duration::from_secs(3);
 /// sends before painting a frame, so each redraw lands on top of the last.
 const SCREEN_HOME: &str = "\x1b[H\x1b[J";
 
-/// A full-screen command holding the terminal. Dropping this aborts the redraw
-/// task, so the timer cannot outlive the channel it paints — closing the
-/// channel, ending the session, or quitting the display all stop it.
+/// A full-screen display or terminal hold, kept alive as long as it owns the
+/// terminal. Dropping this aborts the redraw task if there is one, so a timer
+/// cannot outlive the channel it paints — closing the channel, ending the
+/// session, or quitting the display all stop it.
 struct ScreenHold {
-    redraw: tokio::task::JoinHandle<()>,
+    /// Which display is up, deciding how keystrokes and the quit sequence are
+    /// interpreted. Nothing here re-renders on a keystroke — only `top`'s
+    /// timer repaints, and it owns its own `TopScreen` — so this is all the
+    /// network layer needs, not the [`Screen`] itself.
+    kind: ScreenKind,
+    /// `vi`'s in-progress `:`-command, accumulated since the last `:` until
+    /// Enter or Esc. Always `None` outside colon-command mode, and for every
+    /// kind but `Vi`.
+    colon: Option<String>,
+    /// `top`'s periodic repaint task. Only `Top` schedules one; every other
+    /// kind paints once and holds with nothing left to do on a timer.
+    redraw: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for ScreenHold {
     fn drop(&mut self) {
-        self.redraw.abort();
+        if let Some(redraw) = &self.redraw {
+            redraw.abort();
+        }
     }
+}
+
+/// Which full-screen display [`ScreenHold`] is holding the terminal with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreenKind {
+    Top,
+    Vi,
+    Nano,
+    Listen,
+}
+
+/// Advance `vi`'s colon-command state on one keystroke. Returns whether it
+/// just completed one of the quit commands (`q`, `q!`, `wq`, `wq!`, `x`);
+/// Ctrl-C quits unconditionally, the same escape hatch every screen kind has.
+fn vi_screen_input(hold: &mut ScreenHold, byte: u8) -> bool {
+    if byte == 0x03 {
+        return true;
+    }
+    if let Some(buf) = hold.colon.as_mut() {
+        match byte {
+            b'\r' | b'\n' => {
+                let cmd = std::mem::take(buf);
+                hold.colon = None;
+                return matches!(cmd.as_str(), "q" | "q!" | "wq" | "wq!" | "x");
+            }
+            0x1b => hold.colon = None, // Esc cancels the pending command.
+            0x08 | 0x7f => {
+                buf.pop();
+            }
+            0x20..=0x7e => buf.push(byte as char),
+            _ => {}
+        }
+    } else if byte == b':' {
+        hold.colon = Some(String::new());
+    }
+    false
 }
 
 /// Per-session ceiling on real-disk quarantine writes, as a multiple of
@@ -645,49 +695,88 @@ impl MimicHandler {
     fn hold_screen(
         &mut self,
         channel: ChannelId,
-        screen: crate::commands::system::TopScreen,
+        screen: Screen,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        let first = format!("{SCREEN_HOME}{}", screen.render());
-        session.data(channel, self.out(&first))?;
-        let handle = session.handle();
-        let pty = self.pty;
-        let redraw = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(SCREEN_REFRESH);
-            // The first tick fires immediately; the frame above is that one.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let frame = format!("{SCREEN_HOME}{}", screen.render());
-                let bytes = if pty {
-                    frame.replace('\n', "\r\n").into_bytes()
-                } else {
-                    frame.into_bytes()
-                };
-                if handle.data(channel, Bytes::from(bytes)).await.is_err() {
-                    return;
-                }
+        match screen {
+            Screen::Top(top) => {
+                let first = format!("{SCREEN_HOME}{}", top.render());
+                session.data(channel, self.out(&first))?;
+                let handle = session.handle();
+                let pty = self.pty;
+                let redraw = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(SCREEN_REFRESH);
+                    // The first tick fires immediately; the frame above is that one.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        let frame = format!("{SCREEN_HOME}{}", top.render());
+                        let bytes = if pty {
+                            frame.replace('\n', "\r\n").into_bytes()
+                        } else {
+                            frame.into_bytes()
+                        };
+                        if handle.data(channel, Bytes::from(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                self.screen = Some(ScreenHold {
+                    kind: ScreenKind::Top,
+                    colon: None,
+                    redraw: Some(redraw),
+                });
             }
-        });
-        self.screen = Some(ScreenHold { redraw });
+            Screen::Editor(editor) => {
+                let kind = match editor.kind() {
+                    crate::commands::text::EditorKind::Vi => ScreenKind::Vi,
+                    crate::commands::text::EditorKind::Nano => ScreenKind::Nano,
+                };
+                let first = format!("{SCREEN_HOME}{}", editor.render());
+                session.data(channel, self.out(&first))?;
+                self.screen = Some(ScreenHold {
+                    kind,
+                    colon: None,
+                    redraw: None,
+                });
+            }
+            Screen::Listen => {
+                // A real listener prints nothing until a client connects,
+                // which never happens here — it just holds the terminal.
+                self.screen = Some(ScreenHold {
+                    kind: ScreenKind::Listen,
+                    colon: None,
+                    redraw: None,
+                });
+            }
+        }
         Ok(())
     }
 
     /// Feed a keystroke to a display holding the terminal. Returns whether the
     /// display is still up.
     ///
-    /// Real `top` quits on `q`, and Ctrl-C kills it like any foreground job;
-    /// every other key is consumed by the display rather than echoed, which is
-    /// the whole point of holding the screen.
+    /// `top` quits on `q` (and Ctrl-C, like any foreground job); `vi` quits on
+    /// `:q`/`:q!`/`:wq`/`:wq!`/`:x` followed by Enter, a colon-command mode
+    /// cancelled by Esc; `nano` quits on Ctrl-X; `nc -l` — a plain terminal
+    /// hold with no commands of its own — quits only on Ctrl-C. Every other
+    /// key is consumed by the display rather than echoed, which is the whole
+    /// point of holding the screen.
     fn screen_input(&mut self, byte: u8) -> bool {
-        match byte {
-            b'q' | 0x03 => {
-                // Dropping the hold aborts the redraw task.
-                self.screen = None;
-                false
-            }
-            _ => true,
+        let Some(hold) = self.screen.as_mut() else {
+            return false;
+        };
+        let quit = match hold.kind {
+            ScreenKind::Top => byte == b'q' || byte == 0x03,
+            ScreenKind::Nano => byte == 0x18 || byte == 0x03,
+            ScreenKind::Listen => byte == 0x03,
+            ScreenKind::Vi => vi_screen_input(hold, byte),
+        };
+        if quit {
+            // Dropping the hold aborts the redraw task, if there was one.
+            self.screen = None;
         }
+        !quit
     }
 
     /// Feed input to a shell channel that never asked for a PTY.
@@ -1563,13 +1652,19 @@ impl Handler for MimicHandler {
         // A full-screen command has the terminal: keystrokes drive the display,
         // not the line editor, until it quits and hands the prompt back.
         let mut rest = data;
-        if self.screen.is_some() {
+        if let Some(kind) = self.screen.as_ref().map(|hold| hold.kind) {
             let quit_at = data.iter().position(|&byte| !self.screen_input(byte));
             let Some(i) = quit_at else {
                 return Ok(());
             };
-            // Real `top` clears the screen on its way out.
-            let bytes = self.out(SCREEN_HOME);
+            let bytes = match kind {
+                // `top`, `vi` and `nano` clear the screen on their way out, as
+                // the real programs do; `nc -l` never painted one, so Ctrl-C
+                // out of it looks like any other interrupted foreground
+                // command instead of a display disappearing.
+                ScreenKind::Listen => self.out("^C\n"),
+                ScreenKind::Top | ScreenKind::Vi | ScreenKind::Nano => self.out(SCREEN_HOME),
+            };
             session.data(channel, bytes)?;
             let prompt = self.shell().prompt();
             self.editor.set_prompt(&prompt);
@@ -2555,6 +2650,195 @@ mod tests {
             quiet.is_empty(),
             "the redraw timer outlived the display: {:?}",
             String::from_utf8_lossy(&quiet)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `vi` paints a read-only view of the target and holds the terminal until
+    /// its own quit sequence — `:` followed by `q!` and Enter — clears the
+    /// screen and hands the prompt back. Unlike `top` it never repaints on its
+    /// own: nothing further arrives while it holds.
+    #[tokio::test]
+    async fn vi_holds_the_screen_until_colon_quit() {
+        let (_handle, mut channel, dir) = shell_session("vi-hold").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel
+            .data(&b"echo hello > f.txt\r"[..])
+            .await
+            .expect("send echo");
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel.data(&b"vi f.txt\r"[..]).await.expect("send vi");
+        let held = read_for(&mut channel, Duration::from_millis(400)).await;
+        let held = String::from_utf8_lossy(&held).into_owned();
+        assert!(held.contains("hello"), "file contents missing: {held:?}");
+        assert!(held.contains("~\r\n"), "no filler rows: {held:?}");
+        assert!(
+            !held.contains("root@debian"),
+            "prompt drawn under vi: {held:?}"
+        );
+
+        // `:q!` followed by Enter quits and hands the prompt back.
+        channel.data(&b":q!\r"[..]).await.expect("send :q!");
+        let after = read_for(&mut channel, Duration::from_millis(400)).await;
+        let after = String::from_utf8_lossy(&after).into_owned();
+        let clear_at = after.find(SCREEN_HOME);
+        let prompt_at = after.find("root@debian");
+        assert!(
+            clear_at.is_some(),
+            "vi should clear the screen on the way out: {after:?}"
+        );
+        assert!(prompt_at.is_some(), "no prompt after :q!: {after:?}");
+        assert!(
+            clear_at < prompt_at,
+            "screen not cleared before the prompt: {after:?}"
+        );
+        assert!(
+            !after.contains("~\r\n"),
+            "vi's buffer view leaked past the quit: {after:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nano` holds the terminal until Ctrl-X, its real quit key, rather than
+    /// `top`'s `q` or `vi`'s colon commands.
+    #[tokio::test]
+    async fn nano_holds_the_screen_until_ctrl_x() {
+        let (_handle, mut channel, dir) = shell_session("nano-hold").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel
+            .data(&b"echo hi > f.txt\r"[..])
+            .await
+            .expect("send echo");
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel.data(&b"nano f.txt\r"[..]).await.expect("send nano");
+        let held = read_for(&mut channel, Duration::from_millis(400)).await;
+        let held = String::from_utf8_lossy(&held).into_owned();
+        assert!(held.contains("GNU nano"), "no title bar: {held:?}");
+        assert!(held.contains("f.txt"), "no filename in the title: {held:?}");
+        assert!(held.contains("^X Exit"), "no shortcut bar: {held:?}");
+        assert!(
+            !held.contains("root@debian"),
+            "prompt drawn under nano: {held:?}"
+        );
+
+        channel.data(&b"\x18"[..]).await.expect("send ctrl-x");
+        let after = read_for(&mut channel, Duration::from_millis(400)).await;
+        let after = String::from_utf8_lossy(&after).into_owned();
+        let clear_at = after.find(SCREEN_HOME);
+        let prompt_at = after.find("root@debian");
+        assert!(
+            clear_at.is_some(),
+            "nano should clear the screen on the way out: {after:?}"
+        );
+        assert!(prompt_at.is_some(), "no prompt after ^X: {after:?}");
+        assert!(
+            clear_at < prompt_at,
+            "screen not cleared before the prompt: {after:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nc -l` holds the terminal with no display of its own — a real listener
+    /// prints nothing before a connection arrives — and only Ctrl-C gets it
+    /// back, echoed the way an interrupted foreground command is rather than
+    /// clearing a screen that was never painted.
+    #[tokio::test]
+    async fn nc_listen_holds_the_screen_until_ctrl_c() {
+        let (_handle, mut channel, dir) = shell_session("nc-listen-hold").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel
+            .data(&b"nc -l 4444\r"[..])
+            .await
+            .expect("send nc -l");
+        let held = read_for(&mut channel, Duration::from_millis(400)).await;
+        let held = String::from_utf8_lossy(&held).into_owned();
+        assert!(
+            !held.contains("root@debian"),
+            "prompt drawn while listening: {held:?}"
+        );
+
+        channel.data(&b"\x03"[..]).await.expect("send ctrl-c");
+        let after = read_for(&mut channel, Duration::from_millis(400)).await;
+        let after = String::from_utf8_lossy(&after).into_owned();
+        assert!(after.contains("^C\r\n"), "no ^C echo: {after:?}");
+        assert!(
+            !after.contains(SCREEN_HOME),
+            "nc -l painted nothing, so there is nothing to clear: {after:?}"
+        );
+        assert!(
+            after.contains("root@debian"),
+            "no prompt after Ctrl-C: {after:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A screen hold's kind, and `vi`'s colon-command buffer, must not survive
+    /// past the quit that ends it — a stale `ScreenKind` or leftover `colon`
+    /// state from one hold would silently misinterpret the next one's
+    /// keystrokes. Chains three different kinds (`Listen`, `Top`, `Editor`) end
+    /// to end to catch exactly that.
+    #[tokio::test]
+    async fn screen_holds_do_not_leak_state_into_the_next_one() {
+        let (_handle, mut channel, dir) = shell_session("screen-hold-chain").await;
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel
+            .data(&b"nc -l 4444\r"[..])
+            .await
+            .expect("send nc -l");
+        read_for(&mut channel, Duration::from_millis(300)).await;
+        channel.data(&b"\x03"[..]).await.expect("send ctrl-c");
+        read_for(&mut channel, Duration::from_millis(300)).await;
+
+        channel.data(&b"top\r"[..]).await.expect("send top");
+        let held = read_for(&mut channel, Duration::from_millis(400)).await;
+        let held = String::from_utf8_lossy(&held).into_owned();
+        assert!(
+            held.contains("Tasks:"),
+            "top after nc -l should paint normally: {held:?}"
+        );
+        channel.data(&b"q"[..]).await.expect("send q");
+        let after_top = read_for(&mut channel, Duration::from_millis(400)).await;
+        let after_top = String::from_utf8_lossy(&after_top).into_owned();
+        assert!(
+            after_top.contains("root@debian"),
+            "top after nc -l should still quit on q: {after_top:?}"
+        );
+
+        channel
+            .data(&b"vi missing.txt\r"[..])
+            .await
+            .expect("send vi");
+        let held = read_for(&mut channel, Duration::from_millis(400)).await;
+        let held = String::from_utf8_lossy(&held).into_owned();
+        assert!(
+            held.contains("[New File]"),
+            "vi after top should paint normally: {held:?}"
+        );
+        // `top`'s quit key alone must not also quit `vi` — only its own colon
+        // command may.
+        channel.data(&b"q"[..]).await.expect("send q (ignored)");
+        let ignored = read_for(&mut channel, Duration::from_millis(300)).await;
+        let ignored = String::from_utf8_lossy(&ignored).into_owned();
+        assert!(
+            !ignored.contains("root@debian"),
+            "vi quit on top's key, not its own: {ignored:?}"
+        );
+        channel.data(&b":q!\r"[..]).await.expect("send :q!");
+        let after_vi = read_for(&mut channel, Duration::from_millis(400)).await;
+        let after_vi = String::from_utf8_lossy(&after_vi).into_owned();
+        assert!(
+            after_vi.contains("root@debian"),
+            "vi after top should still quit on :q!: {after_vi:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

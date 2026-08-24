@@ -249,6 +249,11 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "free" => CommandHandler::Read(system::free),
         "uptime" => CommandHandler::Read(system::uptime),
 
+        // Full-screen editors: a read-only stub view, held until the client's
+        // quit sequence (see `commands::text::EditorScreen`).
+        "vi" => CommandHandler::Mut(text::vi),
+        "nano" => CommandHandler::Mut(text::nano),
+
         // Reconnaissance commands (fabricated, in-memory only).
         "history" => CommandHandler::Mut(system::history),
         "which" => CommandHandler::Read(system::which),

@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Central forensic log field sanitisation: non-printable control characters (including ANSI escape sequences, bell, backspace, and NUL bytes) in attacker-controlled strings are hex-escaped to prevent terminal injection attacks on log viewers and SIEM operators.
 
 ### Added
+- `vi` and `nano`: read-only screen-holding stubs that show the target file (or a blank buffer) and hold the terminal until the client quits — `vi`'s `:q`/`:q!`/`:wq`/`:x`, `nano`'s Ctrl-X. `Shell::screen` (the type `top` already held the terminal with) is generalised into a `Screen` enum so any full-screen command can take it.
+- `nc -l PORT` now holds the terminal until Ctrl-C or disconnect, using the same generalised screen hold, instead of returning immediately — closing the tell on an interactive channel that a real blocking listener does not have.
 - `md5sum` and `sha1sum` digest utilities, allowing malware droppers that verify payload hashes with legacy checksums to complete without failing early on exit 127.
 - Dynamic virtual files in VFS (`/proc/uptime` and `/proc/loadavg`): `/proc/uptime` now dynamically computes uptime at read time instead of remaining a static snapshot string, defeating sleep-and-reread honeypot fingerprinting.
 - `/usr/bin`/`/usr/sbin` density: 400 real Debian 12 binary names (up from

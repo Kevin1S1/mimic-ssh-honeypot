@@ -109,7 +109,8 @@ script does nothing); an unlisted name still gets `command not found`.
 | **Shells** | `bash`/`sh` (`-c LINE`, a script operand read from the VFS, or piped stdin — each line runs through the same shell that would have run it interactively), `scp` (local copy; remote operands fail as unreachable) |
 | **Environment** | `env`, `export`, `unset`, `clear` |
 | **Processes** | `ps` (`aux`/`-ef`), `top` (holds the screen and repaints until `q`; `-b`/`-n` dump once), `kill`, `pkill`, `killall`, `pidof`, `pgrep` (`-l`), `free`, `uptime` |
-| **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`, `nc`/`netcat` |
+| **Editors** | `vi`, `nano` — read-only screen-holding stubs: show the target file (or a blank buffer), quit on `vi`'s `:q`/`:q!`/`:wq`/`:x` or `nano`'s Ctrl-X. Typed text is never inserted or saved |
+| **Networking** | `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`, `nc`/`netcat` (`-l` holds the terminal until Ctrl-C, like a real listener with no connection yet) |
 | **Interpreters** | `python3`, `perl` — invocation only; nothing is ever interpreted (see below) |
 | **Recon** | `history`, `which`, `w`, `last`, `df` (`-h`), `mount`, `crontab` (`-l`), `dmesg` (root-only, `dmesg_restrict`) |
 | **Packages** | `apt`, `apt-get`, `dpkg` (stubs — install requires root, fake package DB) |
@@ -122,7 +123,7 @@ Commands write to stdout and stderr separately, as real ones do: a pipeline carr
 
 `wget`, `curl`, `nc` and a `python3`/`perl` one-liner that reaches for the network all log a `download` capture event naming the remote endpoint, so one query recovers every host a session tried to contact; `wget` and `curl` additionally write a placeholder file into the VFS.
 
-**The interpreters run nothing.** `python3 -c` and `perl -e` are emulated at the *invocation*: the payload is already captured verbatim in the `command` event, which is where the intelligence is, and executing attacker code is the one thing this box exists not to do. A one-liner that opens a socket gets the traceback a failed connect produces — by far the most common real outcome, since the attacker's listener is usually already gone — and anything else exits quietly. Before this existed the same line came back `command not found` while `dpkg -l` listed `python3` as installed, which was a one-command contradiction. `nc` behaves the same way: no socket is opened, and a connect always reports `Connection refused`.
+**The interpreters run nothing.** `python3 -c` and `perl -e` are emulated at the *invocation*: the payload is already captured verbatim in the `command` event, which is where the intelligence is, and executing attacker code is the one thing this box exists not to do. A one-liner that opens a socket gets the traceback a failed connect produces — by far the most common real outcome, since the attacker's listener is usually already gone — and anything else exits quietly. Before this existed the same line came back `command not found` while `dpkg -l` listed `python3` as installed, which was a one-command contradiction. `nc` behaves the same way: no socket is opened, and a connect always reports `Connection refused`; `nc -l PORT` holds the terminal instead, since a real listener blocks in `accept(2)` until a client connects or it is interrupted, and nothing ever connects here either.
 
 **`awk` covers pipeline plumbing, not programming.** `{print $N}` rules, `-F`/`-v FS`, bare `/pattern/` matches, `$N == "v"` comparisons and `NR`/`NF` — the shapes awk actually takes in an attack script. Anything outside that subset is a **syntax error with `status: 2`**, deliberately: printing nothing would make awk look like it ran and matched nothing, which is a worse lie than an honest refusal, and the non-zero status is the signal for what to implement next. SCP and SFTP uploads are captured to a SHA-256-named quarantine store on the real filesystem. A non-root `su` shows a realistic `Password:` prompt (suppressing echo) and the typed secret is captured as an `auth_attempt` event before the switch — but, like `sudo`, it never actually fails the credential check: the attacker's session already authenticated at login, so refusing privilege escalation would be an inconsistent tell with no forensic upside. Directory listings honour Unix read permissions, so an unprivileged user running `ls /root` gets `Permission denied` just like a real box — and so does `cd /root`, which needs the directory's search bit. `tar` reads and writes real POSIX ustar archives, so `tar czf t.tgz d && tar tzf t.tgz` round-trips inside the VFS; nothing is compressed, since no command in the emulator can tell (`-z`/`-j`/`-J` are accepted and ignored).
 
@@ -560,7 +561,8 @@ mimic-ssh-honeypot/
 │   │   ├── mod.rs           Command registry and dispatcher
 │   │   ├── fs.rs            ls, cat, cd, pwd, touch, rm, mkdir, cp, mv, chmod
 │   │   ├── system.rs        uname, whoami, id, ps, top, kill, df, history, recon
-│   │   ├── net.rs           wget, curl, ping, netstat, ss, ip
+│   │   ├── text.rs          sed, awk, cut, tr, sort, base64, md5sum, vi, nano
+│   │   ├── net.rs           wget, curl, ping, netstat, ss, ip, nc
 │   │   └── pkg.rs           apt, apt-get, dpkg stubs
 │   └── logging/
 │       ├── mod.rs           JSON logging initialisation (tracing)
