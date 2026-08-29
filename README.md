@@ -4,6 +4,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org/)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success)](#security-architecture)
+[![Security Policy](https://img.shields.io/badge/security-policy-blue)](SECURITY.md)
 
 A medium-to-high interaction SSH honeypot written in Rust. MIMIC presents attackers with a fully convincing Debian 12 shell — realistic prompt, MOTD, filesystem, and ~100 emulated commands — while the entire session runs as a **pure in-memory state machine**. No shell process is ever spawned. No real filesystem is ever touched. The Rust compiler statically enforces this through `#![forbid(unsafe_code)]` and strict module-visibility boundaries.
 
