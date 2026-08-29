@@ -1,5 +1,1 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Report a security vulnerability
-    url: https://github.com/Kevin1S1/mimic-ssh-honeypot/security/policy
-    about: Emulation escapes, crashes, or anything that could touch the real host — use Private Vulnerability Reporting, not a public issue.
