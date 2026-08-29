@@ -61,9 +61,17 @@ impl ConnectionRegistry {
     /// kept alive for the duration of the connection; dropping it frees the
     /// slot. On failure the connection should be closed immediately.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionGuard, RejectReason> {
-        if self.total.fetch_update(Ordering::Acquire, Ordering::Relaxed, |x| {
-            if x >= self.max_sessions { None } else { Some(x + 1) }
-        }).is_err() {
+        if self
+            .total
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |x| {
+                if x >= self.max_sessions {
+                    None
+                } else {
+                    Some(x + 1)
+                }
+            })
+            .is_err()
+        {
             return Err(RejectReason::GlobalLimit);
         }
 
@@ -74,7 +82,7 @@ impl ConnectionRegistry {
             return Err(RejectReason::PerIpLimit);
         }
         *count += 1;
-        
+
         Ok(ConnectionGuard {
             registry: Arc::clone(self),
             ip,
