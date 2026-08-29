@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-30
+
 ### Security
 - Global quarantine disk quota (`quarantine_max_total_bytes`): bounds total real-disk storage usage across all concurrent and sequential sessions, preventing multi-connection disk exhaustion. Emits `quarantine_global_cap` when the limit is reached while continuing in-memory VFS mirroring.
 - Central forensic log field sanitisation: non-printable control characters (including ANSI escape sequences, bell, backspace, and NUL bytes) in attacker-controlled strings are hex-escaped to prevent terminal injection attacks on log viewers and SIEM operators.
@@ -684,7 +686,8 @@ Initial release.
 - CI: clippy (`-D warnings`), full test suite, cargo-deny supply-chain
   audit with weekly scheduled run.
 
-[Unreleased]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Kevin1S1/mimic-ssh-honeypot/compare/v0.2.0...v0.3.0
