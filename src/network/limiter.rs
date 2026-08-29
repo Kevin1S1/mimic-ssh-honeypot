@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Why a connection was refused.
@@ -33,13 +34,13 @@ impl RejectReason {
 
 #[derive(Default)]
 struct RegistryInner {
-    total: usize,
     per_ip: HashMap<IpAddr, usize>,
 }
 
 /// Tracks active connections and enforces the configured caps.
 pub struct ConnectionRegistry {
     inner: Mutex<RegistryInner>,
+    total: AtomicUsize,
     max_sessions: usize,
     per_ip: usize,
 }
@@ -50,6 +51,7 @@ impl ConnectionRegistry {
     pub fn new(max_sessions: usize, per_ip: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(RegistryInner::default()),
+            total: AtomicUsize::new(0),
             max_sessions,
             per_ip,
         })
@@ -59,16 +61,20 @@ impl ConnectionRegistry {
     /// kept alive for the duration of the connection; dropping it frees the
     /// slot. On failure the connection should be closed immediately.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionGuard, RejectReason> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.total >= self.max_sessions {
+        if self.total.fetch_update(Ordering::Acquire, Ordering::Relaxed, |x| {
+            if x >= self.max_sessions { None } else { Some(x + 1) }
+        }).is_err() {
             return Err(RejectReason::GlobalLimit);
         }
+
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let count = inner.per_ip.entry(ip).or_insert(0);
         if *count >= self.per_ip {
+            self.total.fetch_sub(1, Ordering::Release);
             return Err(RejectReason::PerIpLimit);
         }
         *count += 1;
-        inner.total += 1;
+        
         Ok(ConnectionGuard {
             registry: Arc::clone(self),
             ip,
@@ -78,18 +84,19 @@ impl ConnectionRegistry {
     /// Current number of active connections. Used by the limiter tests.
     #[allow(dead_code)]
     pub fn active(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).total
+        self.total.load(Ordering::Relaxed)
     }
 
     fn release(&self, ip: IpAddr) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.total = inner.total.saturating_sub(1);
         if let Some(count) = inner.per_ip.get_mut(&ip) {
             *count -= 1;
             if *count == 0 {
                 inner.per_ip.remove(&ip);
             }
         }
+        drop(inner); // Drop mutex before updating atomic
+        self.total.fetch_sub(1, Ordering::Release);
     }
 }
 
