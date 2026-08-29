@@ -9,10 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0] - 2026-08-30
 
-### Security
-- Global quarantine disk quota (`quarantine_max_total_bytes`): bounds total real-disk storage usage across all concurrent and sequential sessions, preventing multi-connection disk exhaustion. Emits `quarantine_global_cap` when the limit is reached while continuing in-memory VFS mirroring.
-- Central forensic log field sanitisation: non-printable control characters (including ANSI escape sequences, bell, backspace, and NUL bytes) in attacker-controlled strings are hex-escaped to prevent terminal injection attacks on log viewers and SIEM operators.
-
 ### Added
 - `vi` and `nano`: read-only screen-holding stubs that show the target file (or a blank buffer) and hold the terminal until the client quits — `vi`'s `:q`/`:q!`/`:wq`/`:x`, `nano`'s Ctrl-X. `Shell::screen` (the type `top` already held the terminal with) is generalised into a `Screen` enum so any full-screen command can take it.
 - `nc -l PORT` now holds the terminal until Ctrl-C or disconnect, using the same generalised screen hold, instead of returning immediately — closing the tell on an interactive channel that a real blocking listener does not have.
@@ -51,6 +47,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config that points security reports at Private Vulnerability Reporting
   instead of a public issue) and a PR template checklisting the gates
   `CONTRIBUTING.md` already documents.
+- `CONTRIBUTING.md`, documenting the two conventions that were defined only in
+  a gitignored file: the build-enforced module boundary — and why it is a test
+  rather than a review rule — and the `// ponytail:` marker for deliberate
+  emulation shortcuts.
+- A top-level `LICENSE` stating the dual MIT/Apache-2.0 grant, which GitHub was
+  reporting as Apache-2.0 alone.
+- `SECURITY.md` gains one table of every attacker-driven bound — value, file,
+  and what it protects. They were spread across eight files, which is why the
+  one gap that did exist was hard to notice.
+- `README.md` gains Splunk `props.conf`/`inputs.conf` and Filebeat/ECS
+  ingestion recipes, a table of all fifteen event types with their levels, and
+  the two caveats that silently produce wrong dashboards rather than errors:
+  correlate on `boot_id` + `session_id` rather than `session_id` alone, and
+  `connection_rejected` carries no `session_id` to join on.
+- Text-processing commands: `base64`, `sed`, `cut`, `tr`, `sort`, `uniq`,
+  `xargs`, `tee`, `rev`, `nl`, `seq`, `basename`, `dirname`, `printf`,
+  `sha256sum`, `sha512sum`. A pipeline dies at its first `command not found`, so
+  their absence hid everything downstream of them —
+  `echo <b64> | base64 -d | sh` is the dominant payload-delivery idiom in SSH
+  botnets and previously stopped at step one.
+- Account and persistence commands: `passwd`, `chpasswd`, `useradd`/`adduser`,
+  `userdel`/`deluser`, `groupadd`/`addgroup`, `getent`, `systemctl`, `service`,
+  `chattr`, `lsattr`, `nohup`, `sleep`, `killall`, `pidof`, `pgrep`, `sync`,
+  `nologin`. `echo 'root:pass' | chpasswd` is the most common post-access action
+  in SSH botnet telemetry; the new secret is captured as credential data.
+- `command` events for each line of a script `sh` ran, with `source: script`
+  and the line's exit status. A `command` event is emitted per line the client
+  submits, so a dropped script's body would otherwise show as one
+  `sh /tmp/x.sh` entry and nothing of what it did.
+- `sh`/`bash` runs a script operand and piped stdin, not only `-c`. The
+  `wget` → `chmod +x` → run sequence previously captured the download and not
+  one byte of what the script would have done.
+- `passwd` prompts for the new secret twice with echo suppressed, over the same
+  mechanism `su` uses.
+- Every event carries `boot_id`, and `src_ip`/`src_port` alongside `peer`.
+  `session_id` restarts at 1 each boot, so correlating on it alone silently
+  merged unrelated sessions across a restart; CIM and ECS both want the peer
+  typed and split.
+- `command` events record how the line arrived (interactive, exec, pipe,
+  heredoc) and its exit status — close to a bot/human classifier, and the field
+  that names which commands are worth emulating next.
+- Public-key attempts log the offered key's fingerprint, and the client's SSH
+  version banner is recorded at first channel open.
+- Per-deployment hardware identity: machine-id, CPU, RAM, disk, MAC and IP are
+  derived from a seed hashed from the sensor's own host key, so they are stable
+  across restarts but differ between sensors.
+- `/etc/ssh/sshd_config`, `/etc/ssh/ssh_config`, `/etc/apt/sources.list`,
+  `/dev/pts/0` and the deployment's real public host keys. Each closed a
+  one-command self-contradiction: the box hosted an sshd with no config, ran
+  `apt update` against no sources list, and named a pty in `tty` and `$SSH_TTY`
+  that `ls` said did not exist.
 
 ### Changed
 - `which`/tab completion now resolve against the listed `/usr/bin`/`/usr/sbin`
@@ -63,12 +110,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup table to route alerts. Everything else keeps its level.
 - The Filebeat recipe in `README.md` renames the ECS fields instead of adding
   them, so the shipper config cannot drift from what the sensor emits.
+- `README.md` carries a CI status badge, and its documented event samples and
+  command table match what the code now emits and serves.
+- CI's format check is blocking rather than `continue-on-error`.
+- `Dockerfile` no longer strips a binary that `[profile.release]` already
+  stripped.
+- `MaxAuthTries` is 6, matching Debian, rather than russh's default of 10.
+- `pty-req`'s `TERM` and dimensions and accepted `LANG`/`LC_*` values are
+  applied to the session. `echo $TERM` returning a terminal the client never
+  asked for was a one-command tell, and Debian's stock client sends `LANG` by
+  default.
+- Response latency scales with output size instead of a flat uniform 2–18 ms,
+  which had zero correlation with the work done.
+- The five operational events emitted as ad-hoc `tracing` macros moved into
+  `event.rs` so they carry the same fields as every other event.
 
 ### Fixed
 - SFTP decoder returns `SSH_FX_BAD_MESSAGE` (status 5) on truncated or malformed
   packets rather than silently falling back to default values.
+- `grep` accepts the flags real grep accepts. `-q`, `-l`, `-w`, `-o`, `-s`,
+  `-h`/`-H`, `-e` and the matcher-selecting `-E`/`-F`/`-G`/`-P` previously
+  hard-errored with `invalid option`, so `grep -q pattern file && …` — a
+  scripting staple — stopped an attacker's pipeline where a real box would have
+  run it.
+- `mkdir`, `touch` and `cp` report `No space left on device` at the VFS node cap
+  instead of exiting 0 on a file that never appears.
+- A script's lines no longer overwrite each other's captures. `Shell::execute`
+  clears them on entry, so a two-stage dropper logged only its second fetch.
+- `pidof`, `pgrep` and `killall` match the executable name the way `/proc/comm`
+  does, so `pidof sshd` finds the `sshd: /usr/sbin/sshd -D [listener]` entry
+  that `ps` prints.
 
 ### Security
+- Global quarantine disk quota (`quarantine_max_total_bytes`): bounds total real-disk storage usage across all concurrent and sequential sessions, preventing multi-connection disk exhaustion. Emits `quarantine_global_cap` when the limit is reached while continuing in-memory VFS mirroring.
+- Central forensic log field sanitisation: non-printable control characters (including ANSI escape sequences, bell, backspace, and NUL bytes) in attacker-controlled strings are hex-escaped to prevent terminal injection attacks on log viewers and SIEM operators.
 - `SECURITY.md` documents that `python3`/`perl` emulate the invocation only and
   never evaluate a payload, and extends T1/T4 and the fake-networking section to
   cover `nc` and the interpreters. The claims were already true of the code; a
@@ -133,89 +208,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped at 1 MiB, `tr` bounds set expansion (two characters of argument could
   expand to 1.1 million), `sed` bounds a growing substitution both per line and
   across lines, and `sh` bounds how many lines of a script it will run.
-
-### Added
-- `CONTRIBUTING.md`, documenting the two conventions that were defined only in
-  a gitignored file: the build-enforced module boundary — and why it is a test
-  rather than a review rule — and the `// ponytail:` marker for deliberate
-  emulation shortcuts.
-- A top-level `LICENSE` stating the dual MIT/Apache-2.0 grant, which GitHub was
-  reporting as Apache-2.0 alone.
-- `SECURITY.md` gains one table of every attacker-driven bound — value, file,
-  and what it protects. They were spread across eight files, which is why the
-  one gap that did exist was hard to notice.
-- `README.md` gains Splunk `props.conf`/`inputs.conf` and Filebeat/ECS
-  ingestion recipes, a table of all fifteen event types with their levels, and
-  the two caveats that silently produce wrong dashboards rather than errors:
-  correlate on `boot_id` + `session_id` rather than `session_id` alone, and
-  `connection_rejected` carries no `session_id` to join on.
-- Text-processing commands: `base64`, `sed`, `cut`, `tr`, `sort`, `uniq`,
-  `xargs`, `tee`, `rev`, `nl`, `seq`, `basename`, `dirname`, `printf`,
-  `sha256sum`, `sha512sum`. A pipeline dies at its first `command not found`, so
-  their absence hid everything downstream of them —
-  `echo <b64> | base64 -d | sh` is the dominant payload-delivery idiom in SSH
-  botnets and previously stopped at step one.
-- Account and persistence commands: `passwd`, `chpasswd`, `useradd`/`adduser`,
-  `userdel`/`deluser`, `groupadd`/`addgroup`, `getent`, `systemctl`, `service`,
-  `chattr`, `lsattr`, `nohup`, `sleep`, `killall`, `pidof`, `pgrep`, `sync`,
-  `nologin`. `echo 'root:pass' | chpasswd` is the most common post-access action
-  in SSH botnet telemetry; the new secret is captured as credential data.
-- `command` events for each line of a script `sh` ran, with `source: script`
-  and the line's exit status. A `command` event is emitted per line the client
-  submits, so a dropped script's body would otherwise show as one
-  `sh /tmp/x.sh` entry and nothing of what it did.
-- `sh`/`bash` runs a script operand and piped stdin, not only `-c`. The
-  `wget` → `chmod +x` → run sequence previously captured the download and not
-  one byte of what the script would have done.
-- `passwd` prompts for the new secret twice with echo suppressed, over the same
-  mechanism `su` uses.
-- Every event carries `boot_id`, and `src_ip`/`src_port` alongside `peer`.
-  `session_id` restarts at 1 each boot, so correlating on it alone silently
-  merged unrelated sessions across a restart; CIM and ECS both want the peer
-  typed and split.
-- `command` events record how the line arrived (interactive, exec, pipe,
-  heredoc) and its exit status — close to a bot/human classifier, and the field
-  that names which commands are worth emulating next.
-- Public-key attempts log the offered key's fingerprint, and the client's SSH
-  version banner is recorded at first channel open.
-- Per-deployment hardware identity: machine-id, CPU, RAM, disk, MAC and IP are
-  derived from a seed hashed from the sensor's own host key, so they are stable
-  across restarts but differ between sensors.
-- `/etc/ssh/sshd_config`, `/etc/ssh/ssh_config`, `/etc/apt/sources.list`,
-  `/dev/pts/0` and the deployment's real public host keys. Each closed a
-  one-command self-contradiction: the box hosted an sshd with no config, ran
-  `apt update` against no sources list, and named a pty in `tty` and `$SSH_TTY`
-  that `ls` said did not exist.
-
-### Changed
-- `README.md` carries a CI status badge, and its documented event samples and
-  command table match what the code now emits and serves.
-- CI's format check is blocking rather than `continue-on-error`.
-- `Dockerfile` no longer strips a binary that `[profile.release]` already
-  stripped.
-- `MaxAuthTries` is 6, matching Debian, rather than russh's default of 10.
-- `pty-req`'s `TERM` and dimensions and accepted `LANG`/`LC_*` values are
-  applied to the session. `echo $TERM` returning a terminal the client never
-  asked for was a one-command tell, and Debian's stock client sends `LANG` by
-  default.
-- Response latency scales with output size instead of a flat uniform 2–18 ms,
-  which had zero correlation with the work done.
-- The five operational events emitted as ad-hoc `tracing` macros moved into
-  `event.rs` so they carry the same fields as every other event.
-
-### Fixed
-- `grep` accepts the flags real grep accepts. `-q`, `-l`, `-w`, `-o`, `-s`,
-  `-h`/`-H`, `-e` and the matcher-selecting `-E`/`-F`/`-G`/`-P` previously
-  hard-errored with `invalid option`, so `grep -q pattern file && …` — a
-  scripting staple — stopped an attacker's pipeline where a real box would have
-  run it.
-- `mkdir`, `touch` and `cp` report `No space left on device` at the VFS node cap
-  instead of exiting 0 on a file that never appears.
-- A script's lines no longer overwrite each other's captures. `Shell::execute`
-  clears them on entry, so a two-stage dropper logged only its second fetch.
-- `pidof`, `pgrep` and `killall` match the executable name the way `/proc/comm`
-  does, so `pidof sshd` finds the `sshd: /usr/sbin/sshd -D [listener]` entry
-  that `ps` prints.
 
 ## [0.5.0] - 2026-08-23
 
