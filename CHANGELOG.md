@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Demo video recorded and embedded in `README.md` demonstrating an interactive session and live JSON logging.
+- Demo videos recorded and embedded in `README.md` demonstrating interactive shell sessions, SCP/SFTP file uploads into quarantine, and live JSON logging.
 
 ### Changed
 - Documentation restructured: `README.md` is now a compact landing page (pitch,
