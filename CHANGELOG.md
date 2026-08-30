@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Demo video recorded and embedded in `README.md` demonstrating an interactive session and live JSON logging.
+
 ### Changed
 - Documentation restructured: `README.md` is now a compact landing page (pitch,
   quick start, layer overview, doc index), and the reference material moved into

@@ -17,7 +17,7 @@ Every attacker action — authentication attempts, commands, `wget`/`curl`
 downloads, and SCP/SFTP uploads — is captured as a structured JSON event, ready
 for SIEM ingestion or offline analysis.
 
-<!-- demo: drop an asciinema recording / GIF of a captured session here -->
+https://github.com/user-attachments/assets/d03d3be6-f769-4540-91d0-ec59b2556179
 
 ## Why MIMIC?
 
