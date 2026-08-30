@@ -17,10 +17,10 @@ Every attacker action — authentication attempts, commands, `wget`/`curl`
 downloads, and SCP/SFTP uploads — is captured as a structured JSON event, ready
 for SIEM ingestion or offline analysis.
 
-### Interactive Shell & Forensic Event Stream
+### Interactive Shell & Real-Time Logging
 https://github.com/user-attachments/assets/d03d3be6-f769-4540-91d0-ec59b2556179
 
-### SCP / SFTP File Upload & Quarantine
+### SCP / SFTP Quarantine & Real-Time Logging
 https://github.com/user-attachments/assets/9692197c-bdef-4169-b2fc-3fa849247016
 
 ## Why MIMIC?
