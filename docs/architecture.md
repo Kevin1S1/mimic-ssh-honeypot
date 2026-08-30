@@ -97,6 +97,13 @@ mimic-ssh-honeypot/
 ├── tests/
 │   ├── escape_vectors.rs    Asserts emulation layers contain no real-OS I/O
 │   └── output_truncation.rs Verifies the per-command output cap holds under load
+├── docs/
+│   ├── architecture.md      Layer model, invariants, project structure
+│   ├── configuration.md     Config reference and auth modes
+│   ├── deployment.md        Docker, systemd, and daily reset setup
+│   ├── emulation.md         Filesystem snapshot, commands, boundaries
+│   ├── logging.md           Event catalogue and SIEM integration
+│   └── assets/              Media assets (demo video)
 ├── deploy/
 │   ├── mimic.toml           Example / reference configuration
 │   ├── mimic.service        Systemd unit (honeypot service)
