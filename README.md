@@ -17,7 +17,7 @@ Every attacker action — authentication attempts, commands, `wget`/`curl`
 downloads, and SCP/SFTP uploads — is captured as a structured JSON event, ready
 for SIEM ingestion or offline analysis.
 
-<!-- demo: drop an asciinema recording / GIF of a captured session here -->
+https://github.com/Kevin1S1/mimic-ssh-honeypot/raw/main/docs/assets/demo.mp4
 
 ## Why MIMIC?
 
