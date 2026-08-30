@@ -19,6 +19,8 @@ for SIEM ingestion or offline analysis.
 
 https://github.com/user-attachments/assets/d03d3be6-f769-4540-91d0-ec59b2556179
 
+https://github.com/user-attachments/assets/9692197c-bdef-4169-b2fc-3fa849247016
+
 ## Why MIMIC?
 
 Most SSH honeypots either wrap a real shell (introducing real execution risk) or
