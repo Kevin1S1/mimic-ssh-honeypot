@@ -9,9 +9,10 @@
 - [ ] If this touches `src/shell/`, `src/vfs/`, or `src/commands/`: no new
       `std::process`, real `std::fs`, or socket I/O — `tests/escape_vectors.rs`
       enforces this and is included in the test run above.
-- [ ] Docs updated in this PR, not after, if applicable: `README.md`
-      (behavior/config/commands), `SECURITY.md` (invariant/mitigation/bound),
-      `deploy/mimic.toml` (config key added/renamed/removed).
+- [ ] Docs updated in this PR, not after, if applicable: the matching page under
+      `docs/` (behavior/config/commands), `SECURITY.md`
+      (invariant/mitigation/bound), `deploy/mimic.toml` (config key
+      added/renamed/removed).
 - [ ] `CHANGELOG.md` entry added under `## [Unreleased]` (standard Keep a
       Changelog categories only; security-relevant fixes go under `Security`
       even if they'd also fit `Fixed`).

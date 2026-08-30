@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Documentation restructured: `README.md` is now a compact landing page (pitch,
+  quick start, layer overview, doc index), and the reference material moved into
+  `docs/` — `architecture.md`, `emulation.md`, `configuration.md`, `logging.md`
+  and `deployment.md`. Cross-references in `SECURITY.md`, `CONTRIBUTING.md` and
+  the PR template point at the new pages.
+
+### Fixed
+- The event catalogue said "sixteen event types" while listing seventeen, and the
+  line-syntax table row broke its own rendering with unescaped `|` characters.
+
 ## [0.6.0] - 2026-08-30
 
 ### Added
