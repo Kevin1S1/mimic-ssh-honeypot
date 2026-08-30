@@ -26,9 +26,9 @@ is worth stating explicitly:
   dangerous. The property that matters — *nothing in the emulation layers can
   reach the host* — is only visible at the layer boundary, which is precisely
   where a compiler or a test can see it and a reviewer cannot.
-- **It converts a promise into a fact.** `README.md` and `SECURITY.md` both use
-  the phrase "physically impossible". A documented rule does not earn that
-  phrase. A test that refuses to build the crate does.
+- **It converts a promise into a fact.** The docs claim the emulation layers
+  have *zero* access to the real OS. A documented rule does not earn that word.
+  A test that refuses to build the crate does.
 
 The test matches literal substrings, which is why it also bans brace-grouped
 `std::{…}` imports outright: `use std::{fs, process};` contains neither
@@ -87,10 +87,11 @@ any change under `src/shell/`, `src/vfs/` or `src/commands/`.
 
 Also:
 
-- **Update the docs in the same PR as the code**, not after — `README.md` for
-  behaviour, config, commands or setup; `SECURITY.md` for an invariant,
-  mitigation or bound; `deploy/mimic.toml` for any config key, since it is the
-  reference example.
+- **Update the docs in the same PR as the code**, not after — the matching page
+  under [docs/](docs/) for behaviour, config, commands or setup (`README.md`
+  only if the pitch, quick start or doc index changes); `SECURITY.md` for an
+  invariant, mitigation or bound; `deploy/mimic.toml` for any config key, since
+  it is the reference example.
 - **Add a `CHANGELOG.md` entry under `## [Unreleased]`** in the same PR. Use
   only the Keep a Changelog categories (`Added`, `Changed`, `Fixed`, `Security`,
   `Removed`, `Deprecated`). Security-relevant fixes go under `Security` even
