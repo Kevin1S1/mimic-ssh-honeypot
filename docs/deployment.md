@@ -19,7 +19,7 @@ also includes the [daily reset](#daily-reset) sidecar.
 
 ## Build from source
 
-Requires a [Rust toolchain](https://rustup.rs/) (stable, MSRV 1.88).
+Requires a [Rust toolchain](https://rustup.rs/) (stable, MSRV 1.89).
 
 ```bash
 git clone https://github.com/Kevin1S1/mimic-ssh-honeypot.git

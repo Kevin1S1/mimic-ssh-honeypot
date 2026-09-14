@@ -4,7 +4,7 @@
 # Uses the official Rust image on Debian Bookworm to match the target OS.
 # Dependency caching: Cargo.toml + Cargo.lock are copied first so that
 # changing source code does not invalidate the (slow) dependency download.
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 
 WORKDIR /build
 
