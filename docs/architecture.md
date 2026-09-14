@@ -110,6 +110,6 @@ mimic-ssh-honeypot/
 │   ├── mimic-reset.service  Systemd unit (daily reset one-shot)
 │   ├── mimic-reset.timer    Systemd timer (fires the daily reset)
 │   └── daily-reset.sh       Reset script (wipe + restart with random jitter)
-├── Dockerfile               Multi-stage: rust:1.88 → distroless/cc-debian12:nonroot
+├── Dockerfile               Multi-stage: rust:1.89 → distroless/cc-debian12:nonroot
 └── docker-compose.yml       Production-ready compose stack
 ```

@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/` — `architecture.md`, `emulation.md`, `configuration.md`, `logging.md`
   and `deployment.md`. Cross-references in `SECURITY.md`, `CONTRIBUTING.md` and
   the PR template point at the new pages.
+- `russh` bumped from 0.63.1 to 0.63.3, which raises the minimum supported Rust
+  version to 1.89. CI, `Cargo.toml`, the `Dockerfile` and the docs are updated
+  to match.
 
 ### Fixed
 - The event catalogue said "sixteen event types" while listing seventeen, and the
