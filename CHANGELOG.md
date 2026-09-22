@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The event catalogue said "sixteen event types" while listing seventeen, and the
   line-syntax table row broke its own rendering with unescaped `|` characters.
 
+### Security
+- VFS tree depth is capped at 128 levels (enforced on create and on `mv`). A
+  ~1,500-level `mkdir` chain walked by `tar`, `find` or `du` could overflow the
+  stack and abort the whole process; `mkdir -p` and `mv` now report the refusal.
+- Connections that have not logged in within 120 s are disconnected (sshd's
+  `LoginGraceTime`) and logged as `login_timeout`, so a few sources can no longer
+  hold every connection slot unauthenticated for the full session lifetime.
+
 ## [0.6.0] - 2026-08-30
 
 ### Added

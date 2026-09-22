@@ -25,7 +25,7 @@ use russh::keys::ssh_encoding::bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -43,6 +43,11 @@ const LOGOUT: &str = "logout\n";
 
 /// The `data_type_code` RFC 4254 §5.2 assigns to stderr — the only one defined.
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+
+/// Debian sshd's `LoginGraceTime`. Without it a client that never logs in holds
+/// a connection slot for the whole `max_session_secs`, so a handful of sources
+/// can fill every slot and blind the sensor.
+const LOGIN_GRACE: Duration = Duration::from_secs(120);
 
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
@@ -146,6 +151,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         let local = stream
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::new(config.listen_addr, config.port));
+        let authenticated = Arc::new(AtomicBool::new(false));
 
         let handler = MimicHandler {
             config: Arc::clone(&config),
@@ -155,6 +161,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             local,
             pty: false,
             auth_attempts: 0,
+            authenticated: Arc::clone(&authenticated),
             username: String::new(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
             shell_started: false,
@@ -176,6 +183,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         };
 
         let server_config = Arc::clone(&server_config);
+        let login_deadline = Instant::now() + LOGIN_GRACE;
         let deadline = Instant::now() + Duration::from_secs(config.max_session_secs);
         tokio::spawn(async move {
             match russh::server::run_stream(server_config, stream, handler).await {
@@ -190,8 +198,13 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
                     let watchdog = tokio::spawn({
                         let handle = session.handle();
                         async move {
-                            tokio::time::sleep_until(deadline).await;
-                            event::session_timeout(session_id, peer);
+                            tokio::time::sleep_until(login_deadline.min(deadline)).await;
+                            if authenticated.load(Ordering::Relaxed) {
+                                tokio::time::sleep_until(deadline).await;
+                                event::session_timeout(session_id, peer);
+                            } else {
+                                event::login_timeout(session_id, peer);
+                            }
                             let _ = handle
                                 .disconnect(Disconnect::ByApplication, String::new(), String::new())
                                 .await;
@@ -349,6 +362,9 @@ struct MimicHandler {
     /// one was allocated.
     pty: bool,
     auth_attempts: u32,
+    /// Set once a login is accepted; the session watchdog reads it to enforce
+    /// [`LOGIN_GRACE`].
+    authenticated: Arc<AtomicBool>,
     username: String,
     /// Interactive readline-style editor (cursor, history, completion) for the
     /// PTY session.
@@ -1307,6 +1323,7 @@ impl Handler for MimicHandler {
 
         if accepted {
             self.username = user.to_string();
+            self.authenticated.store(true, Ordering::Relaxed);
             jitter_for(0).await;
             Ok(Auth::Accept)
         } else {
@@ -1979,6 +1996,7 @@ mod tests {
             local: "127.0.0.1:2222".parse().unwrap(),
             pty: false,
             auth_attempts: 0,
+            authenticated: Arc::new(AtomicBool::new(true)),
             username: "root".to_string(),
             editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
             shell_started: false,

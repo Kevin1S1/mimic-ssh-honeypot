@@ -1992,7 +1992,7 @@ pub fn touch(shell: &mut Shell, args: &[String]) -> CommandResult {
                 if no_create && shell.vfs.child(parent, &name).is_none() {
                     continue;
                 }
-                if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full() {
+                if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full(parent) {
                     out.push_str(&format!(
                         "touch: cannot touch '{path}': No space left on device
 "
@@ -2070,6 +2070,12 @@ pub fn mkdir(shell: &mut Shell, args: &[String]) -> CommandResult {
                                 break;
                             }
                             current = child;
+                        } else if shell.vfs.is_full(current) {
+                            out.push_str(&format!(
+                                "mkdir: cannot create directory '{path}': No space left on device\n"
+                            ));
+                            status = 1;
+                            break;
                         } else {
                             current = shell.vfs.mkdir(current, name, 0o755, uid, gid);
                         }
@@ -2086,7 +2092,7 @@ pub fn mkdir(shell: &mut Shell, args: &[String]) -> CommandResult {
                         "mkdir: cannot create directory '{path}': File exists\n"
                     ));
                     status = 1;
-                } else if shell.vfs.is_full() {
+                } else if shell.vfs.is_full(parent) {
                     // A real kernel reports the failure; silently exiting 0 on
                     // a directory that never appears is a honeypot tell.
                     out.push_str(&format!(
@@ -2351,7 +2357,7 @@ pub fn cp(shell: &mut Shell, args: &[String]) -> CommandResult {
         // At the node cap `deep_copy` silently returns the parent, so the copy
         // would exit 0 on a file that never appears — both a bug and a tell,
         // since real `cp` reports ENOSPC.
-        if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full() {
+        if shell.vfs.child(parent, &name).is_none() && shell.vfs.is_full(parent) {
             out.push_str(&format!(
                 "cp: cannot create regular file '{name}': No space left on device\n"
             ));
@@ -2430,11 +2436,17 @@ pub fn mv(shell: &mut Shell, args: &[String]) -> CommandResult {
             }
         };
         if !shell.vfs.rename(src_id, parent, &name) {
-            // The destination sits inside the source's own subtree. Real `mv`
-            // refuses this rather than corrupting the tree.
-            out.push_str(&format!(
-                "mv: cannot move '{src}' to a subdirectory of itself, '{dest}/{name}'\n"
-            ));
+            // Real `mv` refuses a move into the source's own subtree rather
+            // than corrupting the tree; anything else is the depth cap.
+            if shell.vfs.is_ancestor_of(src_id, parent) {
+                out.push_str(&format!(
+                    "mv: cannot move '{src}' to a subdirectory of itself, '{dest}/{name}'\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "mv: cannot move '{src}' to '{dest}': File name too long\n"
+                ));
+            }
             status = 1;
         }
     }
@@ -3417,6 +3429,21 @@ mod tests {
         assert!(run(&mut shell, "ls /tmp").contains('a'));
         run(&mut shell, "cd /tmp/a/b");
         assert_eq!(run(&mut shell, "pwd"), "/tmp/a/b\n");
+    }
+
+    #[test]
+    fn deep_directory_chains_are_refused_not_silently_dropped() {
+        let mut shell = Shell::new("root", "debian");
+        let chain = "a/".repeat(200);
+        let out = run(&mut shell, &format!("mkdir -p /tmp/{chain}"));
+        assert!(out.contains("No space left on device"), "{out}");
+
+        run(&mut shell, &format!("mkdir -p /tmp/x/{}", "b/".repeat(100)));
+        let out = run(&mut shell, &format!("mv /tmp/x /tmp/{}a", "a/".repeat(30)));
+        assert!(out.contains("File name too long"), "{out}");
+
+        // The walkers the depth cap protects still finish over the deepest tree.
+        run(&mut shell, "tar cf /tmp/t.tar /tmp; find /tmp; du /tmp");
     }
 
     #[test]

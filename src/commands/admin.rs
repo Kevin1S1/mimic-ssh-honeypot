@@ -34,7 +34,7 @@ fn write_text(shell: &mut Shell, path: &str, text: &str) -> bool {
     match shell.vfs.child(parent, &name) {
         Some(id) => shell.vfs.write_file(id, text.as_bytes(), false),
         None => {
-            if shell.vfs.is_full() {
+            if shell.vfs.is_full(parent) {
                 return false;
             }
             shell

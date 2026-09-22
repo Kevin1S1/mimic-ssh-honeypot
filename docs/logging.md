@@ -84,7 +84,7 @@ docker logs mimic | jq 'select(.fields.event=="download") | .fields.url'
 
 ## Every event, and what carries it
 
-Seventeen event types share one envelope. `sensor_name`, `boot_id`, `event_kind`,
+Eighteen event types share one envelope. `sensor_name`, `boot_id`, `event_kind`,
 `event_category`, `event_dataset` and `ecs_version` are on all of them;
 everything that happens inside a session also carries `session_id`, `peer`,
 `src_ip` and `src_port`. The last four are the ECS classification fields, emitted
@@ -117,6 +117,7 @@ The remaining `WARN`s (`accept_error`, `quarantine_session_cap`,
 | `quarantine_global_cap` | WARN | yes | The honeypot hit its global quarantine storage cap; the payload is still in the VFS. |
 | `quarantine_error` | WARN | yes | **A payload capture failed.** The one to page on when the sensor itself is the problem. |
 | `session_timeout` | INFO | yes | *We* cut the session off, rather than the attacker leaving. |
+| `login_timeout` | INFO | yes | The client never logged in within 120 s (sshd's `LoginGraceTime`) and was disconnected. |
 | `connection_closed` | INFO | yes | Session ended. Carries `duration_secs` and `command_count`. |
 
 Two caveats that produce silently wrong dashboards rather than errors:

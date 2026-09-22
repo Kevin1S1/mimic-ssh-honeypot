@@ -766,7 +766,7 @@ pub fn tee(shell: &mut Shell, args: &[String]) -> CommandResult {
             }
             Some(_) => {}
             None => {
-                if shell.vfs.is_full() {
+                if shell.vfs.is_full(parent) {
                     errs.push_str(&format!("tee: {path}: No space left on device\n"));
                     status = 1;
                 } else {
