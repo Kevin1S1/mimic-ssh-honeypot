@@ -179,6 +179,19 @@ pub fn session_timeout(session_id: u64, peer: SocketAddr) {
     );
 }
 
+/// A connection did not log in within the login grace time and was disconnected.
+pub fn login_timeout(session_id: u64, peer: SocketAddr) {
+    let (src_ip, src_port) = peer_parts(peer);
+    emit!(
+        info,
+        "login_timeout",
+        session_id,
+        peer = %peer,
+        src_ip,
+        src_port,
+    );
+}
+
 /// A session reached its cumulative quarantine-write cap; later uploads in this
 /// session are logged but not stored on disk.
 pub fn quarantine_session_cap(session_id: u64, peer: SocketAddr) {
@@ -583,10 +596,11 @@ mod tests {
             quarantine_global_cap(1, peer());
             quarantine_error(1, peer(), "disk full");
             session_timeout(1, peer());
+            login_timeout(1, peer());
             connection_closed(1, peer(), 1, 1);
             log_retention_pruned(2, 30);
         });
-        assert_eq!(events.len(), 18, "one line per event, every type covered");
+        assert_eq!(events.len(), 19, "one line per event, every type covered");
 
         for event in &events {
             let f = fields(event);

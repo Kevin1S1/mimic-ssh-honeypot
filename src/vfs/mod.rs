@@ -29,6 +29,11 @@ const MAX_VFS_NODES: usize = 2_000;
 /// Writes past the cap are silently dropped, like node-cap overflow.
 const MAX_VFS_BYTES: usize = 8 * 1024 * 1024;
 
+/// Hard ceiling on how deep below `/` a node may sit. Tree walkers (`find`,
+/// `du`, `tar`, ...) recurse once per level, and a stack overflow aborts the
+/// whole process, so the node cap alone (~1,500 levels) is not enough.
+const MAX_VFS_DEPTH: usize = 128;
+
 /// An in-memory filesystem tree.
 #[derive(Debug, Clone)]
 pub struct Vfs {
@@ -173,21 +178,52 @@ impl Vfs {
 
     // --- Mutation helpers -------------------------------------------------
 
-    /// Whether the arena has reached its hard node cap.
+    /// Whether a new child under `parent` would be dropped: the arena is at its
+    /// hard node cap, or `parent` is already at the depth cap.
     ///
     /// Callers that create nodes check this first so they can report the error
     /// a real kernel would return. Without it an insert past the cap is dropped
     /// and `parent` handed back, so `mkdir foo` exits 0 while `ls` never shows
     /// `foo` — a contradiction the box should not produce, and a silent one.
-    pub fn is_full(&self) -> bool {
-        self.nodes.len() >= MAX_VFS_NODES
+    pub fn is_full(&self, parent: NodeId) -> bool {
+        self.nodes.len() >= MAX_VFS_NODES || self.depth_of(parent) >= MAX_VFS_DEPTH
+    }
+
+    /// How many levels below `/` `id` sits; the root is 0.
+    fn depth_of(&self, id: NodeId) -> usize {
+        let mut depth = 0;
+        let mut current = id;
+        // Bounded like `path_of`.
+        while let Some(parent) = self.nodes[current].parent {
+            depth += 1;
+            if depth > self.nodes.len() {
+                break;
+            }
+            current = parent;
+        }
+        depth
+    }
+
+    /// How many levels the subtree under `id` spans; a leaf is 0. Iterative, so
+    /// measuring a deep tree cannot itself overflow the stack.
+    fn height_of(&self, id: NodeId) -> usize {
+        let mut height = 0;
+        let mut stack = vec![(id, 0)];
+        while let Some((node, h)) = stack.pop() {
+            height = height.max(h);
+            if let NodeKind::Directory { children } = &self.nodes[node].kind {
+                stack.extend(children.values().map(|&child| (child, h + 1)));
+            }
+        }
+        height
     }
 
     /// Insert a freshly built node under `parent`, returning its id. The
     /// caller must ensure `parent` is a directory. If the arena is at its hard
-    /// node cap, the insert is dropped and `parent` is returned unchanged.
+    /// node cap or `parent` at the depth cap, the insert is dropped and
+    /// `parent` is returned unchanged.
     fn insert(&mut self, parent: NodeId, name: &str, kind: NodeKind, meta: Metadata) -> NodeId {
-        if self.nodes.len() >= MAX_VFS_NODES {
+        if self.is_full(parent) {
             return parent;
         }
         let id = self.nodes.len();
@@ -428,8 +464,8 @@ impl Vfs {
 
     /// Move/rename `id` to be the child `new_name` of `new_parent`. Any node
     /// already at the destination name is detached first. Returns `false` if
-    /// `new_parent` is not a directory, or if the move would place `id` inside
-    /// its own subtree.
+    /// `new_parent` is not a directory, if the move would place `id` inside
+    /// its own subtree, or if it would push the subtree past the depth cap.
     pub fn rename(&mut self, id: NodeId, new_parent: NodeId, new_name: &str) -> bool {
         if !matches!(self.nodes[new_parent].kind, NodeKind::Directory { .. }) {
             return false;
@@ -440,6 +476,10 @@ impl Vfs {
         // `grep -r`, `chmod -R` — would then run forever, taking down the whole
         // process rather than one session. Real `mv` refuses this too.
         if self.is_ancestor_of(id, new_parent) {
+            return false;
+        }
+        // Otherwise stacking capped chains with `mv` rebuilds an unbounded depth.
+        if self.depth_of(new_parent) + 1 + self.height_of(id) > MAX_VFS_DEPTH {
             return false;
         }
         // Detach from the old parent.
@@ -622,6 +662,35 @@ mod tests {
             fs.add_file(root, &format!("f{i}"), &b""[..], 0o644, 0, 0);
         }
         assert!(fs.nodes.len() <= MAX_VFS_NODES);
+    }
+
+    #[test]
+    fn depth_cap_bounds_tree_depth() {
+        let mut fs = Vfs::new();
+        let mut current = fs.root();
+        for _ in 0..MAX_VFS_DEPTH + 10 {
+            current = fs.mkdir(current, "a", 0o755, 0, 0);
+        }
+        assert_eq!(fs.depth_of(current), MAX_VFS_DEPTH);
+        assert!(fs.is_full(current));
+        assert!(fs
+            .mkdir_p(&"/b".repeat(MAX_VFS_DEPTH + 1), 0o755, 0, 0)
+            .is_none());
+    }
+
+    #[test]
+    fn rename_refuses_to_stack_chains_past_the_depth_cap() {
+        let mut fs = Vfs::new();
+        let root = fs.root();
+        let half = MAX_VFS_DEPTH / 2 + 1;
+        let top = fs.mkdir_p(&"/x".repeat(half), 0o755, 0, 0).unwrap();
+        fs.mkdir_p(&"/y".repeat(half), 0o755, 0, 0).unwrap();
+        let y = fs.child(root, "y").unwrap();
+        // Each chain fits on its own; stacked they would not.
+        assert!(!fs.rename(y, top, "y"));
+        assert_eq!(fs.child(root, "y"), Some(y));
+        let x = fs.child(root, "x").unwrap();
+        assert!(fs.rename(x, y, "x"), "a move that fits is still allowed");
     }
 
     #[test]
