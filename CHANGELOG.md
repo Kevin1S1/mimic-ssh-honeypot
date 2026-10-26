@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Connections that have not logged in within 120 s are disconnected (sshd's
   `LoginGraceTime`) and logged as `login_timeout`, so a few sources can no longer
   hold every connection slot unauthenticated for the full session lifetime.
+- `crypto-bigint` (0.7.5 → 0.7.10) and `ctutils` (0.4.2 → 0.4.6), pulled in via
+  `russh`'s key and cipher stack, updated for non-constant-time operations
+  (RUSTSEC-2026-0387, RUSTSEC-2026-0385).
 
 ## [0.6.0] - 2026-08-30
 
