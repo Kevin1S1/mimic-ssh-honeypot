@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `russh` bumped from 0.63.1 to 0.63.3, which raises the minimum supported Rust
   version to 1.89. CI, `Cargo.toml`, the `Dockerfile` and the docs are updated
   to match.
+- `russh` bumped to 0.65.0; the public-key handler now takes the new
+  `VerifiedPublicKey` type. Behavior is unchanged: the key fingerprint is still
+  logged and the key is still rejected in favor of password auth.
 
 ### Fixed
 - The event catalogue said "sixteen event types" while listing seventeen, and the
@@ -34,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `crypto-bigint` (0.7.5 → 0.7.10) and `ctutils` (0.4.2 → 0.4.6), pulled in via
   `russh`'s key and cipher stack, updated for non-constant-time operations
   (RUSTSEC-2026-0387, RUSTSEC-2026-0385).
+- `russh` 0.65.0 fixes a pre-authentication stack overflow from nested OpenSSH
+  certificates (GHSA-3hm4-p7h4-rvwp) and a channel stall when a peer declares a
+  zero maximum packet size (GHSA-fw5c-8223-6h42).
 
 ## [0.6.0] - 2026-08-30
 
