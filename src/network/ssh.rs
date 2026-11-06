@@ -1347,13 +1347,13 @@ impl Handler for MimicHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        key: &russh::keys::PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth_attempts += 1;
         // The offered key is intelligence in its own right: campaigns reuse key
         // material, so the fingerprint pivots across sessions and sensors in a
         // way a sprayed password does not.
-        let fingerprint = key.fingerprint(Default::default()).to_string();
+        let fingerprint = key.public_key.fingerprint(Default::default()).to_string();
         event::auth_attempt(
             self.session_id,
             self.peer,
