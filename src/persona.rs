@@ -199,6 +199,31 @@ impl Persona {
     pub fn gateway(&self) -> String {
         format!("{}.1", self.subnet)
     }
+
+    pub fn memory(&self) -> MemStats {
+        let total = self.mem_total_kb;
+        let buffers = total * 13 / 1000;
+        let cached = total * 139 / 1000;
+        let sreclaim = total * 20 / 1000;
+        let free = total * 73 / 100;
+        let buff_cache = buffers + cached + sreclaim;
+        MemStats {
+            total,
+            free,
+            available: total * 86 / 100,
+            buff_cache,
+            used: total.saturating_sub(free).saturating_sub(buff_cache),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MemStats {
+    pub total: u64,
+    pub free: u64,
+    pub available: u64,
+    pub buff_cache: u64,
+    pub used: u64,
 }
 
 impl Default for Persona {
