@@ -8,6 +8,42 @@
 //! command substitution the splitters below skip over — happens *before*
 //! tokenization in [`crate::shell::Shell`].
 
+const MISSING_REDIRECT_TARGET: &str = "-bash: syntax error near unexpected token `newline'\n";
+
+#[derive(Default)]
+struct Quotes {
+    single: bool,
+    double: bool,
+    escaped: bool,
+}
+
+impl Quotes {
+    fn is_quoted(&self) -> bool {
+        self.single || self.double
+    }
+
+    fn take_escaped(&mut self) -> bool {
+        std::mem::take(&mut self.escaped)
+    }
+
+    fn toggle(&mut self, c: char) -> bool {
+        match c {
+            '\\' if !self.single => self.escaped = true,
+            '\'' if !self.double => self.single = !self.single,
+            '"' if !self.single => self.double = !self.double,
+            _ => return false,
+        }
+        true
+    }
+
+    fn substitution_end(&self, line: &str, i: usize) -> Option<usize> {
+        if self.single {
+            return None;
+        }
+        substitution_at(line, i).map(|subst| subst.end)
+    }
+}
+
 /// A `$(…)`, `` `…` `` or `$((…))` region found in a raw line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Substitution {
@@ -32,64 +68,65 @@ pub struct Substitution {
 pub fn substitution_at(line: &str, i: usize) -> Option<Substitution> {
     let bytes = line.as_bytes();
     match bytes.get(i)? {
-        b'`' => {
-            let mut j = i + 1;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'\\' => j += 1,
-                    b'`' => {
-                        return Some(Substitution {
-                            end: j + 1,
-                            body: (i + 1, j),
-                            arithmetic: false,
-                        })
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            None
-        }
-        b'$' if bytes.get(i + 1) == Some(&b'(') => {
-            // `$((` is read as arithmetic, as bash's own ambiguity resolves it
-            // for everything but a subshell written `$( (cmd) )`.
-            let arithmetic = bytes.get(i + 2) == Some(&b'(');
-            let mut depth = 0usize;
-            let mut in_single = false;
-            let mut in_double = false;
-            let mut j = i + 1;
-
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'\\' if !in_single => j += 1,
-                    b'\'' if !in_double => in_single = !in_single,
-                    b'"' if !in_single => in_double = !in_double,
-                    b'(' if !in_single && !in_double => depth += 1,
-                    b')' if !in_single && !in_double => {
-                        depth -= 1;
-                        if depth == 0 {
-                            // Closing an arithmetic region takes two `)`, so
-                            // the body never runs past its own start.
-                            let body = if arithmetic {
-                                (i + 3, j - 1)
-                            } else {
-                                (i + 2, j)
-                            };
-                            return Some(Substitution {
-                                end: j + 1,
-                                body,
-                                arithmetic,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            None
-        }
+        b'`' => backtick_at(bytes, i),
+        b'$' if bytes.get(i + 1) == Some(&b'(') => dollar_paren_at(bytes, i),
         _ => None,
     }
+}
+
+fn backtick_at(bytes: &[u8], start: usize) -> Option<Substitution> {
+    let mut j = start + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 1,
+            b'`' => {
+                return Some(Substitution {
+                    end: j + 1,
+                    body: (start + 1, j),
+                    arithmetic: false,
+                })
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+fn dollar_paren_at(bytes: &[u8], start: usize) -> Option<Substitution> {
+    // `$((` is read as arithmetic, as bash's own ambiguity resolves it
+    // for everything but a subshell written `$( (cmd) )`.
+    let arithmetic = bytes.get(start + 2) == Some(&b'(');
+    let mut depth = 0usize;
+    let mut quotes = Quotes::default();
+
+    for (j, &c) in bytes.iter().enumerate().skip(start + 1) {
+        if quotes.take_escaped() || quotes.toggle(char::from(c)) || quotes.is_quoted() {
+            continue;
+        }
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Closing an arithmetic region takes two `)`, so
+                    // the body never runs past its own start.
+                    let body = if arithmetic {
+                        (start + 3, j - 1)
+                    } else {
+                        (start + 2, j)
+                    };
+                    return Some(Substitution {
+                        end: j + 1,
+                        body,
+                        arithmetic,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A here-document a line opened: what ends the body, and how it is treated.
@@ -115,71 +152,58 @@ pub struct Heredoc {
 /// several per line, and one covers every payload seen in the wild.
 pub fn split_heredoc(line: &str) -> Option<(Heredoc, String)> {
     let bytes = line.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
     let mut i = 0;
 
     while i < bytes.len() {
-        if escaped {
-            escaped = false;
+        if quotes.take_escaped() {
             i += 1;
             continue;
         }
         // `$((1 << 2))` is a shift, and a `<<` inside `$(…)` belongs to the
         // command being substituted.
-        if !in_single {
-            if let Some(subst) = substitution_at(line, i) {
-                i = subst.end;
-                continue;
-            }
+        if let Some(end) = quotes.substitution_end(line, i) {
+            i = end;
+            continue;
         }
-        match bytes[i] {
-            b'\\' if !in_single => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'<' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'<') => {
-                // `<<<` is a here-string, which takes its word from the line
-                // itself rather than opening a body.
-                if bytes.get(i + 2) == Some(&b'<') {
-                    i += 3;
-                    continue;
-                }
-                let mut j = i + 2;
-                let strip_tabs = bytes.get(j) == Some(&b'-');
-                if strip_tabs {
-                    j += 1;
-                }
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                let end = word_end(line, j);
-                if end == j {
-                    // `cat <<` with nothing after it is a syntax error, and
-                    // treating it as a plain argument is closer to the truth
-                    // than inventing an empty delimiter.
-                    return None;
-                }
-                let raw = &line[j..end];
-                let quoted = raw.starts_with('\'') || raw.starts_with('"') || raw.contains('\\');
-                let delimiter = unquote(raw);
-                let mut rest = String::with_capacity(line.len());
-                rest.push_str(&line[..i]);
-                rest.push_str(&line[end..]);
-                return Some((
-                    Heredoc {
-                        delimiter,
-                        strip_tabs,
-                        expand: !quoted,
-                    },
-                    rest,
-                ));
-            }
-            _ => {}
+        if quotes.toggle(char::from(bytes[i])) || quotes.is_quoted() {
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<<<") {
+            // `<<<` is a here-string, which takes its word from the line
+            // itself rather than opening a body.
+            i += 3;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<<") {
+            return heredoc_operator(line, i);
         }
         i += 1;
     }
     None
+}
+
+fn heredoc_operator(line: &str, start: usize) -> Option<(Heredoc, String)> {
+    let bytes = line.as_bytes();
+    let strip_tabs = bytes.get(start + 2) == Some(&b'-');
+    let word_start = skip_whitespace(bytes, start + 2 + usize::from(strip_tabs));
+    let end = word_end(line, word_start);
+    if end == word_start {
+        // `cat <<` with nothing after it is a syntax error, and
+        // treating it as a plain argument is closer to the truth
+        // than inventing an empty delimiter.
+        return None;
+    }
+    let raw = &line[word_start..end];
+    let quoted = raw.starts_with('\'') || raw.starts_with('"') || raw.contains('\\');
+    let rest = format!("{}{}", &line[..start], &line[end..]);
+    let doc = Heredoc {
+        delimiter: unquote(raw),
+        strip_tabs,
+        expand: !quoted,
+    };
+    Some((doc, rest))
 }
 
 /// Strip the quoting from a here-document delimiter word. The delimiter is
@@ -187,20 +211,10 @@ pub fn split_heredoc(line: &str) -> Option<(Heredoc, String)> {
 /// all end a body at `EOF`.
 fn unquote(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
     for c in word.chars() {
-        if escaped {
+        if quotes.take_escaped() || !quotes.toggle(c) {
             out.push(c);
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' if !in_single => escaped = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            _ => out.push(c),
         }
     }
     out
@@ -216,9 +230,7 @@ fn unquote(word: &str) -> String {
 /// line, before variable expansion, so a `#` arriving in a variable's value
 /// stays data instead of commenting out the rest of the line.
 pub fn strip_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
     // A `#` only opens a comment at the start of a word: at the start of the
     // line, after whitespace, or after an operator character that ended one.
     let mut word_start = true;
@@ -227,39 +239,23 @@ pub fn strip_comment(line: &str) -> &str {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        if escaped {
-            escaped = false;
+        if quotes.take_escaped() {
             word_start = false;
             i += 1;
             continue;
         }
         // A `#` inside `$(…)` comments out the rest of *that* command, which is
         // the substitution's business, not this line's.
-        if !in_single {
-            if let Some(subst) = substitution_at(line, i) {
-                i = subst.end;
-                word_start = false;
-                continue;
-            }
+        if let Some(end) = quotes.substitution_end(line, i) {
+            i = end;
+            word_start = false;
+            continue;
         }
-        match c {
-            b'\\' if !in_single => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'#' if word_start && !in_single && !in_double => return &line[..i],
-            b';' | b'&' | b'|' if !in_single && !in_double => {
-                word_start = true;
-                i += 1;
-                continue;
-            }
-            c if c.is_ascii_whitespace() && !in_single && !in_double => {
-                word_start = true;
-                i += 1;
-                continue;
-            }
-            _ => {}
+        let quoting = quotes.toggle(char::from(c)) || quotes.is_quoted();
+        if !quoting && word_start && c == b'#' {
+            return &line[..i];
         }
-        word_start = false;
+        word_start = !quoting && (matches!(c, b';' | b'&' | b'|') || c.is_ascii_whitespace());
         i += 1;
     }
     line
@@ -284,6 +280,17 @@ impl Separator {
             Separator::OrIf => previous_status != 0,
         }
     }
+
+    fn at(bytes: &[u8], i: usize) -> Option<(usize, Separator)> {
+        match (bytes[i], bytes.get(i + 1)) {
+            (b';', _) => Some((1, Separator::Always)),
+            (b'&', Some(b'&')) => Some((2, Separator::AndIf)),
+            (b'|', Some(b'|')) => Some((2, Separator::OrIf)),
+            // A single `&` or `|` is not a separator here: background
+            // jobs and pipes are not emulated, so they stay literal.
+            _ => None,
+        }
+    }
 }
 
 /// One command of a compound line, with the operator that gates it.
@@ -306,53 +313,34 @@ pub fn split_segments(line: &str) -> Vec<Segment<'_>> {
     let mut segments = Vec::new();
     let mut run_if = Separator::Always;
     let mut start = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
 
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
-        if escaped {
-            escaped = false;
+        if quotes.take_escaped() {
             i += 1;
             continue;
         }
-        if !in_single {
-            if let Some(subst) = substitution_at(line, i) {
-                i = subst.end;
-                continue;
-            }
+        if let Some(end) = quotes.substitution_end(line, i) {
+            i = end;
+            continue;
         }
-        match c {
-            b'\\' if !in_single => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b';' | b'&' | b'|' if !in_single && !in_double => {
-                let (width, next) = match (c, bytes.get(i + 1)) {
-                    (b';', _) => (1, Separator::Always),
-                    (b'&', Some(b'&')) => (2, Separator::AndIf),
-                    (b'|', Some(b'|')) => (2, Separator::OrIf),
-                    // A single `&` or `|` is not a separator here: background
-                    // jobs and pipes are not emulated, so they stay literal.
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                };
-                segments.push(Segment {
-                    run_if,
-                    text: &line[start..i],
-                });
-                run_if = next;
-                i += width;
-                start = i;
-                continue;
-            }
-            _ => {}
+        if quotes.toggle(char::from(bytes[i])) || quotes.is_quoted() {
+            i += 1;
+            continue;
         }
-        i += 1;
+        let Some((width, next)) = Separator::at(bytes, i) else {
+            i += 1;
+            continue;
+        };
+        segments.push(Segment {
+            run_if,
+            text: &line[start..i],
+        });
+        run_if = next;
+        i += width;
+        start = i;
     }
 
     segments.push(Segment {
@@ -368,33 +356,23 @@ pub fn split_segments(line: &str) -> Vec<Segment<'_>> {
 pub fn split_pipeline(segment: &str) -> Vec<&str> {
     let mut stages = Vec::new();
     let mut start = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
 
     let bytes = segment.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if escaped {
-            escaped = false;
+        if quotes.take_escaped() {
             i += 1;
             continue;
         }
-        if !in_single {
-            if let Some(subst) = substitution_at(segment, i) {
-                i = subst.end;
-                continue;
-            }
+        if let Some(end) = quotes.substitution_end(segment, i) {
+            i = end;
+            continue;
         }
-        match bytes[i] {
-            b'\\' if !in_single => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'|' if !in_single && !in_double => {
-                stages.push(&segment[start..i]);
-                start = i + 1;
-            }
-            _ => {}
+        let quoting = quotes.toggle(char::from(bytes[i])) || quotes.is_quoted();
+        if !quoting && bytes[i] == b'|' {
+            stages.push(&segment[start..i]);
+            start = i + 1;
         }
         i += 1;
     }
@@ -414,6 +392,17 @@ pub enum Stream {
     Stderr,
     /// `&>`: both at once.
     Both,
+}
+
+impl Stream {
+    fn from_descriptor_prefix(prefix: &str) -> Option<Stream> {
+        match prefix {
+            "1" => Some(Stream::Stdout),
+            "2" => Some(Stream::Stderr),
+            "&" => Some(Stream::Both),
+            _ => None,
+        }
+    }
 }
 
 /// Where a redirected stream ends up.
@@ -460,106 +449,55 @@ pub fn split_redirects(stage: &str) -> Result<(String, Vec<Redirect>), String> {
     // and escapes — only a bare `1`, `2`, or `&` counts as a descriptor prefix.
     let mut word_start = 0;
     let mut plain_word = true;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
     let mut i = 0;
 
     while i < bytes.len() {
         let c = bytes[i];
-        if escaped {
-            escaped = false;
+        if quotes.take_escaped() {
             i += 1;
             continue;
         }
         // `$((3>2))` is one word, not a redirect, and a `>` inside `$(…)`
         // belongs to the command being substituted.
-        if !in_single {
-            if let Some(subst) = substitution_at(stage, i) {
-                i = subst.end;
-                plain_word = false;
-                continue;
-            }
+        if let Some(end) = quotes.substitution_end(stage, i) {
+            i = end;
+            plain_word = false;
+            continue;
         }
-        match c {
-            b'\\' if !in_single => {
-                escaped = true;
-                plain_word = false;
-            }
-            b'\'' if !in_double => {
-                in_single = !in_single;
-                plain_word = false;
-            }
-            b'"' if !in_single => {
-                in_double = !in_double;
-                plain_word = false;
-            }
-            b'>' if !in_single && !in_double => {
-                let prefix = if plain_word {
-                    &stage[word_start..i]
-                } else {
-                    ""
-                };
-                // `echo a>b` redirects and keeps `a` as an argument; only an
-                // exact `1`, `2`, or `&` is consumed as the descriptor.
-                let (stream, op_start) = match prefix {
-                    "1" => (Stream::Stdout, word_start),
-                    "2" => (Stream::Stderr, word_start),
-                    "&" => (Stream::Both, word_start),
-                    _ => (Stream::Stdout, i),
-                };
-
-                let mut j = i + 1;
-                let append = bytes.get(j) == Some(&b'>');
-                if append {
-                    j += 1;
-                }
-
-                let (target, end) = if !append && bytes.get(j) == Some(&b'&') {
-                    let mut k = j + 1;
-                    while k < bytes.len() && bytes[k].is_ascii_digit() {
-                        k += 1;
-                    }
-                    match &stage[j + 1..k] {
-                        "1" => (Target::Dup(Stream::Stdout), k),
-                        "2" => (Target::Dup(Stream::Stderr), k),
-                        fd => {
-                            return Err(format!("-bash: {fd}: Bad file descriptor\n"));
-                        }
-                    }
-                } else {
-                    let mut k = j;
-                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    let end = word_end(stage, k);
-                    if end == k {
-                        return Err(
-                            "-bash: syntax error near unexpected token `newline'\n".to_string()
-                        );
-                    }
-                    (
-                        Target::File {
-                            path: stage[k..end].to_string(),
-                            append,
-                        },
-                        end,
-                    )
-                };
-
-                command.push_str(&stage[copy_from..op_start]);
-                redirects.push(Redirect { stream, target });
-                copy_from = end;
-                i = end;
-                word_start = end;
-                plain_word = true;
-                continue;
-            }
-            c if c.is_ascii_whitespace() && !in_single && !in_double => {
-                word_start = i + 1;
-                plain_word = true;
-            }
-            _ => {}
+        if quotes.toggle(char::from(c)) {
+            plain_word = false;
+            i += 1;
+            continue;
+        }
+        if quotes.is_quoted() {
+            i += 1;
+            continue;
+        }
+        if c == b'>' {
+            let prefix = if plain_word {
+                &stage[word_start..i]
+            } else {
+                ""
+            };
+            // `echo a>b` redirects and keeps `a` as an argument; only an
+            // exact `1`, `2`, or `&` is consumed as the descriptor.
+            let (stream, op_start) = match Stream::from_descriptor_prefix(prefix) {
+                Some(stream) => (stream, word_start),
+                None => (Stream::Stdout, i),
+            };
+            let (target, end) = redirect_target(stage, i + 1)?;
+            command.push_str(&stage[copy_from..op_start]);
+            redirects.push(Redirect { stream, target });
+            copy_from = end;
+            i = end;
+            word_start = end;
+            plain_word = true;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            word_start = i + 1;
+            plain_word = true;
         }
         i += 1;
     }
@@ -568,36 +506,64 @@ pub fn split_redirects(stage: &str) -> Result<(String, Vec<Redirect>), String> {
     Ok((command, redirects))
 }
 
+fn redirect_target(stage: &str, after_operator: usize) -> Result<(Target, usize), String> {
+    let bytes = stage.as_bytes();
+    let append = bytes.get(after_operator) == Some(&b'>');
+    let start = after_operator + usize::from(append);
+    if !append && bytes.get(start) == Some(&b'&') {
+        return descriptor_target(stage, start + 1);
+    }
+    let word_start = skip_whitespace(bytes, start);
+    let end = word_end(stage, word_start);
+    if end == word_start {
+        return Err(MISSING_REDIRECT_TARGET.to_string());
+    }
+    let path = stage[word_start..end].to_string();
+    Ok((Target::File { path, append }, end))
+}
+
+fn descriptor_target(stage: &str, start: usize) -> Result<(Target, usize), String> {
+    let digits = stage.as_bytes()[start..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    let end = start + digits;
+    match &stage[start..end] {
+        "1" => Ok((Target::Dup(Stream::Stdout), end)),
+        "2" => Ok((Target::Dup(Stream::Stderr), end)),
+        fd => Err(format!("-bash: {fd}: Bad file descriptor\n")),
+    }
+}
+
+fn skip_whitespace(bytes: &[u8], start: usize) -> usize {
+    start
+        + bytes[start.min(bytes.len())..]
+            .iter()
+            .take_while(|c| c.is_ascii_whitespace())
+            .count()
+}
+
 /// Index one past the end of the word starting at `start`, stopping at unquoted
 /// whitespace or the start of another redirection.
 fn word_end(s: &str, start: usize) -> usize {
     let bytes = s.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
+    let mut quotes = Quotes::default();
     let mut i = start;
 
     while i < bytes.len() {
         let c = bytes[i];
-        if escaped {
-            escaped = false;
+        if quotes.take_escaped() {
             i += 1;
             continue;
         }
         // `> $(echo f)` names one target word, spaces and all.
-        if !in_single {
-            if let Some(subst) = substitution_at(s, i) {
-                i = subst.end;
-                continue;
-            }
+        if let Some(end) = quotes.substitution_end(s, i) {
+            i = end;
+            continue;
         }
-        match c {
-            b'\\' if !in_single => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'>' | b'<' if !in_single && !in_double => break,
-            c if c.is_ascii_whitespace() && !in_single && !in_double => break,
-            _ => {}
+        let quoting = quotes.toggle(char::from(c)) || quotes.is_quoted();
+        if !quoting && (matches!(c, b'>' | b'<') || c.is_ascii_whitespace()) {
+            break;
         }
         i += 1;
     }
