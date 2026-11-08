@@ -11,19 +11,13 @@ const POSITIONAL_COUNT: &str = "0";
 
 type Chars<'a> = Peekable<CharIndices<'a>>;
 
-/// What an expansion's result feeds, which decides whether the characters a
-/// tokenizer would take as syntax have to be escaped on the way out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Expansion {
-    /// Argument words for the command layer.
     Words,
-    /// A here-document body: a command's stdin, never shell source.
+
     Literal,
 }
 
-/// The session state a command substitution runs on a copy of, restored when
-/// its subshell ends. The filesystem is deliberately not in here: a real
-/// subshell shares it with its parent.
 struct Subshell {
     env: Env,
     cwd: NodeId,
@@ -60,36 +54,25 @@ impl Subshell {
         shell.uid = self.uid;
         shell.gid = self.gid;
         shell.pending = self.pending;
-        // A substitution runs in a subshell with no terminal of its own, so
-        // `echo $(top)` captures a dump and does not take the screen.
+
         shell.screen = self.screen;
     }
 }
 
 impl Shell {
-    /// Expand `$VAR`, `${VAR}`, `$?`, `$$`, `$(…)`, `` `…` `` and `$((…))` in
-    /// `line`, respecting the quoting around each one: single quotes suppress
-    /// expansion entirely, double quotes suppress the word splitting the
-    /// tokenizer would otherwise do, and a backslash protects the character
-    /// after it.
     pub(super) fn expand(&mut self, line: &str) -> String {
         self.expand_with(line, Expansion::Words)
     }
 
-    /// The body of [`Shell::expand`], parameterised by what its result feeds.
     pub(super) fn expand_with(&mut self, line: &str, mode: Expansion) -> String {
         let mut out = String::new();
         let mut in_single = false;
         let mut in_double = false;
-        // A here-document body is a command's stdin, not shell source: quotes
-        // in it are ordinary characters, so the quote state never leaves
-        // `false` and every expanded value is emitted exactly as it is.
+
         let words = mode == Expansion::Words;
         let mut chars = line.char_indices().peekable();
 
         while let Some((i, c)) = chars.next() {
-            // A substitution is one word however much it holds, so it is
-            // recognised before the character-by-character rules below.
             if !in_single && (c == '$' || c == '`') {
                 if let Some(subst) = parser::substitution_at(line, i) {
                     let body = &line[subst.body.0..subst.body.1];
@@ -166,31 +149,12 @@ impl Shell {
         Some(value)
     }
 
-    /// Run a substitution's body and return the text bash would splice into the
-    /// line: the command's *stdout* with its trailing newlines stripped.
-    /// Anything the body wrote to stderr is not part of the value — it is held
-    /// for the outer line to emit, so `echo $(ls /nosuch)` reports the error
-    /// and echoes an empty argument, exactly as bash does.
-    ///
-    /// The body is a command line of its own — `$(cd /tmp; ls | wc -l)` — so it
-    /// runs through [`Shell::execute`], in a subshell: what it changes about the
-    /// session itself (working directory, environment, identity) is discarded
-    /// when it ends, while what it writes to the filesystem stays, exactly as a
-    /// real subshell's fork boundary falls. It also cannot end the session
-    /// (bash's subshell exit does not log the parent out), whatever it captured
-    /// is added to the outer line's captures rather than replacing them, and
-    /// both the nesting depth and the per-line output budget bound what it can
-    /// spend.
     fn substitute(&mut self, body: &str) -> String {
-        // Every level here is a stack frame that `dispatch`'s cap never sees:
-        // the descent runs through expansion, before any command is reached.
         if self.nesting >= commands::MAX_NESTED_COMMANDS {
             return String::new();
         }
         let output = self.run_in_subshell(body);
-        // Held stderr is capped like any other stream: a line has room for
-        // hundreds of substitutions, and each one's stderr is only bounded on
-        // its own.
+
         push_capped(&mut self.subst_stderr, &output.stderr);
         let value = substitution_value(output);
         self.spend_substitution_budget(value)
@@ -210,23 +174,12 @@ impl Shell {
         output
     }
 
-    /// One command's output is already capped, but a line has room for
-    /// hundreds of substitutions; the budget bounds their sum the way
-    /// `execute` bounds a chained line's.
     fn spend_substitution_budget(&mut self, mut value: String) -> String {
         value.truncate(floor_char_boundary(&value, self.subst_budget));
         self.subst_budget -= value.len();
         value
     }
 
-    /// Evaluate an `$((…))` body and return the number it comes to.
-    ///
-    /// The body is expanded first, so `$((x + $(echo 1)))` works, and bare
-    /// names resolve against the environment. A malformed expression or a
-    /// division by zero comes to zero rather than the syntax error bash prints,
-    /// because expansion has no channel to fail on.
-    // ponytail: no arithmetic syntax errors; upgrade when expansion can report
-    // a failure back to the command line.
     fn arithmetic(&mut self, body: &str) -> String {
         if self.nesting >= commands::MAX_NESTED_COMMANDS {
             return "0".to_string();
@@ -241,8 +194,6 @@ impl Shell {
 fn substitution_value(output: Output) -> String {
     let mut value = output.stdout;
     if output.exit {
-        // `logout` is what an interactive shell prints on its way out; a
-        // subshell that exits prints nothing.
         if let Some(rest) = value.strip_suffix(commands::LOGOUT) {
             value.truncate(rest.len());
         }
@@ -260,10 +211,6 @@ fn is_positional(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Copy a backslash and what it protects. In words the escape reaches the
-/// tokenizer intact, so whatever it protects stays data — including a `$` that
-/// would expand. In a body a backslash protects only what could still expand;
-/// before anything else it is a plain character.
 fn push_escape(out: &mut String, chars: &mut Chars, mode: Expansion) {
     match mode {
         Expansion::Words => {
@@ -279,7 +226,6 @@ fn push_escape(out: &mut String, chars: &mut Chars, mode: Expansion) {
     }
 }
 
-/// Append an expanded value under the rules of `mode`.
 fn emit(out: &mut String, mode: Expansion, value: &str, in_double: bool) {
     match mode {
         Expansion::Words => push_value(out, value, in_double),
@@ -287,15 +233,6 @@ fn emit(out: &mut String, mode: Expansion, value: &str, in_double: bool) {
     }
 }
 
-/// Append an expansion's result to the line the tokenizer will read, escaping
-/// the characters it would otherwise take as syntax.
-///
-/// What a variable holds is data, not shell source: a quote or a backslash in
-/// a value is a character the command receives, never quoting that re-parses
-/// the rest of the line. Whitespace is deliberately left alone, so an unquoted
-/// value still splits into words and a quoted one does not — the one part of
-/// the value bash does act on. `in_double` only spares the single quote, which
-/// the tokenizer already treats as an ordinary character inside double quotes.
 fn push_value(out: &mut String, value: &str, in_double: bool) {
     for c in value.chars() {
         match c {
