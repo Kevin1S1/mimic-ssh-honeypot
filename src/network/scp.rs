@@ -1,49 +1,64 @@
 use sha2::{Digest, Sha256};
 
+const ACK: u8 = 0;
+const MAX_CONTROL_LINE: usize = 8192;
+const MAX_SCP_DEPTH: usize = 32;
+const UNNAMED_FILE: &str = "unnamed";
+
 pub enum ScpMode {
     Sink { target: String, recursive: bool },
 
     Source { path: String },
 }
 
+#[derive(Default)]
+struct ScpArgs {
+    sink: bool,
+    source: bool,
+    recursive: bool,
+    path: Option<String>,
+}
+
+impl ScpArgs {
+    fn parse(operands: &[String]) -> Self {
+        let mut args = Self::default();
+        for token in operands.iter().filter(|token| *token != "--") {
+            match token.strip_prefix('-') {
+                Some(flags) => args.apply_flags(flags),
+                None => args.path = Some(token.clone()),
+            }
+        }
+        args
+    }
+
+    fn apply_flags(&mut self, flags: &str) {
+        for flag in flags.chars() {
+            match flag {
+                't' => self.sink = true,
+                'f' => self.source = true,
+                'r' => self.recursive = true,
+                _ => {}
+            }
+        }
+    }
+}
+
 pub fn parse_scp(cmd: &str) -> Option<ScpMode> {
     let argv = crate::shell::parser::tokenize(cmd);
-    let first = argv.first()?;
-    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
-    if base != "scp" {
+    let program = argv.first()?;
+    let program_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if program_name != "scp" {
         return None;
     }
 
-    let mut sink = false;
-    let mut source = false;
-    let mut recursive = false;
-    let mut path: Option<String> = None;
-
-    for tok in &argv[1..] {
-        if tok == "--" {
-            continue;
-        }
-        if let Some(flags) = tok.strip_prefix('-') {
-            for ch in flags.chars() {
-                match ch {
-                    't' => sink = true,
-                    'f' => source = true,
-                    'r' => recursive = true,
-                    _ => {}
-                }
-            }
-        } else {
-            path = Some(tok.clone());
-        }
-    }
-
-    let path = path?;
-    if sink {
+    let args = ScpArgs::parse(&argv[1..]);
+    let path = args.path?;
+    if args.sink {
         Some(ScpMode::Sink {
             target: path,
-            recursive,
+            recursive: args.recursive,
         })
-    } else if source {
+    } else if args.source {
         Some(ScpMode::Source { path })
     } else {
         None
@@ -75,6 +90,52 @@ struct Incoming {
 
     hasher: Sha256,
     truncated: bool,
+}
+
+impl Incoming {
+    fn new(name: String, mode: u32, size: u64) -> Self {
+        Self {
+            name,
+            mode,
+            size,
+            remaining: size,
+            data: Vec::new(),
+            hasher: Sha256::new(),
+            truncated: false,
+        }
+    }
+
+    fn body_complete(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn accept_body_byte(&mut self, byte: u8, max_bytes: u64) {
+        self.hasher.update([byte]);
+        if (self.data.len() as u64) < max_bytes {
+            self.data.push(byte);
+        } else {
+            self.truncated = true;
+        }
+        self.remaining -= 1;
+    }
+
+    fn into_completed(self, rel_dir: String) -> CompletedFile {
+        CompletedFile {
+            name: self.name,
+            rel_dir,
+            mode: self.mode,
+            data: self.data,
+            size: self.size,
+            payload_sha256: super::ssh::hex(&self.hasher.finalize()),
+            truncated: self.truncated,
+        }
+    }
+}
+
+struct ControlEntry {
+    mode: u32,
+    size: u64,
+    name: String,
 }
 
 pub struct ScpSink {
@@ -110,45 +171,17 @@ impl ScpSink {
         let mut acks = Vec::new();
         let mut done = Vec::new();
 
-        for &b in data {
-            if let Some(file) = self.file.as_mut() {
-                if file.remaining > 0 {
-                    file.hasher.update([b]);
-                    if (file.data.len() as u64) < self.max_bytes {
-                        file.data.push(b);
-                    } else {
-                        file.truncated = true;
-                    }
-                    file.remaining -= 1;
-                    continue;
+        for &byte in data {
+            match self.file.as_mut() {
+                Some(file) if !file.body_complete() => file.accept_body_byte(byte, self.max_bytes),
+                Some(_) => {
+                    done.push(self.finish_file());
+                    acks.push(ACK);
                 }
-
-                let f = self.file.take().expect("file present");
-                done.push(CompletedFile {
-                    name: f.name,
-                    rel_dir: self.dirs.join("/"),
-                    mode: f.mode,
-                    data: f.data,
-                    size: f.size,
-                    payload_sha256: super::ssh::hex(&f.hasher.finalize()),
-                    truncated: f.truncated,
-                });
-                acks.push(0);
-                continue;
-            }
-
-            if b == b'\n' {
-                let line = std::mem::take(&mut self.buf);
-                self.handle_control(&line);
-                acks.push(0);
-            } else if b != b'\r' {
-                const MAX_CONTROL_LINE: usize = 8192;
-                if self.buf.len() < MAX_CONTROL_LINE {
-                    self.buf.push(b);
-                } else {
-                    self.buf.clear();
-                    self.file = None;
-                    self.dirs.clear();
+                None => {
+                    if self.accept_control_byte(byte) {
+                        acks.push(ACK);
+                    }
                 }
             }
         }
@@ -156,28 +189,43 @@ impl ScpSink {
         (acks, done)
     }
 
+    fn finish_file(&mut self) -> CompletedFile {
+        let file = self.file.take().expect("file present");
+        file.into_completed(self.dirs.join("/"))
+    }
+
+    fn accept_control_byte(&mut self, byte: u8) -> bool {
+        match byte {
+            b'\n' => {
+                let line = std::mem::take(&mut self.buf);
+                self.handle_control(&line);
+                true
+            }
+            b'\r' => false,
+            _ if self.buf.len() < MAX_CONTROL_LINE => {
+                self.buf.push(byte);
+                false
+            }
+            _ => {
+                self.buf.clear();
+                self.dirs.clear();
+                false
+            }
+        }
+    }
+
     fn handle_control(&mut self, line: &[u8]) {
         let text = String::from_utf8_lossy(line);
-        let mut chars = text.chars();
-        match chars.next() {
+        match text.chars().next() {
             Some('C') => {
-                if let Some((mode, size, name)) = parse_cd(&text) {
-                    self.file = Some(Incoming {
-                        name,
-                        mode,
-                        size,
-                        remaining: size,
-                        data: Vec::new(),
-                        hasher: Sha256::new(),
-                        truncated: false,
-                    });
+                if let Some(entry) = parse_cd(&text) {
+                    self.file = Some(Incoming::new(entry.name, entry.mode, entry.size));
                 }
             }
             Some('D') => {
-                const MAX_SCP_DEPTH: usize = 32;
-                if let Some((_, _, name)) = parse_cd(&text) {
+                if let Some(entry) = parse_cd(&text) {
                     if self.dirs.len() < MAX_SCP_DEPTH {
-                        self.dirs.push(name);
+                        self.dirs.push(entry.name);
                     }
                 }
             }
@@ -190,22 +238,30 @@ impl ScpSink {
     }
 }
 
-fn parse_cd(line: &str) -> Option<(u32, u64, String)> {
-    let mut it = line.splitn(3, ' ');
-    let mode_field = it.next()?;
-    let size_field = it.next()?;
-    let raw_name = it.next()?.trim().to_string();
+fn parse_cd(line: &str) -> Option<ControlEntry> {
+    let mut fields = line.splitn(3, ' ');
+    let mode_field = fields.next()?;
+    let size_field = fields.next()?;
+    let raw_name = fields.next()?.trim();
     let mode = u32::from_str_radix(mode_field.get(1..)?, 8).ok()?;
     let size = size_field.parse::<u64>().ok()?;
+    Some(ControlEntry {
+        mode,
+        size,
+        name: sanitize_file_name(raw_name),
+    })
+}
 
-    let stripped: String = raw_name.chars().filter(|c| !c.is_control()).collect();
-    let name = stripped.replace(['/', '\\'], "_").replace("..", "_");
-    let name = if name.is_empty() {
-        "unnamed".to_string()
+fn sanitize_file_name(raw_name: &str) -> String {
+    let without_controls: String = raw_name.chars().filter(|c| !c.is_control()).collect();
+    let name = without_controls
+        .replace(['/', '\\'], "_")
+        .replace("..", "_");
+    if name.is_empty() {
+        UNNAMED_FILE.to_string()
     } else {
         name
-    };
-    Some((mode, size, name))
+    }
 }
 
 #[cfg(test)]
@@ -331,7 +387,7 @@ mod tests {
         ];
         for (raw, expected) in cases {
             let line = format!("C0644 1 {raw}");
-            let (_, _, name) = parse_cd(&line).expect("control line parses");
+            let name = parse_cd(&line).expect("control line parses").name;
             assert_eq!(name, expected, "raw={raw:?}");
         }
     }
