@@ -9,11 +9,16 @@
 
 use super::CommandResult;
 use crate::clock;
-use crate::shell::{Pending, Shell};
+use crate::shell::Shell;
 use crate::vfs::snapshot::{USR_BIN, USR_SBIN};
 
+mod interpreter;
+mod privilege;
 mod process;
 mod top;
+
+pub use interpreter::{scp, shell_cmd};
+pub use privilege::{su, sudo};
 
 pub use process::{kill, pkill, process_name, process_pid, process_table, ps};
 pub use top::{top, TopScreen};
@@ -185,117 +190,6 @@ pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     ))
 }
 
-/// `bash`/`sh` — the shell this session already claims to be.
-///
-/// Three ways a payload arrives, all of which now run:
-///
-/// - `-c LINE`, the classic `sh -c "cd /tmp; wget ...; ./x"`;
-/// - piped stdin, which is what `... | base64 -d | sh` and `curl ... | sh`
-///   produce — the single most common staging idiom there is;
-/// - a script operand, read back out of the VFS, which is what the
-///   `wget`-then-`chmod +x`-then-run sequence ends in.
-///
-/// Each line of a script or of stdin is run through the same shell that would
-/// have run it interactively, so the nesting cap and the output cap apply
-/// exactly as they do everywhere else.
-pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-c" => {
-                let Some(line) = iter.next() else {
-                    return CommandResult::err("bash: -c: option requires an argument\n", 2);
-                };
-                let argv = shell.parse_line(line);
-                if argv.is_empty() {
-                    return CommandResult::ok("");
-                }
-                return super::dispatch(shell, &argv);
-            }
-            // Interactive/login flags change nothing here.
-            "-i" | "-l" | "-s" | "--login" | "-" => {}
-            other if other.starts_with('-') => {}
-            // A script operand: read it out of the VFS and run it.
-            other => {
-                let Some(id) = shell.vfs.resolve(shell.cwd, other) else {
-                    return CommandResult::err(
-                        format!("bash: {other}: No such file or directory\n"),
-                        127,
-                    );
-                };
-                let Some(bytes) = shell.vfs.node(id).file_bytes() else {
-                    return CommandResult::err(format!("bash: {other}: Is a directory\n"), 126);
-                };
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                return run_script(shell, &text);
-            }
-        }
-    }
-
-    // No `-c` and no operand: a real shell reads its stdin. Over a pipe that is
-    // the payload; with no pipe there is nothing to read and it exits.
-    match shell.stdin.clone() {
-        Some(text) if !text.trim().is_empty() => run_script(shell, &text),
-        _ => CommandResult::ok(""),
-    }
-}
-
-/// How many lines of a script or of piped stdin `sh` will run.
-///
-/// The output cap alone does not bound this: a script of a million `true` lines
-/// produces nothing to truncate and still costs a parse per line. A VFS file
-/// can hold 8 MiB, so without a line cap an attacker buys arbitrary CPU for one
-/// upload.
-const MAX_SCRIPT_LINES: usize = 4096;
-
-/// Run each line of `text` as a shell command, accumulating both streams.
-///
-/// This is what makes a dropped script observable: the download was already
-/// captured, but until the body actually ran, nothing downstream of it — the
-/// second-stage fetch, the persistence attempt, the credential change — was
-/// ever seen.
-fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
-    let mut out = String::new();
-    let mut errs = String::new();
-    let mut status = 0;
-    // `Shell::execute` clears `captures` on entry, so each line would otherwise
-    // wipe the one before it — a script that fetched two payloads would log
-    // only the second. Accumulate across the whole body and hand the lot back,
-    // the way command substitution already does for its subshell.
-    let mut collected = std::mem::take(&mut shell.captures);
-
-    for line in text.lines().take(MAX_SCRIPT_LINES) {
-        let line = line.trim();
-        // Shebangs and comments are not commands.
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let result = shell.execute(line);
-        // The network layer logs a `command` event per line the *client*
-        // submits, and these lines came from a file. Capturing each one is what
-        // makes a dropped script observable rather than just its side effects.
-        collected.push(crate::shell::Capture::ScriptCommand {
-            line: line.to_string(),
-            status: result.status,
-        });
-        collected.append(&mut shell.captures);
-        // `stdout` is the pipe view and `text` the terminal-combined one; a
-        // script's output is going onward as a stream, so only the former.
-        out.push_str(&result.stdout);
-        errs.push_str(&result.stderr);
-        status = result.status;
-        if result.exit {
-            break;
-        }
-        // Bounded like every other accumulated stream.
-        if out.len() + errs.len() > super::MAX_COMMAND_OUTPUT_BYTES {
-            break;
-        }
-    }
-    shell.captures = collected;
-    CommandResult::streams(out, errs, status)
-}
-
 /// `printf FORMAT [ARG]...`
 ///
 /// Scripts reach for `printf` wherever `echo`'s portability is in doubt, which
@@ -355,165 +249,6 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
         }
     }
     CommandResult::ok(out)
-}
-
-/// `scp` run as an interactive command.
-///
-/// The binary has to exist — uploads to this host succeed, which means the
-/// server side runs `scp -t` — but an interactive copy would need a real
-/// network, so it fails as a refused connection — a "timed out" that returns
-/// instantly would be a tell in itself. Transfer mode (`-t`/`-f`) never reaches
-/// this handler: the SSH layer intercepts it before the shell sees it.
-pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
-    let operands: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    if operands.len() < 2 {
-        return CommandResult::err(
-            "usage: scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n           \
-             [-i identity_file] [-J destination] [-l limit] [-o ssh_option]\n           \
-             [-P port] [-S program] [-X sftp_option] source ... target\n",
-            1,
-        );
-    }
-
-    // A `host:path` operand means a real connection, which this host will never
-    // make. It fails as a refused connection rather than a timeout: a timeout
-    // that returns instantly is itself a tell.
-    if let Some(host) = operands.iter().find_map(|op| {
-        op.split_once(':')
-            .map(|(h, _)| h.rsplit('@').next().unwrap_or(h))
-            .filter(|h| !h.is_empty())
-    }) {
-        return CommandResult::err(
-            format!("ssh: connect to host {host} port 22: Connection refused\nlost connection\n"),
-            1,
-        );
-    }
-
-    // Purely local operands: real scp just copies, so let `cp` do it.
-    let argv: Vec<String> = std::iter::once("cp".to_string())
-        .chain(operands.into_iter().cloned())
-        .collect();
-    super::dispatch(shell, &argv)
-}
-
-/// `sudo [-u USER] [-l] [-i | -s] COMMAND [ARG]...`
-///
-/// The honeypot never gates this on a real password: the attacker's session
-/// credentials were already accepted at login, and `id` already reports
-/// membership in the `sudo` group, so denying here would be an inconsistent
-/// tell for no forensic benefit. Elevation only lasts for the wrapped
-/// command; the caller's uid/gid are restored afterward.
-///
-/// `-i` and `-s` with no command are the exception: they are the two common
-/// ways an attacker asks for a root *shell*, so they switch the session's
-/// identity for good, the way [`su`] does. `-i` is a login shell (root's
-/// environment and home); `-s` keeps the directory the caller was in.
-pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
-    let mut login_shell = false;
-    let mut keep_cwd = false;
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.peek() {
-        match arg.as_str() {
-            "-i" | "--login" => {
-                login_shell = true;
-                iter.next();
-            }
-            "-s" | "--shell" => {
-                login_shell = true;
-                keep_cwd = true;
-                iter.next();
-            }
-            "-l" | "--list" => {
-                return CommandResult::ok(format!(
-                    "Matching Defaults entries for {user} on {host}:\n    env_reset, mail_badpass, secure_path=/usr/local/sbin\\:/usr/local/bin\\:/usr/sbin\\:/usr/bin\\:/sbin\\:/bin\n\nUser {user} may run the following commands on {host}:\n    (ALL : ALL) ALL\n",
-                    user = shell.username,
-                    host = shell.hostname,
-                ));
-            }
-            "-u" => {
-                iter.next();
-                iter.next(); // consume the target username
-            }
-            other if other.starts_with('-') => {
-                iter.next();
-            }
-            _ => break,
-        }
-    }
-    let rest: Vec<String> = iter.cloned().collect();
-    if rest.is_empty() && login_shell {
-        // A root shell for the rest of the session. `-i` is a login shell, so
-        // the switch is all of it. `-s` is not: Debian's sudoers resets the
-        // environment but does not set `always_set_home`, so the caller keeps
-        // their directory and `$HOME` and only the identity changes.
-        let (cwd, home) = (shell.cwd, shell.home);
-        shell.switch_user("root");
-        if keep_cwd {
-            shell.cwd = cwd;
-            shell.prev_cwd = cwd;
-            shell.home = home;
-            let (pwd, home) = (shell.vfs.path_of(cwd), shell.vfs.path_of(home));
-            shell.env.set("PWD", &pwd);
-            shell.env.set("HOME", &home);
-        }
-        return CommandResult::empty();
-    }
-    if rest.is_empty() {
-        return CommandResult::err(
-            "usage: sudo -h | -K | -k | -V\n\
-             usage: sudo -v [-ABkNnS] [-g group] [-h host] [-p prompt] [-u user]\n\
-             usage: sudo -l [-ABkNnS] [-g group] [-h host] [-p prompt] [-U user] [-u user] [command]\n\
-             usage: sudo [-ABbEHknPS] [-r role] [-t type] [-C fd] [-D directory] [-g group] [-h host] [-p prompt] [-T timeout] [-u user] [VAR=value] [-i | -s] [<command>]\n",
-            1,
-        );
-    }
-    let (uid, gid) = (shell.uid, shell.gid);
-    shell.uid = 0;
-    shell.gid = 0;
-    let result = super::dispatch(shell, &rest);
-    shell.uid = uid;
-    shell.gid = gid;
-    result
-}
-
-/// `su [-] [USER]`
-///
-/// Switches the session's effective identity, as a fresh login shell for
-/// `USER` (root if omitted). Root may switch to any account with no password,
-/// exactly like real `su`; a non-root user is prompted for the target's
-/// password first. The honeypot does not gate the switch on a correct password
-/// (the attacker already authenticated over SSH, and denying here yields no
-/// forensic benefit) — but the attempted password *is* captured, and the
-/// realistic `Password:` prompt removes the "instant, password-less root" tell.
-///
-/// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
-/// identity; add transient (non-persistent) elevation if that distinction
-/// ever matters for captured sessions.
-pub fn su(shell: &mut Shell, args: &[String]) -> CommandResult {
-    let mut target: Option<&str> = None;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-c" | "--command" | "-s" | "--shell" | "-g" | "--group" => {
-                iter.next(); // takes a value; accepted, ignored
-            }
-            other if other.starts_with('-') => {} // "-", "-l", "--login", ...: accepted, no-op
-            other => target = Some(other),
-        }
-    }
-    let target = target.unwrap_or("root").to_string();
-
-    // Root switches identity without a password, like real `su`.
-    if shell.uid == 0 {
-        shell.switch_user(&target);
-        return CommandResult::empty();
-    }
-
-    // A non-root user must be prompted for the target's password. Defer the
-    // switch: the network layer collects the password line (echo suppressed)
-    // and calls `Shell::resume`, which captures it and performs the switch.
-    shell.pending = Some(Pending::SuPassword { target });
-    CommandResult::ok("Password: ")
 }
 
 /// `echo [-ne] [STRING]...`

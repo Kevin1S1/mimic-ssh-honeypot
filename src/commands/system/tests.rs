@@ -99,11 +99,11 @@ fn a_self_running_script_hits_the_nesting_cap() {
 #[test]
 fn a_script_runs_at_most_the_line_cap() {
     let mut shell = Shell::new("root", "debian");
-    let body = "echo x\n".repeat(super::MAX_SCRIPT_LINES + 500);
+    let body = "echo x\n".repeat(super::interpreter::MAX_SCRIPT_LINES + 500);
     let out = shell.execute(&format!("printf '%s' '{body}' | sh"));
     assert_eq!(
         out.stdout.matches('x').count(),
-        super::MAX_SCRIPT_LINES,
+        super::interpreter::MAX_SCRIPT_LINES,
         "line cap not applied"
     );
 }
