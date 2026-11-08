@@ -5,11 +5,9 @@ use crate::persona::MemStats;
 use crate::shell::{Screen, Shell};
 
 const CPU_SUMMARY: &str =
-    "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st
-";
-const COLUMN_HEADER: &str = "
-    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
-";
+    "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n";
+const COLUMN_HEADER: &str =
+    "\n    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n";
 
 fn mib(kb: u64) -> f64 {
     kb as f64 / 1024.0
@@ -44,16 +42,14 @@ impl TopScreen {
         out.push_str(CPU_SUMMARY);
         let m = &self.mem;
         out.push_str(&format!(
-            "MiB Mem : {:>8.1} total, {:>8.1} free, {:>8.1} used, {:>8.1} buff/cache
-",
+            "MiB Mem : {:>8.1} total, {:>8.1} free, {:>8.1} used, {:>8.1} buff/cache\n",
             mib(m.total),
             mib(m.free),
             mib(m.used),
             mib(m.buff_cache)
         ));
         out.push_str(&format!(
-            "MiB Swap: {:>8.1} total, {:>8.1} free, {:>8.1} used. {:>8.1} avail Mem
-",
+            "MiB Swap: {:>8.1} total, {:>8.1} free, {:>8.1} used. {:>8.1} avail Mem\n",
             0.0,
             0.0,
             0.0,
