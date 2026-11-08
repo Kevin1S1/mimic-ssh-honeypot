@@ -2,7 +2,7 @@
 //! `env`, `export`, `unset`, `clear`, plus process-table emulation (`ps`,
 //! `top`, `kill`, `free`, `uptime`).
 //!
-//! There is no real process table â€” every row is fabricated from a static base
+//! There is no real process table — every row is fabricated from a static base
 //! plus the session's own fake shell PID. `kill` never signals anything; it
 //! only validates the target PID against the fake table and returns the message
 //! a real shell would.
@@ -142,12 +142,12 @@ pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.hostname))
 }
 
-/// `nproc` â€” matches the single-core `/proc/cpuinfo` snapshot.
+/// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
 pub fn nproc(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.persona.cpu_cores))
 }
 
-/// `lscpu` â€” describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
+/// `lscpu` — describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
 /// from the deployment persona so the three cannot drift apart.
 pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     let p = &shell.persona;
@@ -185,13 +185,13 @@ pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     ))
 }
 
-/// `bash`/`sh` â€” the shell this session already claims to be.
+/// `bash`/`sh` — the shell this session already claims to be.
 ///
 /// Three ways a payload arrives, all of which now run:
 ///
 /// - `-c LINE`, the classic `sh -c "cd /tmp; wget ...; ./x"`;
 /// - piped stdin, which is what `... | base64 -d | sh` and `curl ... | sh`
-///   produce â€” the single most common staging idiom there is;
+///   produce — the single most common staging idiom there is;
 /// - a script operand, read back out of the VFS, which is what the
 ///   `wget`-then-`chmod +x`-then-run sequence ends in.
 ///
@@ -251,15 +251,15 @@ const MAX_SCRIPT_LINES: usize = 4096;
 /// Run each line of `text` as a shell command, accumulating both streams.
 ///
 /// This is what makes a dropped script observable: the download was already
-/// captured, but until the body actually ran, nothing downstream of it â€” the
-/// second-stage fetch, the persistence attempt, the credential change â€” was
+/// captured, but until the body actually ran, nothing downstream of it — the
+/// second-stage fetch, the persistence attempt, the credential change — was
 /// ever seen.
 fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
     let mut out = String::new();
     let mut errs = String::new();
     let mut status = 0;
     // `Shell::execute` clears `captures` on entry, so each line would otherwise
-    // wipe the one before it â€” a script that fetched two payloads would log
+    // wipe the one before it — a script that fetched two payloads would log
     // only the second. Accumulate across the whole body and hand the lot back,
     // the way command substitution already does for its subshell.
     let mut collected = std::mem::take(&mut shell.captures);
@@ -359,9 +359,9 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
 
 /// `scp` run as an interactive command.
 ///
-/// The binary has to exist â€” uploads to this host succeed, which means the
-/// server side runs `scp -t` â€” but an interactive copy would need a real
-/// network, so it fails as a refused connection â€” a "timed out" that returns
+/// The binary has to exist — uploads to this host succeed, which means the
+/// server side runs `scp -t` — but an interactive copy would need a real
+/// network, so it fails as a refused connection — a "timed out" that returns
 /// instantly would be a tell in itself. Transfer mode (`-t`/`-f`) never reaches
 /// this handler: the SSH layer intercepts it before the shell sees it.
 pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
@@ -483,7 +483,7 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
 /// exactly like real `su`; a non-root user is prompted for the target's
 /// password first. The honeypot does not gate the switch on a correct password
 /// (the attacker already authenticated over SSH, and denying here yields no
-/// forensic benefit) â€” but the attempted password *is* captured, and the
+/// forensic benefit) — but the attempted password *is* captured, and the
 /// realistic `Password:` prompt removes the "instant, password-less root" tell.
 ///
 /// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
@@ -573,7 +573,7 @@ fn interpret_escapes(s: &str) -> (String, bool) {
             // ones; with no digits at all both are the character itself.
             // ponytail: a command's output is a `String`, so a code above 127
             // becomes that Unicode scalar's UTF-8 bytes where real echo writes
-            // the single byte â€” `echo -e '\xff' | wc -c` reads 3, not 2.
+            // the single byte — `echo -e '\xff' | wc -c` reads 3, not 2.
             // Upgrade when command output becomes a byte buffer.
             Some('0') => out.push(take_code(&mut chars, 8, 3).unwrap_or('\0')),
             Some('x') => match take_code(&mut chars, 16, 2) {
@@ -653,7 +653,7 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let giga = args.iter().any(|a| a == "-g");
 
     // Base figures in KiB, matching `/proc/meminfo` and `top`'s header. The
-    // columns must add up â€” `total = used + free + buff/cache` is what a real
+    // columns must add up — `total = used + free + buff/cache` is what a real
     // `free` prints, and a row that doesn't balance is arithmetic anyone can
     // check in one command.
     // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
@@ -741,7 +741,7 @@ pub const BUILTINS: &[&str] = &[
     "cd", "export", "unset", "history", "exit", "logout", "alias", "source",
 ];
 
-/// `history` â€” print the session's command history, bash-style.
+/// `history` — print the session's command history, bash-style.
 pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
     if args.iter().any(|a| a == "-c") {
         shell.history.clear();
@@ -777,7 +777,7 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
 
 /// Resolve a known command name to the absolute path `which` would print, or
 /// `None` if it is not a recognised external binary. Resolves against the
-/// listed set (`USR_BIN`/`USR_SBIN` â€” the same names `ls /usr/bin` shows),
+/// listed set (`USR_BIN`/`USR_SBIN` — the same names `ls /usr/bin` shows),
 /// not the runnable registry, so `which gzip` finds it even though `gzip`
 /// isn't wired into `commands::dispatch`.
 fn binary_path(name: &str) -> Option<String> {
@@ -793,7 +793,7 @@ fn binary_path(name: &str) -> Option<String> {
     }
 }
 
-/// `w` â€” who is logged on and what they are doing. A single fabricated session
+/// `w` — who is logged on and what they are doing. A single fabricated session
 /// for the current user; other connections are never revealed.
 pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     let header = format!(" {}\n", clock::uptime_banner());
@@ -807,7 +807,7 @@ pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{header}{cols}{row}"))
 }
 
-/// `last` â€” listing of recent logins. Fabricated, but anchored to the same
+/// `last` — listing of recent logins. Fabricated, but anchored to the same
 /// boot and previous-login instants PAM's `Last login` banner reports, so the
 /// two cannot contradict each other.
 pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
@@ -837,7 +837,7 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
 pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
     // Every tmpfs size is derived from the persona's `MemTotal` the way the
-    // kernel and systemd size them â€” devtmpfs and /dev/shm at half of RAM,
+    // kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
     // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
     // `free` reports is a two-command honeypot check.
     let mem = shell.persona.mem_total_kb;
@@ -891,7 +891,7 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `mount` â€” print the (fabricated) mount table.
+/// `mount` — print the (fabricated) mount table.
 pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
         proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
@@ -927,7 +927,7 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// `groups [USER]...` â€” the group memberships mirrored from `id`.
+/// `groups [USER]...` — the group memberships mirrored from `id`.
 pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     let line = if shell.uid == 0 {
         "root".to_string()
@@ -937,17 +937,17 @@ pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{line}\n"))
 }
 
-/// `arch` â€” machine hardware name, matching `uname -m`.
+/// `arch` — machine hardware name, matching `uname -m`.
 pub fn arch(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{MACHINE}\n"))
 }
 
-/// `tty` â€” the pseudo-terminal this session runs on (matches `ps`/`w`).
+/// `tty` — the pseudo-terminal this session runs on (matches `ps`/`w`).
 pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("/dev/pts/0\n")
 }
 
-/// `lsb_release [-a|-s|-i|-d|-r|-c]` â€” Debian 12 (bookworm) release info.
+/// `lsb_release [-a|-s|-i|-d|-r|-c]` — Debian 12 (bookworm) release info.
 ///
 /// A near-universal fingerprinting step in automated recon; the values match
 /// the `/etc/os-release` snapshot the VFS presents.
@@ -1028,7 +1028,7 @@ const DMESG_BUFFER: &str = "\
 [    2.310000] e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex\n\
 [    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
 
-/// `dmesg` â€” the kernel ring buffer.
+/// `dmesg` — the kernel ring buffer.
 ///
 /// Debian 12 ships `kernel.dmesg_restrict=1`, so an unprivileged user gets a
 /// permission error; only root sees the (fabricated) buffer.
@@ -1042,7 +1042,7 @@ pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(DMESG_BUFFER)
 }
 
-/// `date [-u] [+FORMAT]` â€” the current UTC time.
+/// `date [-u] [+FORMAT]` — the current UTC time.
 ///
 /// The emulated host runs in UTC, so the `-u` flag is a no-op. Setting the
 /// clock (`date MMDDhhmm...`) would require root and is accepted as a no-op
