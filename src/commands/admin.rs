@@ -1,16 +1,6 @@
-//! Persistence, account, and service commands.
-//!
-//! What an automated intrusion does *after* it lands. `echo 'root:pass' |
-//! chpasswd` is the single most common post-access action in SSH botnet
-//! telemetry, `systemctl` is how persistence gets probed, and `sleep` appears in
-//! nearly every staging script. None of these touch the real OS: accounts live
-//! in the session's `/etc/passwd`, services in a fabricated unit table, and
-//! `sleep` returns immediately rather than holding a connection slot.
-
 use super::CommandResult;
 use crate::shell::Shell;
 
-/// Read a VFS file as text, or an empty string when it is missing.
 fn read_text(shell: &Shell, path: &str) -> String {
     shell
         .vfs
@@ -25,7 +15,6 @@ fn read_text(shell: &Shell, path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Replace a VFS file's contents, creating it if needed.
 fn write_text(shell: &mut Shell, path: &str, text: &str) -> bool {
     let Some((parent, name)) = super::fs::resolve_parent(shell, path) else {
         return false;
@@ -45,17 +34,6 @@ fn write_text(shell: &mut Shell, path: &str, text: &str) -> bool {
     }
 }
 
-/// `sleep NUMBER[SUFFIX]...`
-///
-/// Returns immediately rather than actually waiting. A honeypot that honoured
-/// `sleep 3600` would hold a connection slot for an hour on the attacker's say-so
-/// — the sleep is exactly the resource-exhaustion primitive the session caps
-/// exist to prevent. The exit status and (absent) output are identical either
-/// way, so the only thing an attacker can observe is elapsed wall time.
-///
-/// ponytail: returns instantly, so timing a `sleep` against the clock detects
-/// it. Upgrade when sleeps can be charged against the session deadline rather
-/// than a real timer.
 pub fn sleep(_shell: &Shell, args: &[String]) -> CommandResult {
     if args.is_empty() {
         return CommandResult::err(
@@ -72,11 +50,6 @@ pub fn sleep(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// Replace `user`'s `/etc/shadow` entry with a crypt-shaped placeholder.
-///
-/// The plaintext never reaches the VFS: it is captured as forensic data and
-/// logged, so a later `cat /etc/shadow` shows what a real one would show rather
-/// than handing the attacker back their own secret.
 pub fn set_shadow_entry(shell: &mut Shell, user: &str) {
     let shadow = read_text(shell, "/etc/shadow");
     let prefix = format!("{user}:");
@@ -94,12 +67,6 @@ pub fn set_shadow_entry(shell: &mut Shell, user: &str) {
     write_text(shell, "/etc/shadow", &format!("{updated}\n"));
 }
 
-/// `passwd [USER]`
-///
-/// Prompts for the new secret the way the real thing does, twice. The shell's
-/// [`Pending`](crate::shell::Pending) mechanism collects both answers with echo
-/// suppressed — the same path `su` uses — and the second one is where the
-/// capture happens.
 pub fn passwd(shell: &mut Shell, args: &[String]) -> CommandResult {
     let target = args
         .iter()
@@ -126,11 +93,6 @@ pub fn passwd(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{banner}New password: "))
 }
 
-/// `chpasswd` — reads `user:password` lines from stdin.
-///
-/// The most common thing an SSH botnet does once it has a shell: lock the owner
-/// out by resetting the password. Captured as credential data, applied only to
-/// the session's own `/etc/shadow`.
 pub fn chpasswd(shell: &mut Shell, _args: &[String]) -> CommandResult {
     let input = shell.stdin.clone().unwrap_or_default();
     if input.trim().is_empty() {
@@ -163,7 +125,7 @@ pub fn chpasswd(shell: &mut Shell, _args: &[String]) -> CommandResult {
             status = 1;
             continue;
         }
-        // Forensic value is the plaintext, which the shell's capture path logs.
+
         shell.captures.push(crate::shell::Capture::PasswordChange {
             target: user.to_string(),
             password: password.to_string(),
@@ -173,7 +135,6 @@ pub fn chpasswd(shell: &mut Shell, _args: &[String]) -> CommandResult {
     CommandResult::streams(String::new(), errs, status)
 }
 
-/// `useradd [-m] [-s SHELL] [-u UID] USER`
 pub fn useradd(shell: &mut Shell, args: &[String]) -> CommandResult {
     if shell.uid != 0 {
         return CommandResult::err(
@@ -241,7 +202,6 @@ pub fn useradd(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `userdel [-r] USER`
 pub fn userdel(shell: &mut Shell, args: &[String]) -> CommandResult {
     if shell.uid != 0 {
         return CommandResult::err("userdel: Permission denied.\n", 1);
@@ -262,7 +222,6 @@ pub fn userdel(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `groupadd GROUP`
 pub fn groupadd(shell: &mut Shell, args: &[String]) -> CommandResult {
     if shell.uid != 0 {
         return CommandResult::err("groupadd: Permission denied.\n", 1);
@@ -285,9 +244,6 @@ pub fn groupadd(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// The service units this box claims to run. Chosen to match what the rest of
-/// the emulation already implies: an sshd is obviously running, and the others
-/// are the Debian 12 default set for a minimal cloud image.
 const UNITS: &[(&str, &str, &str)] = &[
     ("ssh.service", "OpenBSD Secure Shell server", "running"),
     (
@@ -317,16 +273,6 @@ const UNITS: &[(&str, &str, &str)] = &[
     ("getty@tty1.service", "Getty on tty1", "running"),
 ];
 
-/// `systemctl [SUBCOMMAND] [UNIT]`
-///
-/// Persistence probing goes through here: `systemctl enable`, then a unit file
-/// dropped into `/etc/systemd/system`. Mutating verbs report success — a
-/// refusal would end the interaction early and hide what the attacker meant to
-/// install — while the state they claim to change is not tracked.
-///
-/// ponytail: `enable`/`start` report success without changing `is-active`, so
-/// a follow-up `systemctl status` on an attacker's own unit contradicts the
-/// enable that preceded it. Upgrade when the unit table becomes session state.
 pub fn systemctl(shell: &Shell, args: &[String]) -> CommandResult {
     let operands: Vec<&str> = args
         .iter()
@@ -390,7 +336,7 @@ pub fn systemctl(shell: &Shell, args: &[String]) -> CommandResult {
             Some(_) => CommandResult::ok("enabled\n"),
             None => CommandResult::streams("disabled\n", "", 1),
         },
-        // Mutating verbs. Root-only, like the real thing.
+
         "start" | "stop" | "restart" | "reload" | "enable" | "disable" | "daemon-reload"
         | "mask" | "unmask" => {
             if shell.uid != 0 {
@@ -418,7 +364,6 @@ pub fn systemctl(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// `service NAME ACTION` — the SysV wrapper, which scripts still reach for.
 pub fn service(shell: &Shell, args: &[String]) -> CommandResult {
     let operands: Vec<&str> = args
         .iter()
@@ -436,18 +381,10 @@ pub fn service(shell: &Shell, args: &[String]) -> CommandResult {
         return CommandResult::err("Usage: service < option > | --status-all | [ service_name [ command | --full-restart ] ]\n", 1);
     }
     let (name, action) = (operands[0], operands[1]);
-    // `service x y` is a thin shim over systemctl on Debian 12.
+
     systemctl(shell, &[action.to_string(), name.to_string()])
 }
 
-/// `chattr [+-=]ATTR FILE...`
-///
-/// The immutable bit is a favourite persistence trick — `chattr +i` on a
-/// dropped binary or on `/etc/passwd` to stop cleanup. Accepted and reported as
-/// success; the attribute itself is not modelled.
-///
-/// ponytail: attributes are not stored, so `lsattr` never shows what `chattr`
-/// set. Upgrade when node metadata grows an attribute field.
 pub fn chattr(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, files): (Vec<&String>, Vec<&String>) =
         args.iter().partition(|a| a.starts_with(['+', '-', '=']));
@@ -470,7 +407,6 @@ pub fn chattr(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(String::new(), errs, status)
 }
 
-/// `lsattr [FILE]...`
 pub fn lsattr(shell: &Shell, args: &[String]) -> CommandResult {
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     let targets: Vec<String> = if files.is_empty() {
@@ -500,7 +436,6 @@ pub fn lsattr(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(out, errs, status)
 }
 
-/// `nohup COMMAND [ARG]...`
 pub fn nohup(shell: &mut Shell, args: &[String]) -> CommandResult {
     let argv: Vec<String> = args
         .iter()
@@ -511,7 +446,7 @@ pub fn nohup(shell: &mut Shell, args: &[String]) -> CommandResult {
         return CommandResult::err("nohup: missing operand\n", 125);
     }
     let mut result = super::dispatch(shell, &argv);
-    // Real nohup announces the redirect on stderr before the command runs.
+
     result.stderr.insert_str(
         0,
         "nohup: ignoring input and appending output to 'nohup.out'\n",
@@ -519,21 +454,14 @@ pub fn nohup(shell: &mut Shell, args: &[String]) -> CommandResult {
     result
 }
 
-/// `sync` — flush the (nonexistent) buffer cache.
-///
-/// Present because `/etc/passwd` gives the `sync` account `/bin/sync` as its
-/// login shell: a box that names a binary in a file an attacker reads and then
-/// cannot run it has contradicted itself.
 pub fn sync(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `nologin` — the shell `/etc/passwd` gives every system account.
 pub fn nologin(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::err("This account is currently not available.\n", 1)
 }
 
-/// `getent DATABASE [KEY]...`
 pub fn getent(shell: &Shell, args: &[String]) -> CommandResult {
     let operands: Vec<&str> = args
         .iter()
@@ -570,8 +498,6 @@ pub fn getent(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(out, String::new(), status)
 }
 
-/// `killall NAME...` and `pidof NAME` / `pgrep NAME`, over the same fabricated
-/// process table `ps` renders.
 pub fn killall(shell: &Shell, args: &[String]) -> CommandResult {
     let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     if names.is_empty() {
@@ -588,7 +514,6 @@ pub fn killall(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(String::new(), errs, status)
 }
 
-/// `pidof NAME`
 pub fn pidof(shell: &Shell, args: &[String]) -> CommandResult {
     let mut out = String::new();
     for n in args.iter().filter(|a| !a.starts_with('-')) {
@@ -602,7 +527,6 @@ pub fn pidof(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", out.trim_end()))
 }
 
-/// `pgrep [-l] PATTERN`
 pub fn pgrep(shell: &Shell, args: &[String]) -> CommandResult {
     let long = args.iter().any(|a| a == "-l" || a == "-a");
     let Some(pattern) = args.iter().find(|a| !a.starts_with('-')) else {
@@ -610,8 +534,6 @@ pub fn pgrep(shell: &Shell, args: &[String]) -> CommandResult {
     };
     let mut out = String::new();
     for (pid, name) in super::system::process_table(shell) {
-        // Real `pgrep` matches the executable name, not the whole command line,
-        // so it agrees with `pidof` about what `sshd: /usr/sbin/sshd …` is.
         if super::system::process_name(&name).contains(pattern.as_str()) {
             if long {
                 out.push_str(&format!("{pid} {name}\n"));
@@ -642,7 +564,6 @@ mod tests {
         assert!(run(&mut shell, "sleep abc").contains("invalid time interval"));
     }
 
-    /// The single most common post-access action in SSH botnet telemetry.
     #[test]
     fn chpasswd_locks_out_the_owner_and_captures_the_plaintext() {
         let mut shell = Shell::new("root", "debian");
@@ -655,7 +576,7 @@ mod tests {
             ),
             "the plaintext must be captured as forensic data"
         );
-        // The emulated shadow file changed, but never holds the plaintext.
+
         let shadow = run(&mut shell, "cat /etc/shadow");
         assert!(shadow.contains("root:$6$mimic$changed"), "{shadow}");
         assert!(
@@ -686,10 +607,10 @@ mod tests {
             passwd.contains("backdoor:x:1001:1001::/home/backdoor:/bin/bash"),
             "{passwd}"
         );
-        // The account is reachable the way a real one would be.
+
         assert!(run(&mut shell, "getent passwd backdoor").contains("backdoor"));
         assert!(run(&mut shell, "ls /home").contains("backdoor"));
-        // And adding it twice fails the way useradd does.
+
         let again = shell.execute("useradd backdoor");
         assert_eq!(again.status, 9);
     }
@@ -708,7 +629,7 @@ mod tests {
         assert!(run(&mut shell, "systemctl is-active ssh").starts_with("active"));
         assert!(run(&mut shell, "systemctl status ssh").contains("OpenBSD Secure Shell server"));
         assert!(run(&mut shell, "systemctl list-units").contains("cron.service"));
-        // An unknown unit fails the way systemd's does.
+
         let missing = shell.execute("systemctl status nosuchthing");
         assert_eq!(missing.status, 4);
         assert!(
@@ -753,8 +674,6 @@ mod tests {
         assert_eq!(missing.status, 1);
     }
 
-    /// `/etc/passwd` names both of these as login shells, so a box that cannot
-    /// run them contradicts a file every attacker reads.
     #[test]
     fn the_shells_etc_passwd_names_all_exist() {
         let mut shell = Shell::new("root", "debian");
@@ -769,15 +688,13 @@ mod tests {
     #[test]
     fn pidof_and_pgrep_agree_with_the_process_table() {
         let mut shell = Shell::new("root", "debian");
-        // sshd is in the fabricated table, so all three must find it.
+
         assert!(!run(&mut shell, "pidof sshd").trim().is_empty());
         assert!(!run(&mut shell, "pgrep sshd").trim().is_empty());
         let missing = shell.execute("pidof nosuchdaemon");
         assert_eq!(missing.status, 1);
     }
 
-    /// `passwd` prompts twice, like the real thing, and the plaintext is
-    /// captured on the second answer rather than written to the VFS.
     #[test]
     fn passwd_prompts_twice_and_captures_the_secret() {
         let mut shell = Shell::new("root", "debian");

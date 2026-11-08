@@ -1,32 +1,13 @@
-//! Security invariant test: the emulation layers must never touch the real OS.
-//!
-//! MIMIC's core safety guarantee is that the shell, virtual filesystem, and
-//! command implementations operate purely on in-memory state. Real process
-//! execution and real filesystem/network access are confined to the network
-//! layer (host-key persistence, upload quarantine). This test fails the build
-//! if any forbidden API leaks into an emulation-layer source file, turning the
-//! architectural invariant into an automatically enforced one.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Directories whose contents must be free of real-OS access.
 const EMULATION_DIRS: &[&str] = &["src/shell", "src/vfs", "src/commands"];
 
-/// Substrings that indicate a real process / filesystem / network escape.
-/// Chosen to be specific enough that they do not appear in ordinary prose
-/// comments.
 const FORBIDDEN: &[&str] = &[
     "std::process",
     "process::Command",
     "std::fs",
-    // A brace-grouped import defeats every `std::…` entry above:
-    // `use std::{fs, process};` contains neither `std::fs` nor `std::process`.
-    // Nothing in the emulation layers groups a `std` import today, so banning
-    // the form outright costs nothing and closes the hole permanently.
     "std::{",
-    // Reading the real process environment is host information leakage, which
-    // SECURITY.md puts in scope even though it is not a write.
     "std::env",
     "tokio::fs",
     "tokio::net",

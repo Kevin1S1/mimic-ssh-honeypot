@@ -1,64 +1,26 @@
-//! Per-deployment hardware identity.
-//!
-//! Every fact the emulated box reports about its hardware — machine id, memory
-//! size, CPU model, disk size, MAC address — used to be a compile-time constant.
-//! That made two things true at once: every MIMIC deployment was byte-identical
-//! to every other, and (once the source is public) the constants themselves are
-//! a published detection signature. `cat /etc/machine-id` was a single-command,
-//! zero-false-positive check for anyone who had read this file.
-//!
-//! A `Persona` fixes that by deriving those values from a seed. The seed comes
-//! from the sensor's own host key, so:
-//!
-//! - it is **stable across restarts**, the same property host-key persistence
-//!   already protects — a box whose RAM size changes every boot is a worse tell
-//!   than one that shares a constant with other installs; and
-//! - it is **different per sensor**, because no two deployments share a host
-//!   key, so two MIMIC instances no longer look like the same machine.
-//!
-//! Everything here is pure computation. The seed is derived in `src/network/`,
-//! which is the only layer permitted to read the key material it comes from.
-
-/// One deployment's fabricated hardware identity.
-///
-/// Every emulated command that reports a hardware fact reads it from here, so
-/// `/proc/cpuinfo`, `lscpu`, `nproc`, `/proc/meminfo`, `free`, `df`, `dmesg`
-/// and `ip addr` cannot drift apart the way independent constants would.
 #[derive(Debug, Clone)]
 pub struct Persona {
-    /// `/etc/machine-id` — 32 lowercase hex characters.
     pub machine_id: String,
-    /// `/proc/sys/kernel/random/boot_id` — a UUID, regenerated per boot on a
-    /// real box and therefore per process here.
+
     pub boot_id: String,
-    /// Total RAM in kB, as `/proc/meminfo` and `free` report it.
+
     pub mem_total_kb: u64,
-    /// Root filesystem size in 1K blocks, as `df` reports it.
+
     pub disk_total_kb: u64,
-    /// Online CPU count.
+
     pub cpu_cores: u32,
-    /// The CPU this box claims to be.
+
     pub cpu: CpuModel,
-    /// Primary interface MAC, shared by `ip addr` and `ip link`.
+
     pub mac: String,
-    /// Primary interface IPv4 address, in CIDR-less form.
+
     pub ipv4: String,
-    /// The /24 this box sits on, e.g. `10.0.0`.
+
     pub subnet: String,
-    /// This deployment's `/etc/ssh/*.pub` files, as `(filename, contents)`.
-    ///
-    /// These carry the **public** halves of the sensor's real host keys — the
-    /// same bytes every client is handed during the key exchange, so publishing
-    /// them in the emulated filesystem discloses nothing the handshake has not
-    /// already disclosed. Fabricating them instead would be the tell: an
-    /// attacker can compare the fingerprint their client just recorded against
-    /// what `ssh-keygen -lf` would report here. The private halves never leave
-    /// `src/network/`.
+
     pub host_keys: Vec<(String, String)>,
 }
 
-/// A plausible cloud/VM CPU, with the fields `/proc/cpuinfo` and `lscpu` need
-/// to agree on.
 #[derive(Debug, Clone, Copy)]
 pub struct CpuModel {
     pub name: &'static str,
@@ -73,8 +35,6 @@ pub struct CpuModel {
     pub bugs: &'static str,
 }
 
-/// The CPUs a deployment may claim. All are real parts commonly seen backing
-/// small cloud instances, so any one of them is unremarkable.
 const CPUS: &[CpuModel] = &[
     CpuModel {
         name: "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz",
@@ -126,21 +86,10 @@ const CPUS: &[CpuModel] = &[
     },
 ];
 
-/// Memory sizes a small VM plausibly has, in kB. Each is slightly under the
-/// round figure, the way a real `MemTotal` sits below installed RAM once the
-/// kernel and firmware have taken their reservations.
 const MEM_SIZES_KB: &[u64] = &[1009428, 2041208, 4025464, 8148304, 16373612];
 
-/// Root filesystem sizes in 1K blocks, matching common cloud root volumes
-/// (8/16/20/32/40/64 GB) after filesystem overhead.
 const DISK_SIZES_KB: &[u64] = &[8065444, 16197524, 20263528, 32441516, 40593708, 64891496];
 
-/// SplitMix64 — a small, well-distributed deterministic generator.
-///
-/// A fixed algorithm written out here rather than pulled from `rand`, because
-/// the values must stay identical across `rand` releases: a dependency bump
-/// that changed a sensor's memory size or MAC would be exactly the instability
-/// this type exists to avoid.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -152,8 +101,6 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    /// A value in `0..n`. `n` is always a small literal here, so the modulo
-    /// bias is far below anything observable.
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
@@ -169,10 +116,6 @@ impl SplitMix64 {
 }
 
 impl Persona {
-    /// Derive a deployment identity from `seed`.
-    ///
-    /// The same seed always yields the same persona, so a sensor keeps its
-    /// identity across restarts.
     pub fn from_seed(seed: u64) -> Self {
         let mut rng = SplitMix64(seed);
 
@@ -188,7 +131,7 @@ impl Persona {
         );
 
         let cpu = CPUS[rng.below(CPUS.len() as u64) as usize];
-        // Small instances are overwhelmingly 1-2 vCPU; 4 is the tail.
+
         let cpu_cores = match rng.below(10) {
             0..=4 => 1,
             5..=8 => 2,
@@ -197,8 +140,6 @@ impl Persona {
         let mem_total_kb = MEM_SIZES_KB[rng.below(MEM_SIZES_KB.len() as u64) as usize];
         let disk_total_kb = DISK_SIZES_KB[rng.below(DISK_SIZES_KB.len() as u64) as usize];
 
-        // Locally-administered unicast MAC, which is what every hypervisor
-        // hands a guest: low bit of the first octet clear, next bit set.
         let mac_tail = rng.hex(10);
         let first: u8 = (rng.below(64) as u8) << 2 | 0b10;
         let mac = format!(
@@ -211,8 +152,6 @@ impl Persona {
             &mac_tail[8..10]
         );
 
-        // An RFC 1918 address, drawn from the ranges cloud providers actually
-        // hand out so the box looks like it sits behind ordinary NAT.
         let (subnet, host) = match rng.below(3) {
             0 => (
                 format!("10.{}.{}", rng.below(256), rng.below(256)),
@@ -240,32 +179,23 @@ impl Persona {
         }
     }
 
-    /// Attach this deployment's public host-key files, as the network layer
-    /// reads them off the keys it is actually serving.
     pub fn with_host_keys(mut self, keys: Vec<(String, String)>) -> Self {
         self.host_keys = keys;
         self
     }
 
-    /// The persona used by tests and by any caller that has no seed.
-    ///
-    /// Production always derives one from the host key; this exists so unit
-    /// tests get stable, assertable values.
     pub fn sample() -> Self {
         Self::from_seed(0x5EED_1234_5678_9ABC)
     }
 
-    /// Bogomips as the kernel reports them: twice the clock, to two decimals.
     pub fn bogomips(&self) -> String {
         format!("{}.00", self.cpu.mhz * 2)
     }
 
-    /// The broadcast address for this box's /24.
     pub fn broadcast(&self) -> String {
         format!("{}.255", self.subnet)
     }
 
-    /// The default gateway for this box's /24, which is `.1` by convention.
     pub fn gateway(&self) -> String {
         format!("{}.1", self.subnet)
     }
@@ -294,8 +224,6 @@ mod tests {
 
     #[test]
     fn different_seeds_yield_different_identities() {
-        // The identity fields must actually vary: a persona that collapses to
-        // one value for every sensor is the constant it replaced.
         let ids: std::collections::BTreeSet<String> =
             (0..64).map(|s| Persona::from_seed(s).machine_id).collect();
         assert_eq!(ids.len(), 64, "machine ids must be distinct");
@@ -329,8 +257,6 @@ mod tests {
 
     #[test]
     fn mac_is_locally_administered_unicast() {
-        // Every hypervisor-assigned MAC has the locally-administered bit set
-        // and the multicast bit clear; a guest with a vendor OUI would be odd.
         for seed in 0..32 {
             let mac = Persona::from_seed(seed).mac;
             let first = u8::from_str_radix(&mac[0..2], 16).expect("hex octet");
@@ -352,7 +278,7 @@ mod tests {
                 || (octets[0] == 172 && (16..32).contains(&octets[1]))
                 || (octets[0] == 192 && octets[1] == 168);
             assert!(private, "ipv4={} is not RFC1918", p.ipv4);
-            // The host part must not collide with the gateway `.1`.
+
             assert!(octets[3] >= 4, "ipv4={}", p.ipv4);
         }
     }

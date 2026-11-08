@@ -1,29 +1,16 @@
-//! Connection limiting: a global concurrent-session cap and a per-source-IP
-//! concurrent-connection cap.
-//!
-//! Limits are enforced at TCP accept time — before the SSH handshake runs — so
-//! a flood of connections from a single host (or in aggregate) is shed cheaply
-//! without allocating crypto state. Each accepted connection holds a
-//! [`ConnectionGuard`] for its lifetime; the slot is released automatically when
-//! the guard is dropped (i.e. when the session ends, for any reason).
-
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Why a connection was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// The global concurrent-session cap (`max_sessions`) was reached.
     GlobalLimit,
-    /// The per-source-IP concurrent-connection cap (`per_ip_connections`) was
-    /// reached for this peer.
+
     PerIpLimit,
 }
 
 impl RejectReason {
-    /// A short, stable string for structured logs.
     pub fn as_str(self) -> &'static str {
         match self {
             RejectReason::GlobalLimit => "global_limit",
@@ -37,7 +24,6 @@ struct RegistryInner {
     per_ip: HashMap<IpAddr, usize>,
 }
 
-/// Tracks active connections and enforces the configured caps.
 pub struct ConnectionRegistry {
     inner: Mutex<RegistryInner>,
     total: AtomicUsize,
@@ -46,8 +32,6 @@ pub struct ConnectionRegistry {
 }
 
 impl ConnectionRegistry {
-    /// Build a registry enforcing `max_sessions` total and `per_ip` per source
-    /// IP. Both caps must be greater than zero (validated by config loading).
     pub fn new(max_sessions: usize, per_ip: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(RegistryInner::default()),
@@ -57,9 +41,6 @@ impl ConnectionRegistry {
         })
     }
 
-    /// Reserve a connection slot for `ip`. On success the returned guard must be
-    /// kept alive for the duration of the connection; dropping it frees the
-    /// slot. On failure the connection should be closed immediately.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionGuard, RejectReason> {
         if self
             .total
@@ -89,7 +70,6 @@ impl ConnectionRegistry {
         })
     }
 
-    /// Current number of active connections. Used by the limiter tests.
     #[allow(dead_code)]
     pub fn active(&self) -> usize {
         self.total.load(Ordering::Relaxed)
@@ -103,12 +83,11 @@ impl ConnectionRegistry {
                 inner.per_ip.remove(&ip);
             }
         }
-        drop(inner); // Drop mutex before updating atomic
+        drop(inner);
         self.total.fetch_sub(1, Ordering::Release);
     }
 }
 
-/// RAII handle for one reserved connection slot. Releasing happens on drop.
 pub struct ConnectionGuard {
     registry: Arc<ConnectionRegistry>,
     ip: IpAddr,
@@ -138,7 +117,7 @@ mod tests {
             reg.try_acquire(ip(1)),
             Err(RejectReason::PerIpLimit)
         ));
-        // A different IP is unaffected.
+
         let _c = reg.try_acquire(ip(2)).expect("other ip allowed");
         assert_eq!(reg.active(), 3);
     }
@@ -165,7 +144,7 @@ mod tests {
             ));
             assert_eq!(reg.active(), 1);
         }
-        // Guard dropped — the slot is free again.
+
         assert_eq!(reg.active(), 0);
         let _g = reg.try_acquire(ip(1)).expect("allowed after release");
         assert_eq!(reg.active(), 1);
@@ -177,8 +156,7 @@ mod tests {
         {
             let _g = reg.try_acquire(ip(1)).expect("allowed");
         }
-        // After the only connection from an IP closes, its bookkeeping entry is
-        // removed so the map cannot grow unbounded under scanning.
+
         assert_eq!(reg.inner.lock().unwrap().per_ip.len(), 0);
     }
 }

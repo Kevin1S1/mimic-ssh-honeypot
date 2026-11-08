@@ -1,20 +1,11 @@
-//! Shell environment variables.
-//!
-//! A small ordered map of variable names to values, seeded with the defaults a
-//! Debian login shell exports. Purely in-memory; nothing is read from the real
-//! process environment.
-
 use std::collections::BTreeMap;
 
-/// The set of environment variables for a single shell session.
 #[derive(Debug, Clone)]
 pub struct Env {
     vars: BTreeMap<String, String>,
 }
 
 impl Env {
-    /// Seed the default environment a Debian login shell would present for
-    /// `user` whose home directory is `home`.
     pub fn login(user: &str, home: &str, hostname: &str) -> Self {
         let mut vars = BTreeMap::new();
         vars.insert("USER".into(), user.into());
@@ -35,12 +26,10 @@ impl Env {
         Self { vars }
     }
 
-    /// Get a variable's value, if set.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.vars.get(key).map(String::as_str)
     }
 
-    /// Set (or overwrite) a variable.
     pub fn set(&mut self, key: &str, value: &str) {
         const MAX_ENV_VARS: usize = 256;
         const MAX_ENV_VALUE_LEN: usize = 4096;
@@ -51,12 +40,10 @@ impl Env {
         self.vars.insert(key.to_string(), value);
     }
 
-    /// Remove a variable, returning `true` if it existed.
     pub fn unset(&mut self, key: &str) -> bool {
         self.vars.remove(key).is_some()
     }
 
-    /// Iterate over all variables in sorted order.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.vars.iter()
     }

@@ -1,18 +1,6 @@
-//! Package-manager stubs: `apt`, `apt-get`, `dpkg`.
-//!
-//! These emulate the surface behaviour an attacker probes — update indexes,
-//! "install" packages, list installed ones — without any real package work.
-//! The package database is a static, read-only, in-memory table; no real
-//! process is ever spawned and no real path is ever touched.
-
 use super::CommandResult;
 use crate::shell::Shell;
 
-/// A handful of packages a base Debian 12 install ships, for `dpkg -l` and
-/// `apt list --installed`. Alphabetical by package name. The second group is
-/// the major contributors behind the `/usr/bin`/`/usr/sbin` density in
-/// `vfs::snapshot::USR_BIN`/`USR_SBIN` — `dpkg -l` has to agree that the
-/// packages behind those listed binaries are installed.
 const INSTALLED: &[(&str, &str, &str)] = &[
     ("adduser", "3.131", "add and remove users and groups"),
     (
@@ -122,7 +110,6 @@ const INSTALLED: &[(&str, &str, &str)] = &[
     ("xz-utils", "5.4.1-0.2", "XZ-format compression utilities"),
 ];
 
-/// `apt` / `apt-get`
 pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
     let sub = args
         .iter()
@@ -190,7 +177,6 @@ pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
                 .filter(|p| !INSTALLED.iter().any(|(n, _, _)| n == *p))
                 .collect();
             if !unknown.is_empty() {
-                // apt's progress chatter is stdout; every `E:` line is stderr.
                 let mut errs = String::new();
                 for pkg in &unknown {
                     errs.push_str(&format!("E: Unable to locate package {pkg}\n"));
@@ -239,7 +225,6 @@ pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// `dpkg`
 pub fn dpkg(_shell: &Shell, args: &[String]) -> CommandResult {
     let list = args.iter().any(|a| a == "-l" || a == "--list");
     let show = args.iter().position(|a| a == "-s" || a == "--status");
@@ -287,7 +272,6 @@ pub fn dpkg(_shell: &Shell, args: &[String]) -> CommandResult {
     )
 }
 
-/// Truncate a string to at most `max` chars (the `dpkg -l` description column).
 fn trunc(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }

