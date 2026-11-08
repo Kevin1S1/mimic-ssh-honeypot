@@ -1,12 +1,3 @@
-//! System and identity commands: `whoami`, `id`, `uname`, `hostname`, `echo`,
-//! `env`, `export`, `unset`, `clear`, plus process-table emulation (`ps`,
-//! `top`, `kill`, `free`, `uptime`).
-//!
-//! There is no real process table — every row is fabricated from a static base
-//! plus the session's own fake shell PID. `kill` never signals anything; it
-//! only validates the target PID against the fake table and returns the message
-//! a real shell would.
-
 use super::CommandResult;
 use crate::clock;
 use crate::shell::Shell;
@@ -27,19 +18,16 @@ fn is_root(shell: &Shell) -> bool {
     shell.uid == 0
 }
 
-/// Emulated kernel release (`uname -r`).
 const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
-/// Emulated kernel version (`uname -v`).
+
 const KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)";
-/// Emulated machine hardware name (`uname -m`).
+
 const MACHINE: &str = "x86_64";
 
-/// `whoami`
 pub fn whoami(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.username))
 }
 
-/// `id`
 pub fn id(shell: &Shell, _args: &[String]) -> CommandResult {
     let line = if shell.uid == 0 {
         "uid=0(root) gid=0(root) groups=0(root)\n".to_string()
@@ -54,7 +42,6 @@ pub fn id(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(line)
 }
 
-/// `uname [OPTION]...`
 pub fn uname(shell: &Shell, args: &[String]) -> CommandResult {
     let mut sysname = false;
     let mut nodename = false;
@@ -142,18 +129,14 @@ pub fn uname(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", parts.join(" ")))
 }
 
-/// `hostname`
 pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.hostname))
 }
 
-/// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
 pub fn nproc(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.persona.cpu_cores))
 }
 
-/// `lscpu` — describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
-/// from the deployment persona so the three cannot drift apart.
 pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     let p = &shell.persona;
     let cpu = &p.cpu;
@@ -190,10 +173,6 @@ pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     ))
 }
 
-/// `printf FORMAT [ARG]...`
-///
-/// Scripts reach for `printf` wherever `echo`'s portability is in doubt, which
-/// in practice means anywhere a payload builds a multi-line file.
 pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
     let Some(format) = args.first() else {
         return CommandResult::err("printf: usage: printf [-v var] format [arguments]\n", 2);
@@ -212,8 +191,7 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
                     'r' => out.push('\r'),
                     '0' => out.push('\0'),
                     '\\' => out.push('\\'),
-                    // An unknown escape is passed through as written, the way
-                    // bash's printf does rather than swallowing the backslash.
+
                     other => {
                         out.push('\\');
                         out.push(other);
@@ -251,7 +229,6 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `echo [-ne] [STRING]...`
 pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut no_newline = false;
     let mut interpret = false;
@@ -284,8 +261,6 @@ pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(text)
 }
 
-/// Interpret the backslash escapes `echo -e` understands. The flag is set by
-/// `\c`, which ends the output there and takes the trailing newline with it.
 fn interpret_escapes(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -304,18 +279,13 @@ fn interpret_escapes(s: &str) -> (String, bool) {
             Some('e') | Some('E') => out.push('\x1b'),
             Some('f') => out.push('\x0c'),
             Some('v') => out.push('\x0b'),
-            // `\0NNN` takes up to three octal digits, `\xHH` up to two hex
-            // ones; with no digits at all both are the character itself.
-            // ponytail: a command's output is a `String`, so a code above 127
-            // becomes that Unicode scalar's UTF-8 bytes where real echo writes
-            // the single byte — `echo -e '\xff' | wc -c` reads 3, not 2.
-            // Upgrade when command output becomes a byte buffer.
+
             Some('0') => out.push(take_code(&mut chars, 8, 3).unwrap_or('\0')),
             Some('x') => match take_code(&mut chars, 16, 2) {
                 Some(c) => out.push(c),
                 None => out.push_str("\\x"),
             },
-            // `\c` drops the rest of the output, trailing newline included.
+
             Some('c') => return (out, true),
             Some(other) => {
                 out.push('\\');
@@ -327,8 +297,6 @@ fn interpret_escapes(s: &str) -> (String, bool) {
     (out, false)
 }
 
-/// Read up to `max` digits in `radix` off `chars` and return the character
-/// they encode, or `None` if the next character is not a digit in that radix.
 fn take_code(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     radix: u32,
@@ -344,11 +312,10 @@ fn take_code(
         chars.next();
         digits += 1;
     }
-    // Every value a byte escape can name is a valid `char`.
+
     (digits > 0).then(|| char::from(value as u8))
 }
 
-/// `env` / `printenv`
 pub fn env(shell: &Shell, _args: &[String]) -> CommandResult {
     let mut out = String::new();
     for (key, value) in shell.env.iter() {
@@ -357,7 +324,6 @@ pub fn env(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `export [NAME=VALUE]...`
 pub fn export(shell: &mut Shell, args: &[String]) -> CommandResult {
     for arg in args {
         if let Some((name, value)) = arg.split_once('=') {
@@ -367,7 +333,6 @@ pub fn export(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `unset NAME...`
 pub fn unset(shell: &mut Shell, args: &[String]) -> CommandResult {
     for arg in args {
         shell.env.unset(arg);
@@ -375,33 +340,22 @@ pub fn unset(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `clear`
 pub fn clear(_shell: &Shell, _args: &[String]) -> CommandResult {
-    // ANSI: move cursor home, clear screen, clear scrollback.
     CommandResult::ok("\x1b[H\x1b[2J\x1b[3J")
 }
 
-/// `free [-h|-m|-g]`
 pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human");
     let mega = args.iter().any(|a| a == "-m");
     let giga = args.iter().any(|a| a == "-g");
 
-    // Base figures in KiB, matching `/proc/meminfo` and `top`'s header. The
-    // columns must add up — `total = used + free + buff/cache` is what a real
-    // `free` prints, and a row that doesn't balance is arithmetic anyone can
-    // check in one command.
-    // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
-    // left, exactly as procps derives them from `/proc/meminfo`.
-    // Derived from the persona's `MemTotal` with the same proportions
-    // `/proc/meminfo` uses, so the two agree for any deployment.
     let total = shell.persona.mem_total_kb;
     let free_mem = total * 73 / 100;
     let available = total * 86 / 100;
     let shared = 992u64;
-    // buff/cache = Buffers + Cached + SReclaimable.
+
     let buff = total * 13 / 1000 + total * 139 / 1000 + total * 20 / 1000;
-    // used is whatever is left, so the row balances by construction.
+
     let used = total.saturating_sub(free_mem).saturating_sub(buff);
 
     let fmt = |kb: u64| -> String {
@@ -438,7 +392,6 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// Human-readable size for `free -h` (Gi/Mi/Ki units).
 fn human_kib(kb: u64) -> String {
     let bytes = kb as f64 * 1024.0;
     const UNITS: [&str; 5] = ["B", "Ki", "Mi", "Gi", "Ti"];
@@ -451,32 +404,20 @@ fn human_kib(kb: u64) -> String {
     if unit == 0 {
         format!("{}B", value as u64)
     } else if value < 10.0 {
-        // procps only spends a decimal place where it buys precision: `1.9Gi`,
-        // but `992Ki` and `346Mi`. `992.0Ki` is a byte-for-byte mismatch.
         format!("{value:.1}{}", UNITS[unit])
     } else {
         format!("{value:.0}{}", UNITS[unit])
     }
 }
 
-/// `uptime`
 pub fn uptime(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!(" {}\n", clock::uptime_banner()))
 }
 
-// --- Reconnaissance commands ---------------------------------------------
-//
-// The first things an attacker runs after login. Their *absence* is itself a
-// tell, so each emulates plausible, internally consistent output. As with the
-// process table, all values are fabricated and static (or per-session) so no
-// real host detail and no other honeypot session is ever exposed.
-
-/// Shell builtins that `which` reports as not on the PATH.
 pub const BUILTINS: &[&str] = &[
     "cd", "export", "unset", "history", "exit", "logout", "alias", "source",
 ];
 
-/// `history` — print the session's command history, bash-style.
 pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
     if args.iter().any(|a| a == "-c") {
         shell.history.clear();
@@ -489,7 +430,6 @@ pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `which NAME...`
 pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
     if args.is_empty() {
         return CommandResult::empty();
@@ -498,23 +438,17 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut status = 0;
     for name in args {
         if BUILTINS.contains(&name.as_str()) {
-            status = 1; // builtins are not external binaries
+            status = 1;
         } else if let Some(path) = binary_path(name) {
             out.push_str(&format!("{path}\n"));
         } else {
             status = 1;
         }
     }
-    // A name that resolved still prints its path; `which` says nothing about
-    // the ones that did not, it only reports them in the exit status.
+
     CommandResult::streams(out, "", status)
 }
 
-/// Resolve a known command name to the absolute path `which` would print, or
-/// `None` if it is not a recognised external binary. Resolves against the
-/// listed set (`USR_BIN`/`USR_SBIN` — the same names `ls /usr/bin` shows),
-/// not the runnable registry, so `which gzip` finds it even though `gzip`
-/// isn't wired into `commands::dispatch`.
 fn binary_path(name: &str) -> Option<String> {
     if BUILTINS.contains(&name) {
         return None;
@@ -528,8 +462,6 @@ fn binary_path(name: &str) -> Option<String> {
     }
 }
 
-/// `w` — who is logged on and what they are doing. A single fabricated session
-/// for the current user; other connections are never revealed.
 pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     let header = format!(" {}\n", clock::uptime_banner());
     let cols = "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n";
@@ -542,9 +474,6 @@ pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{header}{cols}{row}"))
 }
 
-/// `last` — listing of recent logins. Fabricated, but anchored to the same
-/// boot and previous-login instants PAM's `Last login` banner reports, so the
-/// two cannot contradict each other.
 pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
     let (prev, prev_end) = clock::prev_login();
     let boot = clock::boot_time();
@@ -568,13 +497,9 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `df [-h]`
 pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
-    // Every tmpfs size is derived from the persona's `MemTotal` the way the
-    // kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
-    // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
-    // `free` reports is a two-command honeypot check.
+
     let mem = shell.persona.mem_total_kb;
     let disk = shell.persona.disk_total_kb;
     let udev = mem / 2 - 5270;
@@ -626,7 +551,6 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `mount` — print the (fabricated) mount table.
 pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
         proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
@@ -639,14 +563,11 @@ pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `crontab [-l|-e|-r]`
 pub fn crontab(shell: &Shell, args: &[String]) -> CommandResult {
     if args.iter().any(|a| a == "-l") {
         return CommandResult::err(format!("no crontab for {}\n", shell.username), 1);
     }
     if args.iter().any(|a| a == "-r" || a == "-e") {
-        // Removing/editing a non-existent crontab is a no-op / opens an editor;
-        // for an emulated session we simply report nothing.
         return CommandResult::empty();
     }
     CommandResult::err(
@@ -656,13 +577,10 @@ pub fn crontab(shell: &Shell, args: &[String]) -> CommandResult {
     )
 }
 
-/// Truncate `s` to at most `n` characters (ASCII usernames), for column
-/// alignment.
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// `groups [USER]...` — the group memberships mirrored from `id`.
 pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     let line = if shell.uid == 0 {
         "root".to_string()
@@ -672,20 +590,14 @@ pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{line}\n"))
 }
 
-/// `arch` — machine hardware name, matching `uname -m`.
 pub fn arch(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{MACHINE}\n"))
 }
 
-/// `tty` — the pseudo-terminal this session runs on (matches `ps`/`w`).
 pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("/dev/pts/0\n")
 }
 
-/// `lsb_release [-a|-s|-i|-d|-r|-c]` — Debian 12 (bookworm) release info.
-///
-/// A near-universal fingerprinting step in automated recon; the values match
-/// the `/etc/os-release` snapshot the VFS presents.
 pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
     let (mut want_i, mut want_d, mut want_r, mut want_c) = (false, false, false, false);
     let mut short = false;
@@ -701,13 +613,12 @@ pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
                     'd' => want_d = true,
                     'r' => want_r = true,
                     'c' => want_c = true,
-                    _ => {} // -v etc.: accepted, ignored
+                    _ => {}
                 }
             }
         }
     }
 
-    // Bare invocation or -a lists every field.
     let full = all || !(want_i || want_d || want_r || want_c);
     if full {
         want_i = true;
@@ -743,7 +654,6 @@ pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// A static kernel ring buffer for `dmesg`, shown only to root.
 const DMESG_BUFFER: &str = "\
 [    0.000000] Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n\
 [    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz-6.1.0-21-amd64 root=UUID=8f3a2b1c-4d5e-6f70-8192-a3b4c5d6e7f8 ro console=tty0 console=ttyS0,115200\n\
@@ -763,10 +673,6 @@ const DMESG_BUFFER: &str = "\
 [    2.310000] e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex\n\
 [    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
 
-/// `dmesg` — the kernel ring buffer.
-///
-/// Debian 12 ships `kernel.dmesg_restrict=1`, so an unprivileged user gets a
-/// permission error; only root sees the (fabricated) buffer.
 pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     if shell.uid != 0 {
         return CommandResult::err(
@@ -777,20 +683,11 @@ pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(DMESG_BUFFER)
 }
 
-/// `date [-u] [+FORMAT]` — the current UTC time.
-///
-/// The emulated host runs in UTC, so the `-u` flag is a no-op. Setting the
-/// clock (`date MMDDhhmm...`) would require root and is accepted as a no-op
-/// that echoes the current time back.
-///
-/// ponytail: read-only clock (uses the real host time, which is realistic for a
-/// live box); does not honour a `date STRING` set operand beyond echoing.
 pub fn date(_shell: &Shell, args: &[String]) -> CommandResult {
     let epoch = clock::now();
     let fmt = args
         .iter()
         .find_map(|a| a.strip_prefix('+'))
-        // Default C-locale form: `Wed Jul  8 12:34:56 UTC 2026`.
         .unwrap_or("%a %b %e %H:%M:%S %Z %Y");
     CommandResult::ok(format!("{}\n", clock::format(epoch, fmt)))
 }

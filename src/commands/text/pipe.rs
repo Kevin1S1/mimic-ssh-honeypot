@@ -6,7 +6,6 @@ const NEW_FILE_MODE: u32 = 0o644;
 const NO_SUCH_FILE: &str = "No such file or directory";
 const NO_SPACE: &str = "No space left on device";
 
-/// `tee [-a] FILE...` — copies stdin onward and into each named VFS file.
 pub fn tee(shell: &mut Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let append = has_flag_letter(&flags, 'a');
@@ -45,7 +44,6 @@ fn write_copy(
     }
 }
 
-/// `seq [FIRST [INCREMENT]] LAST`
 pub fn seq(_shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let nums: Vec<i64> = operands.iter().filter_map(|a| a.parse().ok()).collect();
@@ -60,8 +58,7 @@ pub fn seq(_shell: &Shell, args: &[String]) -> CommandResult {
     }
     let mut out = String::new();
     let mut i = first;
-    // Bounded like every other generated stream: `seq 1 100000000` must not
-    // become an unbounded allocation just because the arithmetic allows it.
+
     while (step > 0 && i <= last) || (step < 0 && i >= last) {
         out.push_str(&format!("{i}\n"));
         if out.len() > MAX_COMMAND_OUTPUT_BYTES {
@@ -72,10 +69,6 @@ pub fn seq(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `xargs [-n N] [COMMAND [ARG]...]`
-///
-/// Runs `COMMAND` with the whitespace-separated words of stdin appended, which
-/// is the shape every `find ... | xargs rm`-style one-liner takes.
 pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
     let (per_call, command) = parse_xargs_args(args);
 
@@ -92,8 +85,7 @@ pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
     for group in words.chunks(chunk) {
         let mut argv = command.clone();
         argv.extend(group.iter().cloned());
-        // Goes through `dispatch`, so the nesting cap bounds recursion here the
-        // same way it bounds `sudo` and `sh -c`.
+
         let result = crate::commands::dispatch(shell, &argv);
         out.push_str(&result.output);
         errs.push_str(&result.stderr);

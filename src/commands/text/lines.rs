@@ -4,7 +4,6 @@ use super::{has_flag_letter, newline_terminated, split_args, with_input};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
 
-/// `sort [-r] [-n] [-u] [FILE]...`
 pub fn sort(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let reverse = has_flag_letter(&flags, 'r');
@@ -38,7 +37,6 @@ fn numeric_key(line: &str) -> f64 {
     line.trim().parse().unwrap_or(f64::MIN)
 }
 
-/// `uniq [-c] [-d] [-u] [FILE]`
 pub fn uniq(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let count = has_flag_letter(&flags, 'c');
@@ -72,7 +70,6 @@ fn runs(text: &str) -> Vec<(&str, usize)> {
     runs
 }
 
-/// `rev [FILE]...`
 pub fn rev(shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     with_input(shell, "rev", &operands, |text| {
@@ -83,7 +80,6 @@ pub fn rev(shell: &Shell, args: &[String]) -> CommandResult {
     })
 }
 
-/// `nl [FILE]...` — number non-empty lines, as GNU `nl` does by default.
 pub fn nl(shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     with_input(shell, "nl", &operands, |text| {

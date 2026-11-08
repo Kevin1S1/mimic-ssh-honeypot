@@ -1,15 +1,3 @@
-//! Text-processing commands: the plumbing shell one-liners are made of.
-//!
-//! These exist because of what they unblock rather than what they do on their
-//! own. An automated intrusion almost never runs a bare command — it runs a
-//! pipeline, and a pipeline dies at its first `command not found`. The single
-//! most common payload-delivery idiom in SSH botnets is
-//! `echo <base64> | base64 -d | sh`, which needs exactly one of these to work
-//! before anything downstream of it can be observed.
-//!
-//! Purely in-memory, like every other command module: input comes from the VFS
-//! or the pipeline, never from a real file.
-
 use std::borrow::Cow;
 
 use super::{CommandResult, MAX_COMMAND_OUTPUT_BYTES};
@@ -52,15 +40,6 @@ fn stdin_text(shell: &Shell) -> String {
     shell.stdin.clone().unwrap_or_default()
 }
 
-/// Read the operands as files, or fall back to the pipeline's stdin when there
-/// are none — the convention every filter here follows, and what real
-/// coreutils does.
-///
-/// The text is capped at [`MAX_COMMAND_OUTPUT_BYTES`] before any filter sees
-/// it. Every command in this module is a transform whose result is capped at
-/// that same figure anyway, and several of them *inflate* their input
-/// (`base64` by 4/3, `sed` by the length of a replacement) — so bounding the
-/// input is what keeps the peak allocation bounded, not just the result.
 fn read_input(shell: &Shell, tool: &str, files: &[&str]) -> Result<String, CommandResult> {
     if files.is_empty() || files == ["-"] {
         let mut text = stdin_text(shell);
@@ -101,9 +80,6 @@ fn with_input(
     }
 }
 
-/// Cut `text` to [`MAX_COMMAND_OUTPUT_BYTES`] on a char boundary, silently —
-/// unlike the dispatch cap this is an *input* bound, so it must not inject a
-/// truncation notice into data a filter is about to transform.
 fn cap(text: &mut String) {
     if text.len() <= MAX_COMMAND_OUTPUT_BYTES {
         return;
@@ -115,8 +91,6 @@ fn cap(text: &mut String) {
     text.truncate(cut);
 }
 
-/// Split argv into flags and operands, treating everything after `--` as an
-/// operand.
 fn split_args(args: &[String]) -> (Vec<&str>, Vec<&str>) {
     let mut flags = Vec::new();
     let mut operands = Vec::new();
@@ -175,12 +149,10 @@ mod tests {
         assert_eq!(run(&mut shell, "echo aGVsbG8K | base64 -d"), "hello\n");
     }
 
-    /// The idiom this module exists for: a staged payload arriving encoded and
-    /// piped straight into a shell.
     #[test]
     fn the_base64_dropper_idiom_runs_end_to_end() {
         let mut shell = Shell::new("root", "debian");
-        // `echo whoami` encoded.
+
         let out = run(&mut shell, "echo d2hvYW1pCg== | base64 -d | sh");
         assert_eq!(out, "root\n", "the decoded command must actually run");
     }
@@ -196,7 +168,7 @@ mod tests {
     #[test]
     fn md5sum_matches_a_known_vector() {
         let mut shell = Shell::new("root", "debian");
-        // Well-known: md5 of "abc" is 900150983cd24fb0d6963f7d28e17f72.
+
         let out = run(&mut shell, "echo -n abc | md5sum");
         assert!(out.starts_with("900150983cd24fb0d6963f7d28e17f72"), "{out}");
         assert!(out.trim_end().ends_with("  -"), "{out}");
@@ -205,7 +177,7 @@ mod tests {
     #[test]
     fn sha1sum_matches_a_known_vector() {
         let mut shell = Shell::new("root", "debian");
-        // Well-known: sha1 of "abc" is a9993e364706816aba3e25717850c26c9cd0d89d.
+
         let out = run(&mut shell, "echo -n abc | sha1sum");
         assert!(
             out.starts_with("a9993e364706816aba3e25717850c26c9cd0d89d"),
@@ -217,7 +189,7 @@ mod tests {
     #[test]
     fn sha256sum_matches_a_known_vector() {
         let mut shell = Shell::new("root", "debian");
-        // Well-known: sha256 of "abc".
+
         let out = run(&mut shell, "echo -n abc | sha256sum");
         assert!(
             out.starts_with("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
@@ -231,7 +203,7 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "echo aaa | sed 's/a/b/'"), "baa\n");
         assert_eq!(run(&mut shell, "echo aaa | sed 's/a/b/g'"), "bbb\n");
-        // Any delimiter, which is what path substitutions use.
+
         assert_eq!(run(&mut shell, "echo /x/y | sed 's|/x|/z|'"), "/z/y\n");
     }
 
@@ -250,7 +222,6 @@ mod tests {
         assert_eq!(run(&mut shell, "echo abcdef | cut -c2-4"), "bcd\n");
     }
 
-    /// The reconnaissance one-liner this unblocks.
     #[test]
     fn cut_reads_passwd_fields() {
         let mut shell = Shell::new("root", "debian");
@@ -307,7 +278,7 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "seq 3"), "1\n2\n3\n");
         assert_eq!(run(&mut shell, "seq 2 4"), "2\n3\n4\n");
-        // A generated stream is capped like every other command's output.
+
         let huge = run(&mut shell, "seq 1 100000000");
         assert!(
             huge.len() < super::MAX_COMMAND_OUTPUT_BYTES + 4096,
@@ -322,8 +293,6 @@ mod tests {
         assert_eq!(run(&mut shell, "echo a b | xargs -n1 echo"), "a\nb\n");
     }
 
-    /// A substitution is the one transform here that grows what it matches, and
-    /// a single line can be the whole input.
     #[test]
     fn sed_bounds_a_growing_substitution() {
         let mut shell = Shell::new("root", "debian");
@@ -347,9 +316,6 @@ mod tests {
     fn awk_handles_the_pipeline_shapes_attackers_use() {
         let mut shell = Shell::new("root", "debian");
 
-        // The single most common form, and the reason awk's absence mattered:
-        // a pipeline dies at its first `command not found`, so everything
-        // downstream of awk used to be invisible.
         assert_eq!(
             shell.execute("echo 'a b c' | awk '{print $2}'").stdout,
             "b\n"
@@ -363,17 +329,14 @@ mod tests {
             "a b\n"
         );
 
-        // Finding uid-0 accounts is textbook post-exploitation recon.
         let roots = shell.execute("awk -F: '$3 == 0 {print $1}' /etc/passwd");
         assert_eq!(roots.stdout, "root\n");
 
-        // A bare pattern prints the whole line.
         assert!(shell
             .execute("awk '/root/' /etc/passwd")
             .stdout
             .starts_with("root:x:0:0:"));
 
-        // NR and NF are the other two names worth supporting.
         assert_eq!(
             shell
                 .execute("printf 'x\\ny\\n' | awk 'NR == 2 {print $1}'")
@@ -389,9 +352,7 @@ mod tests {
     #[test]
     fn awk_admits_what_it_cannot_parse() {
         let mut shell = Shell::new("root", "debian");
-        // Printing nothing would make awk look like it ran and matched no
-        // lines, which is a worse lie than an honest syntax error — and
-        // `status: 2` on an awk line is the signal for what to implement next.
+
         for program in [
             "BEGIN {x = 1} {print x}",
             "{for (i = 1; i <= NF; i++) print $i}",
@@ -417,10 +378,6 @@ mod tests {
             );
         }
 
-        // A pipe, a redirect, and a one-shot `exec` are not a terminal: real
-        // vi/nano have no full-screen behaviour to fall back to there, so
-        // they get nothing, exactly like any other listed-but-unimplemented
-        // binary rather than an invented dump.
         assert_eq!(run(&mut shell, "vi /tmp/f | wc -l"), "0\n");
         assert!(shell.screen.is_none(), "a pipe should not hold the screen");
         run(&mut shell, "nano /tmp/f > /tmp/out");
@@ -435,7 +392,6 @@ mod tests {
         assert!(shell.screen.is_none(), "exec should not hold the screen");
         shell.interactive = true;
 
-        // A substitution runs in a subshell with no terminal of its own.
         assert_eq!(shell.execute("echo [$(vi /tmp/f)]").text, "[]\n");
         assert!(
             shell.screen.is_none(),
@@ -457,14 +413,12 @@ mod tests {
         assert!(rendered.contains("~\n"), "unused rows should show as ~");
         assert!(rendered.contains("\"/tmp/f\" 2L,"));
 
-        // A path that does not exist yet is a new buffer, like real vi.
         run(&mut shell, "vi /tmp/nope");
         let Screen::Editor(editor) = shell.screen.take().unwrap() else {
             panic!("vi should hold a Screen::Editor");
         };
         assert!(editor.render().contains("\"/tmp/nope\" [New File]"));
 
-        // A bare invocation is an unnamed, empty buffer with no status line.
         run(&mut shell, "vi");
         let Screen::Editor(editor) = shell.screen.take().unwrap() else {
             panic!("vi should hold a Screen::Editor");

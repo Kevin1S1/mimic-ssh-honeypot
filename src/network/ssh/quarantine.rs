@@ -3,15 +3,9 @@ use crate::logging::event;
 use crate::network::{scp, sftp};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
-/// Per-session ceiling on real-disk quarantine writes, as a multiple of
-/// `max_upload_bytes`. Bounds one session's disk footprint to a fixed multiple
-/// of its largest single allowed upload, closing the gap where many distinct
-/// small files could otherwise grow the quarantine store without limit for the
-/// duration of a session.
+
 pub(super) const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
 
-/// Default global ceiling on real-disk quarantine writes across all sessions,
-/// as a multiple of `max_upload_bytes`.
 pub(super) const QUARANTINE_GLOBAL_MULTIPLIER: u64 = 64;
 
 pub(super) fn measure_dir_size(dir: &std::path::Path) -> u64 {
@@ -26,8 +20,6 @@ pub(super) fn measure_dir_size(dir: &std::path::Path) -> u64 {
 }
 
 impl MimicHandler {
-    /// Persist one SCP-uploaded file: write it into the session VFS, copy it to
-    /// the quarantine store on the real filesystem, and emit an `upload` event.
     pub(super) fn store_upload(&mut self, file: scp::CompletedFile) {
         let target = self
             .scp
@@ -111,8 +103,6 @@ impl MimicHandler {
         }
     }
 
-    /// Materialise an uploaded file in the session VFS, returning its absolute
-    /// path. Best-effort: failures are non-fatal for the honeypot.
     pub(super) fn write_to_vfs(
         &mut self,
         target: &str,
@@ -122,7 +112,6 @@ impl MimicHandler {
         let (uid, gid) = (self.shell().uid, self.shell().gid);
         let cwd = self.shell().cwd;
 
-        // Determine the directory the file lands in and its final name.
         let (dir_path, name): (String, String) = {
             let shell = self.shell();
             let target_abs = abs_path(&shell.vfs.path_of(cwd), target);
@@ -140,17 +129,11 @@ impl MimicHandler {
             if target_is_dir || target.ends_with('/') || recursive || !file.rel_dir.is_empty() {
                 (base, file.name.clone())
             } else {
-                // Target names the file itself.
                 let (d, n) = crate::vfs::Vfs::split_path(base.trim_end_matches('/'));
                 (d.to_string(), n.to_string())
             }
         };
 
-        // The returned path is what the `upload` event records, so it must be
-        // where the file actually went. Mirroring into the VFS is best-effort —
-        // it has its own node and byte caps — and when either refuses, the
-        // honest answer is the path the attacker asked for, not `path_of` of a
-        // parent directory that happens to be what the arena handed back.
         let intended = format!("{}/{name}", dir_path.trim_end_matches('/'));
         let shell = self.shell();
         let Some(parent) = shell.vfs.mkdir_p(&dir_path, 0o755, uid, gid) else {
@@ -171,7 +154,6 @@ impl MimicHandler {
     }
 }
 
-/// Hex-encode a byte slice.
 pub(in crate::network) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -189,7 +171,6 @@ pub(super) struct QuarantinedPayload {
     path: String,
 }
 
-/// Resolve `path` against `cwd` into an absolute path string (no VFS lookup).
 pub(super) fn abs_path(cwd: &str, path: &str) -> String {
     if path.starts_with('/') {
         path.to_string()
@@ -200,11 +181,6 @@ pub(super) fn abs_path(cwd: &str, path: &str) -> String {
     }
 }
 
-/// Write `data` to `<dir>/<sha256>` (deduplicating by content hash), creating
-/// `dir` if needed. Returns `(stored_path, newly_written_bytes)`. Files are created
-/// non-executable and owner-read/write only (`0600`) at creation time so a
-/// captured payload can never be run from the quarantine store and is never
-/// briefly world/group-readable between the write and a chmod.
 pub(super) fn write_quarantine(
     dir: &std::path::Path,
     sha256: &str,
@@ -213,22 +189,12 @@ pub(super) fn write_quarantine(
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(sha256);
-    // Content-addressed store: identical payloads dedupe. `create_new` also
-    // closes the exists()-then-write TOCTOU — if a concurrent session already
-    // stored the same bytes, `AlreadyExists` is success, not an error.
-    // Write to a scratch name and rename into place, so the store's invariant —
-    // the filename is the SHA-256 of the contents — holds even if the write
-    // fails partway. A direct write that dies on ENOSPC would leave a truncated
-    // file under a valid hash name, and every later upload of the same payload
-    // would then take the `AlreadyExists` path and report that corrupt file as
-    // successfully stored. `rename` is atomic on both target platforms.
+
     let newly_written = if path.exists() {
         0
     } else {
         let staging = dir.join(format!("{sha256}.partial"));
-        // A concurrent session storing the same payload is using the same
-        // staging name; `create_new` makes exactly one of them the writer and
-        // the other falls back to the dedup path below.
+
         match create_restricted(&staging) {
             Ok(mut file) => {
                 let result = file.write_all(data).and_then(|()| file.sync_all());
@@ -250,17 +216,12 @@ pub(super) fn write_quarantine(
         }
     };
     let stored = path.to_string_lossy().into_owned();
-    // `Path::join` appends a backslash on Windows, so a forward-slash
-    // `quarantine_dir` from the config yields `C:/data\ab12…` — one logged
-    // path in two separator styles. Normalise so `stored_path` is a usable
-    // key. Windows-only: a backslash is a legal filename byte on Unix.
+
     #[cfg(windows)]
     let stored = stored.replace('\\', "/");
     Ok((stored, newly_written))
 }
 
-/// Create `path` for writing with owner-only (`0600`) permissions set at
-/// creation time on Unix, failing if it already exists.
 #[cfg(unix)]
 pub(super) fn create_restricted(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;

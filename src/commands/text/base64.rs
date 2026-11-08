@@ -43,7 +43,6 @@ fn decode(text: &str) -> Option<Vec<u8>> {
     let mut bits = 0u32;
     let mut out = Vec::new();
     for c in text.chars() {
-        // Real `base64 -d` skips newlines; anything else invalid is an error.
         if c.is_ascii_whitespace() {
             continue;
         }
@@ -60,11 +59,6 @@ fn decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `base64 [-d] [FILE]`
-///
-/// The one command in this module that is load-bearing on its own: staged
-/// payloads arrive base64-encoded far more often than any other way, so
-/// without it the interesting half of an intrusion never runs.
 pub fn base64(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let decoding = has_flag_letter(&flags, 'd');

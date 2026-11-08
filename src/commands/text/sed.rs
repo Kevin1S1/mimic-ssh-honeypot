@@ -21,13 +21,6 @@ enum SedOutcome {
     Error(String),
 }
 
-/// `sed [-n] [-e SCRIPT] [SCRIPT] [FILE]...`
-///
-/// ponytail: supports the substitution (`s/a/b/[g][i]`), delete (`d`) and
-/// print (`p`) commands over literal patterns — no regular expressions,
-/// address ranges, hold space, or `-i`. That covers the config-editing and
-/// line-filtering one-liners droppers use; upgrade when captured scripts need
-/// real regex.
 pub fn sed(shell: &Shell, args: &[String]) -> CommandResult {
     let invocation = match parse_args(args) {
         Ok(invocation) => invocation,
@@ -55,8 +48,7 @@ fn parse_args(args: &[String]) -> Result<SedInvocation<'_>, CommandResult> {
         match a.as_str() {
             "-n" | "--quiet" | "--silent" => invocation.quiet = true,
             "-e" | "--expression" => expect_script = true,
-            // `-i` without a real filesystem write would be a lie; refuse the
-            // way sed does when it cannot edit in place.
+
             "-i" | "--in-place" => {
                 return Err(CommandResult::err(
                     "sed: no input files while in-place editing\n",
@@ -98,10 +90,7 @@ fn run(invocation: &SedInvocation, text: &str) -> CommandResult {
             out.push_str(&edited.text);
             out.push('\n');
         }
-        // A substitution is the one transform here that grows its input without
-        // limit — `s/a/<4096 bytes>/g` over a megabyte of `a` is a gigabyte —
-        // so the accumulator is checked as it is built rather than trimmed
-        // afterwards by dispatch, which would already have paid for it.
+
         if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
             break;
         }
@@ -139,7 +128,7 @@ fn apply_script(script: &str, line: &str) -> SedOutcome {
             script.chars().next().unwrap_or(' ')
         ));
     }
-    // The delimiter is whatever follows `s`, so `s|a|b|` works like `s/a/b/`.
+
     let delim = script.as_bytes()[1] as char;
     let body: Vec<&str> = script[2..].split(delim).collect();
     if body.len() < 2 {
@@ -161,10 +150,6 @@ fn apply_script(script: &str, line: &str) -> SedOutcome {
     SedOutcome::Replaced(line.replacen(pattern, replacement, limit))
 }
 
-/// One line can be the whole input, so a global substitution that grows what
-/// it matches has to be bounded here too and not only across lines:
-/// `s/a/<4 KiB>/g` over a megabyte of `a` would otherwise build a gigabyte
-/// before anything downstream could cap it.
 fn global_replacement_limit(pattern: &str, replacement: &str) -> usize {
     let growth = replacement.len().saturating_sub(pattern.len());
     MAX_COMMAND_OUTPUT_BYTES

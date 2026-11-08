@@ -8,9 +8,6 @@ use crate::network::sftp;
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 
-/// Build a `MimicHandler` wired to a real (temp-dir) quarantine store, with
-/// no real network I/O involved, so `store_upload` can be exercised
-/// directly.
 fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> MimicHandler {
     let config = Arc::new(Config {
         quarantine_dir,
@@ -45,7 +42,6 @@ fn quarantine_disk_writes_are_capped_per_session() {
     let mut handler = test_handler(dir.clone(), max_upload_bytes);
     let cap = max_upload_bytes * QUARANTINE_SESSION_MULTIPLIER;
 
-    // Upload well past the cap worth of distinct (non-deduplicating) files.
     let file_size: usize = 1000;
     let num_files = (cap / file_size as u64) + 5;
     for i in 0..num_files {
@@ -53,7 +49,7 @@ fn quarantine_disk_writes_are_capped_per_session() {
             name: format!("f{i}"),
             rel_dir: String::new(),
             mode: 0o644,
-            data: vec![i as u8; file_size], // distinct content per file
+            data: vec![i as u8; file_size],
             size: file_size as u64,
             payload_sha256: String::new(),
             truncated: false,
@@ -152,7 +148,6 @@ fn quarantine_disk_writes_are_capped_globally() {
     });
     handler2.global_quarantine_bytes = Arc::clone(&shared_global);
 
-    // Upload in handler1
     handler1.store_upload(CompletedFile {
         name: "h1_file".to_string(),
         rel_dir: String::new(),
@@ -163,7 +158,6 @@ fn quarantine_disk_writes_are_capped_globally() {
         truncated: false,
     });
 
-    // Upload in handler2 (second session, distinct content)
     handler2.store_upload(CompletedFile {
         name: "h2_file1".to_string(),
         rel_dir: String::new(),
@@ -174,7 +168,6 @@ fn quarantine_disk_writes_are_capped_globally() {
         truncated: false,
     });
 
-    // Third upload in handler2 should hit global cap (1000 + 1000 + 1000 > 2000)
     handler2.store_upload(CompletedFile {
         name: "h2_file2".to_string(),
         rel_dir: String::new(),
@@ -199,8 +192,6 @@ fn quarantine_disk_writes_are_capped_globally() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `accept_after = N` accepts the Nth attempt, not the (N+1)th — the README
-/// and `deploy/mimic.toml` promise an operator that exact count.
 #[test]
 fn accept_after_grants_on_the_nth_attempt() {
     let mut handler = test_handler(std::env::temp_dir(), 1024);
@@ -231,7 +222,6 @@ fn only_one_channel_is_active_at_a_time() {
     assert!(handler.try_open_channel(2));
 }
 
-/// Minimal client that trusts whatever host key the honeypot presents.
 struct TestClient;
 
 impl russh::client::Handler for TestClient {
@@ -245,17 +235,12 @@ impl russh::client::Handler for TestClient {
     }
 }
 
-/// `max_session_secs` must actually end the session, not just log that it
-/// expired. The cap has to disconnect the session task explicitly: wrapping
-/// the `RunningSession` in a `tokio::time::timeout` only drops its
-/// `JoinHandle`, which detaches the session and leaves it serving commands
-/// (and holding its connection slot) until the idle timeout.
 #[tokio::test]
 async fn session_cap_disconnects_a_live_session() {
     const CAP_SECS: u64 = 1;
 
     let dir = std::env::temp_dir().join(format!("mimic-session-cap-test-{}", std::process::id()));
-    // Reserve a free port from the OS, then hand it to the listener.
+
     let probe = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("probe bind");
@@ -266,7 +251,7 @@ async fn session_cap_disconnects_a_live_session() {
         listen_addr: "127.0.0.1".parse().expect("loopback"),
         port,
         max_session_secs: CAP_SECS,
-        // Long enough that only the lifetime cap can end this session.
+
         idle_timeout_secs: 600,
         host_key_dir: dir.join("host_keys"),
         quarantine_dir: dir.join("quarantine"),
@@ -282,7 +267,7 @@ async fn session_cap_disconnects_a_live_session() {
             .await
         {
             Ok(handle) => break handle,
-            // The listener may not have bound yet.
+
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     };
@@ -298,7 +283,6 @@ async fn session_cap_disconnects_a_live_session() {
         .expect("session channel");
     channel.request_shell(true).await.expect("shell request");
 
-    // Drain the shell output; the server — not the client — must close this.
     let started = Instant::now();
     tokio::time::timeout(Duration::from_secs(15), async {
         while channel.wait().await.is_some() {}
@@ -315,9 +299,6 @@ async fn session_cap_disconnects_a_live_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Start a honeypot on a free port with both timeouts far away, so only the
-/// session ending on its own can close a channel, and authenticate against
-/// it. Returns the client handle and the temp dir to clean up.
 async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("mimic-{tag}-test-{}", std::process::id()));
     let probe = TcpListener::bind(("127.0.0.1", 0))
@@ -329,7 +310,7 @@ async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::P
     let config = Config {
         listen_addr: "127.0.0.1".parse().expect("loopback"),
         port,
-        // Long enough that neither timeout can be what ends the session.
+
         idle_timeout_secs: 600,
         max_session_secs: 1800,
         host_key_dir: dir.join("host_keys"),
@@ -346,7 +327,7 @@ async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::P
             .await
         {
             Ok(handle) => break handle,
-            // The listener may not have bound yet.
+
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     };
@@ -358,9 +339,6 @@ async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::P
     (handle, dir)
 }
 
-/// A honeypot plus an interactive shell channel with a PTY on it. Returns
-/// the client handle (which must outlive the channel), the channel, and
-/// the temp dir to clean up.
 async fn shell_session(
     tag: &str,
 ) -> (
@@ -381,9 +359,6 @@ async fn shell_session(
     (handle, channel, dir)
 }
 
-/// Read the channel until the server closes it, returning everything it
-/// sent and the exit status it reported (`None` if it sent none). Fails
-/// rather than hangs if the server never closes.
 async fn drain_until_closed(
     channel: &mut russh::Channel<russh::client::Msg>,
 ) -> (Vec<u8>, Option<u32>) {
@@ -391,9 +366,6 @@ async fn drain_until_closed(
     (seen, status)
 }
 
-/// Collect whatever the server sends over `window`, then stop. Unlike
-/// [`drain_until_closed`] this expects the channel to stay open, so it is
-/// what a display that keeps painting has to be measured with.
 async fn read_for(channel: &mut russh::Channel<russh::client::Msg>, window: Duration) -> Vec<u8> {
     let mut seen = Vec::new();
     let _ = tokio::time::timeout(window, async {
@@ -407,8 +379,6 @@ async fn read_for(channel: &mut russh::Channel<russh::client::Msg>, window: Dura
     seen
 }
 
-/// Drain a channel keeping the two data streams apart, as the client's own
-/// stdout and stderr do.
 async fn drain_streams(
     channel: &mut russh::Channel<russh::client::Msg>,
 ) -> (Vec<u8>, Vec<u8>, Option<u32>) {
@@ -434,9 +404,6 @@ async fn drain_streams(
     (seen, errs, status)
 }
 
-/// Ctrl-D on an empty line ends the session, and a login shell says so
-/// before it goes — silence there is the tell, since MIMIC's own `exit`
-/// prints `logout`.
 #[tokio::test]
 async fn ctrl_d_logs_out_and_ends_the_session() {
     let (_handle, mut channel, dir) = shell_session("ctrl-d").await;
@@ -454,9 +421,6 @@ async fn ctrl_d_logs_out_and_ends_the_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A client closing stdin is end-of-input to the shell: a real sshd ends
-/// the session right there. Lingering until the idle timeout both looks
-/// wrong and holds a connection slot for every abandoned probe.
 #[tokio::test]
 async fn client_eof_ends_the_session() {
     let (_handle, mut channel, dir) = shell_session("client-eof").await;
@@ -474,9 +438,6 @@ async fn client_eof_ends_the_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `exit` is the third way out of the shell, and all three have to report
-/// the same status; without one `ssh` reports 255, which no real server
-/// does for a shell that exited cleanly.
 #[tokio::test]
 async fn exit_reports_a_status() {
     let (_handle, mut channel, dir) = shell_session("shell-exit").await;
@@ -494,9 +455,6 @@ async fn exit_reports_a_status() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A one-shot `exec` has no PTY, so a real sshd sends the command's own
-/// LF-terminated bytes. Rewriting them to CRLF is a byte-comparison tell
-/// for anything that diffs output against a known-good host.
 #[tokio::test]
 async fn exec_without_a_pty_sends_bare_lf() {
     let (handle, dir) = honeypot("exec-lf").await;
@@ -514,8 +472,6 @@ async fn exec_without_a_pty_sends_bare_lf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `ssh -t host cmd` does ask for a PTY, and then CRLF is what a real
-/// server sends — the rule is per channel, not per command path.
 #[tokio::test]
 async fn exec_with_a_pty_still_sends_crlf() {
     let (handle, dir) = honeypot("exec-crlf").await;
@@ -536,10 +492,6 @@ async fn exec_with_a_pty_still_sends_crlf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A real sshd running a command without a PTY has two streams to write
-/// to, and sends stderr as extended data. Putting the error on stdout is
-/// visible from the client the moment it writes `2>/dev/null` — and the
-/// bytes still have to be bare LF, like everything else on this channel.
 #[tokio::test]
 async fn exec_without_a_pty_sends_errors_as_extended_data() {
     let (handle, dir) = honeypot("exec-stderr").await;
@@ -558,9 +510,6 @@ async fn exec_without_a_pty_sends_errors_as_extended_data() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// With a PTY there is only one stream: a real sshd never sends extended
-/// data on a channel that asked for a terminal, because the command's two
-/// descriptors are both the tty.
 #[tokio::test]
 async fn a_pty_channel_sends_no_extended_data() {
     let (handle, dir) = honeypot("pty-stderr").await;
@@ -582,12 +531,6 @@ async fn a_pty_channel_sends_no_extended_data() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `ssh -T host < script` asks for a shell with no terminal. Real bash
-/// finds a pipe on stdin and runs non-interactively: no readline, so no
-/// prompt, no echo of the line, and none of the `\x1b[K` erase sequences
-/// redrawing one needs — and no `logout`, which only an interactive login
-/// shell prints. Sending any of that to a client that asked for no
-/// terminal is a tell on its own.
 #[tokio::test]
 async fn a_shell_without_a_pty_runs_no_line_editor() {
     let (handle, dir) = honeypot("no-pty-shell").await;
@@ -605,40 +548,33 @@ async fn a_shell_without_a_pty_runs_no_line_editor() {
     let (seen, errs, status) = drain_streams(&mut channel).await;
     let out = String::from_utf8_lossy(&seen);
 
-    // The MOTD still arrives: it comes from the PAM session, which opens
-    // whether or not a terminal was allocated.
     assert!(out.contains("Debian GNU/Linux"), "missing motd: {out:?}");
-    // Everything a terminal would have added is absent.
+
     assert!(!out.contains("root@debian"), "prompt leaked: {out:?}");
     assert!(!out.contains("\x1b["), "erase sequence leaked: {out:?}");
     assert!(!out.contains('\r'), "CR leaked onto a channel with no pty");
     assert!(!out.contains("Last login"), "lastlog leaked: {out:?}");
     assert!(!out.contains("logout"), "logout leaked: {out:?}");
-    // What the commands actually wrote is all that is left, split by
-    // stream and LF-terminated.
+
     assert!(out.ends_with("one\nroot\n"), "unexpected output: {out:?}");
     assert_eq!(
         errs,
         b"ls: cannot access '/nope': No such file or directory\n"
     );
-    // A shell that ended cleanly reports a status; without one `ssh`
-    // reports 255, which no real server does.
+
     assert_eq!(status, Some(2), "missing exit status");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Real `top` holds the screen and repaints until `q`. One snapshot and an
-/// immediate prompt is the tell this closes: the display has to keep
-/// arriving with no further input, and the clock in its header has to move.
 #[tokio::test]
 async fn top_holds_the_screen_until_q() {
     let (_handle, mut channel, dir) = shell_session("top-hold").await;
-    // Drain the login banner and first prompt.
+
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel.data(&b"top\r"[..]).await.expect("send top");
-    // Long enough for the paint plus at least one timed repaint.
+
     let held = read_for(&mut channel, SCREEN_REFRESH + Duration::from_secs(2)).await;
     let held = String::from_utf8_lossy(&held).into_owned();
 
@@ -647,16 +583,14 @@ async fn top_holds_the_screen_until_q() {
         frames >= 2,
         "expected a repaint with no further input, saw {frames} frame(s): {held:?}"
     );
-    // A full-screen program homes the cursor and erases before painting,
-    // so each frame lands on top of the last instead of scrolling.
+
     assert!(held.contains(SCREEN_HOME), "no screen-home before a frame");
-    // No prompt while the display owns the terminal.
+
     assert!(
         !held.contains("root@debian"),
         "prompt drawn under top: {held:?}"
     );
 
-    // `q` quits, and the shell comes back.
     channel.data(&b"q"[..]).await.expect("send q");
     let after = read_for(&mut channel, Duration::from_millis(400)).await;
     let after = String::from_utf8_lossy(&after).into_owned();
@@ -665,7 +599,6 @@ async fn top_holds_the_screen_until_q() {
         "no prompt after q: {after:?}"
     );
 
-    // The redraw task is gone: nothing more arrives once it has quit.
     let quiet = read_for(&mut channel, SCREEN_REFRESH + Duration::from_secs(1)).await;
     assert!(
         quiet.is_empty(),
@@ -676,10 +609,6 @@ async fn top_holds_the_screen_until_q() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `vi` paints a read-only view of the target and holds the terminal until
-/// its own quit sequence — `:` followed by `q!` and Enter — clears the
-/// screen and hands the prompt back. Unlike `top` it never repaints on its
-/// own: nothing further arrives while it holds.
 #[tokio::test]
 async fn vi_holds_the_screen_until_colon_quit() {
     let (_handle, mut channel, dir) = shell_session("vi-hold").await;
@@ -701,7 +630,6 @@ async fn vi_holds_the_screen_until_colon_quit() {
         "prompt drawn under vi: {held:?}"
     );
 
-    // `:q!` followed by Enter quits and hands the prompt back.
     channel.data(&b":q!\r"[..]).await.expect("send :q!");
     let after = read_for(&mut channel, Duration::from_millis(400)).await;
     let after = String::from_utf8_lossy(&after).into_owned();
@@ -724,8 +652,6 @@ async fn vi_holds_the_screen_until_colon_quit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `nano` holds the terminal until Ctrl-X, its real quit key, rather than
-/// `top`'s `q` or `vi`'s colon commands.
 #[tokio::test]
 async fn nano_holds_the_screen_until_ctrl_x() {
     let (_handle, mut channel, dir) = shell_session("nano-hold").await;
@@ -766,10 +692,6 @@ async fn nano_holds_the_screen_until_ctrl_x() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `nc -l` holds the terminal with no display of its own — a real listener
-/// prints nothing before a connection arrives — and only Ctrl-C gets it
-/// back, echoed the way an interrupted foreground command is rather than
-/// clearing a screen that was never painted.
 #[tokio::test]
 async fn nc_listen_holds_the_screen_until_ctrl_c() {
     let (_handle, mut channel, dir) = shell_session("nc-listen-hold").await;
@@ -802,11 +724,6 @@ async fn nc_listen_holds_the_screen_until_ctrl_c() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A screen hold's kind, and `vi`'s colon-command buffer, must not survive
-/// past the quit that ends it — a stale `ScreenKind` or leftover `colon`
-/// state from one hold would silently misinterpret the next one's
-/// keystrokes. Chains three different kinds (`Listen`, `Top`, `Editor`) end
-/// to end to catch exactly that.
 #[tokio::test]
 async fn screen_holds_do_not_leak_state_into_the_next_one() {
     let (_handle, mut channel, dir) = shell_session("screen-hold-chain").await;
@@ -845,8 +762,7 @@ async fn screen_holds_do_not_leak_state_into_the_next_one() {
         held.contains("[New File]"),
         "vi after top should paint normally: {held:?}"
     );
-    // `top`'s quit key alone must not also quit `vi` — only its own colon
-    // command may.
+
     channel.data(&b"q"[..]).await.expect("send q (ignored)");
     let ignored = read_for(&mut channel, Duration::from_millis(300)).await;
     let ignored = String::from_utf8_lossy(&ignored).into_owned();
@@ -865,11 +781,6 @@ async fn screen_holds_do_not_leak_state_into_the_next_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `passwd` asks twice, and *both* answers must be collected with echo
-/// suppressed. One answer leaving another prompt outstanding is the case
-/// the prompt loop originally missed: it would have drawn `PS1` over the
-/// second prompt, echoed the secret in clear on the attacker's terminal,
-/// and then run it as a command line.
 #[tokio::test]
 async fn passwd_suppresses_echo_for_both_prompts() {
     let (_handle, mut channel, dir) = shell_session("passwd-echo").await;
@@ -904,14 +815,12 @@ async fn passwd_suppresses_echo_for_both_prompts() {
     let done = String::from_utf8_lossy(&done).into_owned();
     assert!(done.contains("updated successfully"), "{done:?}");
     assert!(!done.contains("hunter2"), "the secret was echoed: {done:?}");
-    // The shell comes back afterwards.
+
     assert!(done.contains("root@debian"), "no prompt after: {done:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A one-shot `exec` has no terminal to hold, so `ssh host top` must print
-/// its dump and exit rather than hanging until the idle timeout.
 #[tokio::test]
 async fn exec_top_prints_once_and_exits() {
     let (handle, dir) = honeypot("exec-top").await;
@@ -935,12 +844,6 @@ async fn exec_top_prints_once_and_exits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A here-document spans lines, so the network layer has to collect them:
-/// under a PTY behind bash's `PS2` continuation prompt, echoing as usual,
-/// and over a pipe simply as the lines that follow. Dropping a script into
-/// a file with `cat << EOF > file` is one of the most common things a bot
-/// does, so the body has to reach the command and only the opening line may
-/// be logged as a command.
 #[tokio::test]
 async fn a_heredoc_collects_its_body_under_a_pty() {
     let (_handle, mut channel, dir) = shell_session("heredoc-pty").await;
@@ -975,8 +878,6 @@ async fn a_heredoc_collects_its_body_under_a_pty() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The same document over a channel with no terminal, where the body is
-/// simply the next lines of the script.
 #[tokio::test]
 async fn a_heredoc_collects_its_body_over_a_pipe() {
     let (handle, dir) = honeypot("heredoc-pipe").await;
@@ -1004,9 +905,6 @@ async fn a_heredoc_collects_its_body_over_a_pipe() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A one-shot `exec` can never be fed a body, so the document ends at
-/// end-of-input with bash's warning rather than hanging to the idle
-/// timeout.
 #[tokio::test]
 async fn exec_heredoc_ends_at_end_of_input() {
     let (handle, dir) = honeypot("heredoc-exec").await;
@@ -1029,9 +927,6 @@ async fn exec_heredoc_ends_at_end_of_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `logout` is what an *interactive* login shell prints as it exits, so
-/// `ssh host exit` — a one-shot command, never interactive — must print
-/// nothing while still reporting the status.
 #[tokio::test]
 async fn exec_exit_prints_no_logout() {
     let (handle, dir) = honeypot("exec-exit-quiet").await;
@@ -1052,8 +947,6 @@ async fn exec_exit_prints_no_logout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A script whose last line has no trailing newline still runs, the way
-/// bash runs what it has when the pipe reaches EOF.
 #[tokio::test]
 async fn a_shell_without_a_pty_runs_an_unterminated_last_line() {
     let (handle, dir) = honeypot("no-pty-partial").await;
@@ -1074,9 +967,6 @@ async fn a_shell_without_a_pty_runs_an_unterminated_last_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `pty-req` is per channel. A connection that runs an interactive session
-/// and then an `exec` — what an SSH ControlMaster does — must not carry the
-/// first channel's line endings into the second.
 #[tokio::test]
 async fn a_later_exec_channel_does_not_inherit_the_pty() {
     let (handle, dir) = honeypot("exec-after-shell").await;

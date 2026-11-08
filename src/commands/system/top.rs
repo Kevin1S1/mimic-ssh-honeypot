@@ -9,14 +9,6 @@ MiB Mem :   1993.4 total,   1468.3 free,    179.0 used,    346.0 buff/cache\n\
 MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1723.6 avail Mem\n\
 \n    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n";
 
-/// One `top` display, able to redraw itself at any later instant.
-///
-/// The process rows are fixed when the command runs — this box has one session
-/// on it, and nothing starts or exits while an attacker watches — but the
-/// header carries the clock and the uptime, which are exactly what a viewer
-/// checks to see whether the screen is alive. Holding only the rendered rows
-/// keeps this free of any borrow on the shell, so the network layer can redraw
-/// it on a timer without reaching back into the session.
 #[derive(Clone)]
 pub struct TopScreen {
     rows: Vec<String>,
@@ -33,7 +25,6 @@ impl TopScreen {
         }
     }
 
-    /// Render the whole display as of now.
     pub fn render(&self) -> String {
         let mut out = format!("top - {}\n", clock::uptime_banner());
         out.push_str(&format!(
@@ -69,18 +60,9 @@ fn is_one_shot(args: &[String]) -> bool {
         .any(|a| a == "-b" || a == "--batch" || (a.starts_with('-') && a.contains('n')))
 }
 
-/// `top [-b] [-n N]`
-///
-/// On a terminal, real `top` takes the screen and redraws every three seconds
-/// until `q`. The display is built here; the holding is the network layer's,
-/// which is the only layer allowed to own a timer. Batch mode (`-b`), an
-/// iteration count (`-n`), a pipe, and any channel without a terminal all get
-/// the one-shot dump instead — the same cases real `top` prints once for.
 pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
     let screen = TopScreen::new(&session_table(shell, &invocation("top", args)));
     if !is_one_shot(args) && shell.interactive && shell.stdout_is_tty {
-        // The display paints itself once the network layer picks it up, so the
-        // command writes nothing: a frame here would be painted twice.
         shell.screen = Some(Screen::Top(screen));
         return CommandResult::empty();
     }

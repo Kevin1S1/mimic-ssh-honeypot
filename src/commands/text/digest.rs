@@ -6,22 +6,18 @@ use super::{failure_status, split_args, stdin_text, vfs_file};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
 
-/// `md5sum [FILE]...`
 pub fn md5sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command::<Md5>(shell, args, "md5sum")
 }
 
-/// `sha1sum [FILE]...`
 pub fn sha1sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command::<Sha1>(shell, args, "sha1sum")
 }
 
-/// `sha256sum [FILE]...`
 pub fn sha256sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command::<Sha256>(shell, args, "sha256sum")
 }
 
-/// `sha512sum [FILE]...`
 pub fn sha512sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command::<Sha512>(shell, args, "sha512sum")
 }

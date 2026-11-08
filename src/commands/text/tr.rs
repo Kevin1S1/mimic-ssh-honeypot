@@ -2,14 +2,6 @@ use super::{has_flag_letter, missing_operand, split_args, stdin_text};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
 
-/// The widest `tr` set that will be expanded.
-///
-/// A range is two characters on the wire and up to 1.1 million after expansion
-/// (`tr '\x01-\u{10FFFF}' x`), and every input character is then matched
-/// against the set linearly — so an unbounded set is both an allocation and a
-/// quadratic-time vector for a few bytes of argument. Real `tr` works over
-/// bytes, so 256 entries is already more than it can express; the margin is for
-/// the multi-byte sets a shell one-liner writes literally.
 const MAX_TR_SET: usize = 1024;
 
 const POSIX_CLASSES: [&str; 5] = [
@@ -27,7 +19,6 @@ struct Translation {
     squeeze: bool,
 }
 
-/// `tr [-d] [-s] SET1 [SET2]`
 pub fn tr(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let Some(from) = operands.first() else {
@@ -55,7 +46,7 @@ impl Translation {
             if self.delete {
                 continue;
             }
-            // Real tr pads a short SET2 with its final character.
+
             let mapped = self
                 .to
                 .get(pos)
@@ -72,8 +63,6 @@ impl Translation {
     }
 }
 
-/// Expand `a-z` ranges and the common escapes in a `tr` set, up to
-/// [`MAX_TR_SET`] characters.
 fn expand_set(spec: &str) -> Vec<char> {
     let chars: Vec<char> = spec.chars().collect();
     let mut out = Vec::new();
@@ -137,8 +126,6 @@ fn posix_class_members(class: &str) -> Vec<char> {
 mod tests {
     use crate::shell::Shell;
 
-    /// Two characters of argument must not become a million characters of set,
-    /// which every input byte would then be matched against linearly.
     #[test]
     fn tr_bounds_a_hostile_range() {
         let set = super::expand_set("\u{1}-\u{10FFFE}");
@@ -147,7 +134,7 @@ mod tests {
             "expanded to {} chars",
             set.len()
         );
-        // The ranges a one-liner actually writes are unaffected.
+
         assert_eq!(super::expand_set("a-z").len(), 26);
         let mut shell = Shell::new("root", "debian");
         assert_eq!(shell.execute("echo abc | tr a-z A-Z").text, "ABC\n");

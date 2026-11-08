@@ -12,7 +12,6 @@ const LCG_INCREMENT: u64 = 1442695040888963407;
 const WGET_NAME_COLUMN: usize = 20;
 const KIB: u64 = 1024;
 
-/// Split a URL into `(host, last_path_component)`.
 fn url_parts(url: &str) -> (String, String) {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let (authority, path) = without_scheme
@@ -34,16 +33,10 @@ fn url_parts(url: &str) -> (String, String) {
     (host.to_string(), base.to_string())
 }
 
-/// The size a fetch of `host` reports and writes. Stable per host so repeated
-/// downloads in one session stay consistent with each other.
 fn fake_size(host: &str) -> u64 {
     1024 + (host.len() as u64 * 37 % 8192)
 }
 
-/// Body for a "downloaded" artefact. A block of identical bytes is an obvious
-/// tell to anyone who looks at what they just fetched, so the filler is
-/// deterministic pseudo-random noise — what a compressed or binary payload
-/// looks like from the outside.
 fn placeholder_bytes(url: &str, size: u64) -> Vec<u8> {
     let mut state = url.bytes().fold(FNV1A_64_OFFSET_BASIS, |acc, b| {
         (acc ^ b as u64).wrapping_mul(FNV1A_64_PRIME)
@@ -58,11 +51,6 @@ fn placeholder_bytes(url: &str, size: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Create a placeholder file for a "downloaded" artefact in the cwd (or at an
-/// explicit path) so a follow-up `ls`/`cat` is consistent with the transfer.
-/// Returns the path written and the number of bytes that actually landed —
-/// the VFS content cap can refuse the write, and the transfer must not claim
-/// bytes the attacker cannot then see in `ls -l`.
 fn drop_file(shell: &mut Shell, dest: &str, contents: Vec<u8>) -> (String, u64) {
     if dest == STDOUT_DESTINATION {
         return (STDOUT_DESTINATION.to_string(), 0);
@@ -94,7 +82,6 @@ struct WgetOptions {
     urls: Vec<String>,
 }
 
-/// `wget [OPTION]... [URL]...`
 pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
     let options = parse_wget_args(args);
     if options.urls.is_empty() {
@@ -143,7 +130,7 @@ fn parse_wget_args(args: &[String]) -> WgetOptions {
             s if s.starts_with("--output-document=") => {
                 options.output = Some(s["--output-document=".len()..].to_string())
             }
-            s if s.starts_with('-') => {} // -c, -L, --no-check-certificate, ...
+            s if s.starts_with('-') => {}
             other => options.urls.push(other.to_string()),
         }
     }
@@ -184,7 +171,6 @@ struct CurlOptions {
     urls: Vec<String>,
 }
 
-/// `curl [OPTION]... [URL]...`
 pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
     let options = parse_curl_args(args);
     if options.urls.is_empty() {
@@ -238,7 +224,7 @@ fn parse_curl_args(args: &[String]) -> CurlOptions {
             | "-e" | "--referer" | "-b" | "--cookie" | "-u" | "--user" => {
                 iter.next();
             }
-            s if s.starts_with('-') => {} // -L, -k, -v, -f, ...
+            s if s.starts_with('-') => {}
             other => options.urls.push(other.to_string()),
         }
     }
@@ -257,9 +243,6 @@ fn curl_headers(size: u64) -> String {
     )
 }
 
-/// Real curl always renders this table when the body goes to a file. A small
-/// transfer completes instantly; curl then reports a rate in the hundreds of
-/// KB/s rather than a measured one.
 fn curl_progress(size: u64) -> String {
     let rate = format!("{}k", 300 + size % 500);
     let mut out = String::from(
@@ -272,12 +255,10 @@ fn curl_progress(size: u64) -> String {
     out
 }
 
-/// Truncate a string to `max` chars for fixed-width columns.
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Human-readable byte size in wget's style (K/M/G with one decimal).
 fn human(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["", "K", "M", "G"];
     if bytes < KIB {

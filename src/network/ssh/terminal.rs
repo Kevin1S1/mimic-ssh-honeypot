@@ -5,8 +5,7 @@ pub(super) const BACKSPACE: u8 = 0x08;
 pub(super) const CTRL_X: u8 = 0x18;
 pub(super) const ESC: u8 = 0x1b;
 pub(super) const DELETE: u8 = 0x7f;
-/// What the client asked for in `pty-req`, kept so the session environment can
-/// reflect it rather than inventing a terminal the client never requested.
+
 pub(super) struct PtyRequest {
     pub(super) term: String,
     pub(super) cols: u32,
@@ -41,11 +40,6 @@ pub(super) fn is_locale_variable(name: &str) -> bool {
     name == "LANG" || name.starts_with("LC_")
 }
 
-/// Keep only what a terminal name can legally hold, bounded.
-///
-/// `TERM` is attacker-controlled and reaches `env` output, so it is restricted
-/// to the character class terminfo names actually use. An empty or hostile value
-/// falls back to what a client that sent nothing would get.
 pub(super) fn sanitise_term(term: &str) -> String {
     let cleaned: String = term
         .chars()
@@ -59,11 +53,6 @@ pub(super) fn sanitise_term(term: &str) -> String {
     }
 }
 
-/// Strip control characters from an accepted `env` value and bound its length.
-///
-/// `Env::set` bounds length too, but a locale value reaches the terminal through
-/// `env`/`printenv` output, so escape sequences come out here rather than at the
-/// far end.
 pub(super) fn sanitise_env_value(value: &str) -> String {
     value
         .chars()
@@ -72,8 +61,6 @@ pub(super) fn sanitise_env_value(value: &str) -> String {
         .collect()
 }
 
-/// Lay candidate strings out in newline-separated columns the way bash prints
-/// ambiguous completions. Kept simple: a single space-padded grid.
 pub(super) fn format_columns(items: &[String]) -> String {
     if items.is_empty() {
         return String::new();

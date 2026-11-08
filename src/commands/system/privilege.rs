@@ -31,7 +31,7 @@ fn parse_sudo(args: &[String]) -> SudoRequest {
             }
             "-l" | "--list" => return SudoRequest::List,
             "-u" => {
-                iter.next(); // consume the target username
+                iter.next();
             }
             other if other.starts_with('-') => {}
             _ => break,
@@ -45,18 +45,6 @@ fn parse_sudo(args: &[String]) -> SudoRequest {
     }
 }
 
-/// `sudo [-u USER] [-l] [-i | -s] COMMAND [ARG]...`
-///
-/// The honeypot never gates this on a real password: the attacker's session
-/// credentials were already accepted at login, and `id` already reports
-/// membership in the `sudo` group, so denying here would be an inconsistent
-/// tell for no forensic benefit. Elevation only lasts for the wrapped
-/// command; the caller's uid/gid are restored afterward.
-///
-/// `-i` and `-s` with no command are the exception: they are the two common
-/// ways an attacker asks for a root *shell*, so they switch the session's
-/// identity for good, the way [`su`] does. `-i` is a login shell (root's
-/// environment and home); `-s` keeps the directory the caller was in.
 pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
     match parse_sudo(args) {
         SudoRequest::List => sudo_list(shell),
@@ -81,10 +69,6 @@ fn sudo_list(shell: &Shell) -> CommandResult {
     ))
 }
 
-/// A root shell for the rest of the session. `-i` is a login shell, so the
-/// switch is all of it. `-s` is not: Debian's sudoers resets the environment
-/// but does not set `always_set_home`, so the caller keeps their directory and
-/// `$HOME` and only the identity changes.
 fn become_root(shell: &mut Shell, keep_cwd: bool) {
     let (cwd, home) = (shell.cwd, shell.home);
     shell.switch_user(ROOT);
@@ -109,31 +93,14 @@ fn run_as_root(shell: &mut Shell, command: &[String]) -> CommandResult {
     result
 }
 
-/// `su [-] [USER]`
-///
-/// Switches the session's effective identity, as a fresh login shell for
-/// `USER` (root if omitted). Root may switch to any account with no password,
-/// exactly like real `su`; a non-root user is prompted for the target's
-/// password first. The honeypot does not gate the switch on a correct password
-/// (the attacker already authenticated over SSH, and denying here yields no
-/// forensic benefit) — but the attempted password *is* captured, and the
-/// realistic `Password:` prompt removes the "instant, password-less root" tell.
-///
-/// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
-/// identity; add transient (non-persistent) elevation if that distinction
-/// ever matters for captured sessions.
 pub fn su(shell: &mut Shell, args: &[String]) -> CommandResult {
     let target = su_target(args).to_string();
 
-    // Root switches identity without a password, like real `su`.
     if is_root(shell) {
         shell.switch_user(&target);
         return CommandResult::empty();
     }
 
-    // A non-root user must be prompted for the target's password. Defer the
-    // switch: the network layer collects the password line (echo suppressed)
-    // and calls `Shell::resume`, which captures it and performs the switch.
     shell.pending = Some(Pending::SuPassword { target });
     CommandResult::ok("Password: ")
 }
@@ -144,9 +111,9 @@ fn su_target(args: &[String]) -> &str {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-c" | "--command" | "-s" | "--shell" | "-g" | "--group" => {
-                iter.next(); // takes a value; accepted, ignored
+                iter.next();
             }
-            other if other.starts_with('-') => {} // "-", "-l", "--login", ...: accepted, no-op
+            other if other.starts_with('-') => {}
             other => target = other,
         }
     }

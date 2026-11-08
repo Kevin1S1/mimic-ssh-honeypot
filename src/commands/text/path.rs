@@ -2,7 +2,6 @@ use super::{missing_operand, split_args};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
 
-/// `basename PATH [SUFFIX]`
 pub fn basename(_shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let Some(path) = operands.first() else {
@@ -18,7 +17,6 @@ pub fn basename(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{base}\n"))
 }
 
-/// `dirname PATH`
 pub fn dirname(_shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let Some(path) = operands.first() else {

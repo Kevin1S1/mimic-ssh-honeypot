@@ -6,7 +6,6 @@ const DEFAULT_COUNT: u32 = 4;
 const MAX_COUNT: u32 = 20;
 const INTERVAL_MS: u32 = 1001;
 
-/// `ping [-c COUNT] HOST`
 pub fn ping(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut count = DEFAULT_COUNT;
     let mut host: Option<&str> = None;

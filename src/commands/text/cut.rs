@@ -6,7 +6,6 @@ const DEFAULT_DELIMITER: char = '\t';
 
 type Range = (usize, usize);
 
-/// `cut -d DELIM -f LIST [FILE]...` / `cut -c LIST [FILE]...`
 pub fn cut(shell: &Shell, args: &[String]) -> CommandResult {
     let mut delim = DEFAULT_DELIMITER;
     let mut fields: Option<String> = None;
@@ -72,7 +71,7 @@ fn pick_chars(line: &str, wanted: &[Range]) -> String {
 
 fn pick_fields(line: &str, delim: char, wanted: &[Range]) -> String {
     let parts: Vec<&str> = line.split(delim).collect();
-    // A line with no delimiter is passed through whole, like real cut.
+
     if parts.len() == 1 {
         return line.to_string();
     }
@@ -85,7 +84,6 @@ fn pick_fields(line: &str, delim: char, wanted: &[Range]) -> String {
     picked.join(&delim.to_string())
 }
 
-/// Parse a `cut`-style list such as `1,3-5,7-` into inclusive 1-based ranges.
 fn parse_ranges(spec: &str) -> Vec<Range> {
     let mut out = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {

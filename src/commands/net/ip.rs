@@ -6,7 +6,6 @@ const FALLBACK_LINK_LOCAL: &str = "fe80::1";
 const MAC_OCTETS: usize = 6;
 const UNIVERSAL_LOCAL_BIT: u8 = 0x02;
 
-/// `ip [OPTION] OBJECT { COMMAND }`
 pub fn ip(shell: &Shell, args: &[String]) -> CommandResult {
     let object = args
         .iter()
@@ -25,11 +24,6 @@ pub fn ip(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// The EUI-64 link-local address the kernel derives from an interface MAC.
-///
-/// A `fe80::` address that does not match the `link/ether` line two rows above
-/// it is a tell for anyone who knows how SLAAC works, so it is computed rather
-/// than written down.
 fn link_local(mac: &str) -> String {
     let o: Vec<u8> = mac
         .split(':')
@@ -38,7 +32,7 @@ fn link_local(mac: &str) -> String {
     if o.len() != MAC_OCTETS {
         return FALLBACK_LINK_LOCAL.to_string();
     }
-    // Flip the universal/local bit and insert ff:fe in the middle, per RFC 4291.
+
     let first = o[0] ^ UNIVERSAL_LOCAL_BIT;
     format!(
         "fe80::{:x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",

@@ -10,7 +10,6 @@ fn flag_letters(args: &[String]) -> String {
         .collect()
 }
 
-/// `netstat [OPTION]...`
 pub fn netstat(_shell: &Shell, args: &[String]) -> CommandResult {
     let flags = flag_letters(args);
     let listening = flags.contains('l');
@@ -60,7 +59,6 @@ pub fn netstat(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `ss [OPTION]...`
 pub fn ss(_shell: &Shell, args: &[String]) -> CommandResult {
     let flags = flag_letters(args);
     let listening = flags.contains('l');

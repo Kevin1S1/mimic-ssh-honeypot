@@ -11,22 +11,20 @@ const MIN_SESSION_SSHD_PID: u32 = 1000;
 pub(super) const CLOCK_TIME_FORMAT: &str = "%H:%M";
 const BOOT_DATE_FORMAT: &str = "%b%d";
 
-/// One row of the fabricated process table.
 pub(super) struct Proc {
     pub(super) pid: u32,
     pub(super) ppid: u32,
     pub(super) user: String,
     pub(super) tty: &'static str,
     pub(super) stat: &'static str,
-    /// %MEM.
+
     pub(super) mem: &'static str,
-    /// Virtual size in KiB.
+
     pub(super) vsz: u32,
-    /// Resident set size in KiB.
+
     pub(super) rss: u32,
     pub(super) time: &'static str,
-    /// `ps`'s START column: the boot date for daemons, `HH:MM` for anything
-    /// started in the last day.
+
     pub(super) start: String,
     pub(super) cmd: String,
 }
@@ -68,9 +66,6 @@ impl BootProcess {
     }
 }
 
-/// The system processes a Debian 12 VM shows, all started at boot — so their
-/// START column is the boot date, not a date fixed at compile time that a
-/// long-running honeypot eventually reports as older than its own uptime.
 const BOOT_PROCESSES: [BootProcess; 10] = [
     BootProcess {
         pid: 1,
@@ -194,8 +189,6 @@ const BOOT_PROCESSES: [BootProcess; 10] = [
     },
 ];
 
-/// The command line as typed, which is what `ps`/`top` show for the process
-/// doing the asking.
 pub(super) fn invocation(name: &str, args: &[String]) -> String {
     if args.is_empty() {
         name.to_string()
@@ -204,11 +197,6 @@ pub(super) fn invocation(name: &str, args: &[String]) -> String {
     }
 }
 
-/// The `(pid, command)` pairs the fabricated process table holds.
-///
-/// `pidof`, `pgrep` and `killall` all read this, so none of them can disagree
-/// with what `ps` prints — three commands inventing their own tables would
-/// contradict each other on the first cross-check.
 pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
     session_table(shell, "ps")
         .into_iter()
@@ -216,14 +204,6 @@ pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// The executable name a `ps` command line reports, the way `/proc/PID/comm`
-/// would: the first word, minus any directory, minus the `sshd: ` title prefix
-/// a privilege-separated daemon rewrites its argv to, minus the brackets a
-/// kernel thread is shown in.
-///
-/// Without this, `pidof sshd` misses the one process an attacker is guaranteed
-/// to look for — `ps` prints `sshd: /usr/sbin/sshd -D [listener]`, whose first
-/// word is `sshd:`.
 pub fn process_name(cmd: &str) -> &str {
     let first = cmd.split_whitespace().next().unwrap_or(cmd);
     let first = first.strip_suffix(':').unwrap_or(first);
@@ -231,7 +211,6 @@ pub fn process_name(cmd: &str) -> &str {
     first.trim_start_matches('[').trim_end_matches(']')
 }
 
-/// The pid of the first process whose executable name is `name`, if any.
 pub fn process_pid(shell: &Shell, name: &str) -> Option<u32> {
     process_table(shell)
         .into_iter()
@@ -239,9 +218,6 @@ pub fn process_pid(shell: &Shell, name: &str) -> Option<u32> {
         .map(|(pid, _)| pid)
 }
 
-/// Build the full table including this session's own login chain. `running` is
-/// the command asking for the table: it is itself in the process list it
-/// prints, so `top` must not report `ps aux` as the process at the top.
 pub(super) fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
     let boot = clock::format(clock::boot_time(), BOOT_DATE_FORMAT);
     let mut table: Vec<Proc> = BOOT_PROCESSES.iter().map(|p| p.started_at(&boot)).collect();
@@ -294,17 +270,13 @@ pub(super) fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
     table
 }
 
-/// Non-root may only signal its own processes; system PIDs are owned by root,
-/// so an unprivileged attacker is denied.
 fn may_signal(shell: &Shell, process: &Proc) -> bool {
     is_root(shell) || process.user == shell.username
 }
 
-/// `ps [aux|-ef|...]`
 pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
     let joined: String = args.join("");
-    // `ps aux` / `ps -ef` style: show every process. Bare `ps` shows only this
-    // session's processes on its tty.
+
     let has_arg = |wanted: &str| args.iter().any(|a| a == wanted);
     let show_all = joined.contains('a') || joined.contains('e') || joined.contains('A');
     let full_format = has_arg("-ef") || joined.contains('f') && !joined.contains('u');
@@ -356,14 +328,13 @@ fn default_format_row(p: &Proc) -> String {
     )
 }
 
-/// `kill [-SIG] PID...`
 pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
     let mut pids: Vec<&str> = Vec::new();
     let mut list = false;
     for arg in args {
         match arg.as_str() {
             "-l" | "--list" => list = true,
-            // Signal specifiers (e.g. -9, -SIGKILL, -s TERM): accepted, ignored.
+
             s if s.starts_with('-') => {}
             other => pids.push(other),
         }
@@ -411,12 +382,6 @@ fn kill_error(shell: &Shell, table: &[Proc], target: &str) -> Option<String> {
     }
 }
 
-/// `pkill [-SIGNAL] NAME`
-///
-/// Matches process names (substring) in the same fake table `ps`/`kill` use,
-/// applying the same ownership rule as `kill`. Tab-completion has always
-/// offered `pkill`; this closes the gap where it fell through to "command not
-/// found".
 pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
     let names: Vec<&str> = args
         .iter()

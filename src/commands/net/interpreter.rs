@@ -6,8 +6,6 @@ const USAGE_FAILURE: i32 = 2;
 const MAX_HOSTNAME_LEN: usize = 253;
 const NETWORK_HINTS: [&str; 3] = ["socket", "connect", "Socket"];
 
-/// Kept in one place so `python3 --version`, the REPL banner and the
-/// `python3` entry in the package database cannot drift apart.
 const PYTHON_VERSION: &str = "Python 3.11.2";
 
 const PERL_VERSION: &str = "\nThis is perl 5, version 36, subversion 0 (v5.36.0) built for \
@@ -25,25 +23,10 @@ enum Interpreter {
     Perl,
 }
 
-/// `python3` — see the note below; `perl` is [`perl`].
-///
-/// No interpreter is emulated, and none should be: running attacker code is the
-/// one thing this box exists not to do. What matters is the *invocation* — the
-/// `-c` payload is the intelligence, and the `command` event already records
-/// the whole line verbatim, including the one-liner. Before this existed the
-/// same line came back `command not found`, which both lost the interaction and
-/// told a scanner the box has no Python while `dpkg -l` lists python3 as
-/// installed. That contradiction was the real cost.
-///
-/// The one-liner attackers reach for is a reverse shell, and the outcome a real
-/// box gives it most of the time is a connect that fails — their listener is
-/// usually already gone. So a payload that tries to reach the network gets the
-/// traceback that failure produces, and anything else exits quietly.
 pub fn python3(shell: &mut Shell, args: &[String]) -> CommandResult {
     run(shell, Interpreter::Python3, args)
 }
 
-/// `perl` — see [`python3`].
 pub fn perl(shell: &mut Shell, args: &[String]) -> CommandResult {
     run(shell, Interpreter::Perl, args)
 }
@@ -56,7 +39,6 @@ impl Interpreter {
         }
     }
 
-    /// The `--version` text each interpreter prints.
     fn version(self) -> String {
         match self {
             Interpreter::Python3 => format!("{PYTHON_VERSION}\n"),
@@ -105,8 +87,7 @@ fn run(shell: &mut Shell, interpreter: Interpreter, args: &[String]) -> CommandR
                 };
                 return run_inline(shell, interpreter, code);
             }
-            // Flags that take a value; consumed so the value is not mistaken
-            // for a script path.
+
             "-m" | "-W" | "-X" | "-I" if !perl => {
                 iter.next();
                 return CommandResult::empty();
@@ -116,10 +97,6 @@ fn run(shell: &mut Shell, interpreter: Interpreter, args: &[String]) -> CommandR
         }
     }
 
-    // No script and no `-c`: the interpreter reads its program from stdin,
-    // which is how `curl … | python3` and `python3 < payload` arrive.
-    // With no stdin either, python prints its banner and exits at EOF. Perl
-    // waits for input and then exits silently.
     if shell.stdin.is_some() || perl {
         return CommandResult::empty();
     }
@@ -129,33 +106,18 @@ fn run(shell: &mut Shell, interpreter: Interpreter, args: &[String]) -> CommandR
     ))
 }
 
-/// Run a `-c`/`-e` one-liner. Nothing is executed; the payload is already in the
-/// `command` event, so all this decides is what the attacker sees back.
 fn run_inline(shell: &mut Shell, interpreter: Interpreter, code: &str) -> CommandResult {
     let Some((host, port)) = inline_endpoint(code) else {
-        // A non-network one-liner: most of these really do exit 0 with no
-        // output, and guessing at output for code that was never run would be
-        // a fabrication, not an emulation.
         return CommandResult::empty();
     };
 
-    // The endpoint is worth as much as a `wget` URL, and lands in the same
-    // event so one query finds every remote host a session named.
     capture_connection(shell, interpreter.name(), format!("tcp://{host}:{port}"));
     interpreter.connection_refused()
 }
 
-/// Run a script operand. The file has to exist in the VFS — a dropper that
-/// `wget`s a payload and then runs it should see it run, and one that names a
-/// path that was never written should see the real error.
 fn run_script(shell: &mut Shell, interpreter: Interpreter, script: &str) -> CommandResult {
     let name = interpreter.name();
     let message = match (shell.vfs.resolve(shell.cwd, script), interpreter) {
-        // ponytail: the body is not interpreted, so a script that would
-        // have printed something prints nothing. `sh` runs its operands
-        // line by line because those lines are shell commands this box
-        // already emulates; there is no equivalent for Python. Upgrade only
-        // if captured payloads show scripts whose output attackers check.
         (Some(id), _) if !shell.vfs.node(id).meta.is_dir() => return CommandResult::empty(),
         (Some(_), Interpreter::Perl) => {
             format!("Can't open perl script \"{script}\": Is a directory\n")
@@ -174,7 +136,6 @@ fn run_script(shell: &mut Shell, interpreter: Interpreter, script: &str) -> Comm
     CommandResult::err(message, USAGE_FAILURE)
 }
 
-/// Python reports the absolute path it tried to open, not the operand.
 fn abs_operand(shell: &Shell, script: &str) -> String {
     if script.starts_with('/') {
         return script.to_string();
@@ -183,14 +144,6 @@ fn abs_operand(shell: &Shell, script: &str) -> String {
     format!("{}/{script}", cwd.trim_end_matches('/'))
 }
 
-/// The host and port a one-liner tries to reach, if it looks like it does.
-///
-/// Deliberately shallow: a quoted host-shaped string plus the integer literal
-/// nearest to it. Python writes the pair one way round
-/// (`s.connect(("1.2.3.4",4444))`) and Perl the other
-/// (`sockaddr_in(4444,inet_aton("1.2.3.4"))`), so "nearest" is what covers both
-/// without parsing either language. Missing an exotic payload costs a
-/// traceback, not a capture — the whole command line is logged regardless.
 fn inline_endpoint(code: &str) -> Option<(String, u16)> {
     if !NETWORK_HINTS.iter().any(|hint| code.contains(hint)) {
         return None;
@@ -219,7 +172,6 @@ fn inline_endpoint(code: &str) -> Option<(String, u16)> {
     None
 }
 
-/// A host is an address or a name, never empty and never a sentence.
 fn is_host_shaped(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= MAX_HOSTNAME_LEN
@@ -228,8 +180,6 @@ fn is_host_shaped(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
 }
 
-/// The port literal closest to the quoted host spanning `start..=end`, on
-/// either side.
 fn nearest_port(ports: &[(usize, u16)], start: usize, end: usize) -> Option<u16> {
     ports
         .iter()
@@ -243,9 +193,6 @@ fn nearest_port(ports: &[(usize, u16)], start: usize, end: usize) -> Option<u16>
         .map(|(_, port)| *port)
 }
 
-/// Every integer literal in `code` that could be a port, with where it starts.
-/// Dotted-quad octets are excluded by requiring the run not to sit between two
-/// dots, so `1.2.3.4` never contributes a "port".
 fn port_literals(chars: &[char]) -> Vec<(usize, u16)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -270,7 +217,6 @@ fn port_literals(chars: &[char]) -> Vec<(usize, u16)> {
     out
 }
 
-/// The banner the interactive interpreter prints before its first prompt.
 fn python_banner() -> String {
     format!("{PYTHON_VERSION} (main, Mar 13 2023, 09:44:40) [GCC 12.2.0] on linux")
 }
