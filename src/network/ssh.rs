@@ -36,47 +36,11 @@ const AUTH_REJECTION_DELAY: Duration = Duration::from_secs(2);
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
-const CTRL_C: u8 = 0x03;
-
-const CTRL_X: u8 = 0x18;
-
-const ESC: u8 = 0x1b;
-
-const BACKSPACE: u8 = 0x08;
-
-const DELETE: u8 = 0x7f;
-
-const DEFAULT_TERMINAL_COLS: u32 = 80;
-
-const DEFAULT_TERMINAL_ROWS: u32 = 24;
-
-const MAX_TERMINAL_DIMENSION: u32 = 10_000;
-
-const FALLBACK_TERM: &str = "xterm-256color";
-
-const MAX_TERM_LEN: usize = 64;
-
-const MAX_ENV_VALUE_LEN: usize = 256;
-
-const MAX_ACCEPTED_ENV: usize = 32;
-
-const SCP_READY_ACK: u8 = 0;
-
-const SCP_SOURCE_EXIT_STATUS: u32 = 1;
-
 const DEFAULT_SCP_TARGET: &str = "/tmp";
-
-const SSH_TTY_PATH: &str = "/dev/pts/0";
-
-const LAST_LOGIN_TIME_FORMAT: &str = "%a %b %e %H:%M:%S %Y";
 
 const UPLOAD_DIR_MODE: u32 = 0o755;
 
 const FILE_PERMISSION_BITS: u32 = 0o7777;
-
-const LISTING_WIDTH: usize = 80;
-
-const LISTING_COLUMN_GAP: usize = 2;
 
 pub async fn serve(config: Arc<Config>) -> Result<()> {
     let host_keys = super::hostkey::load_or_create(&config.host_key_dir)?;
