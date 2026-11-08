@@ -2,15 +2,25 @@
 //! `env`, `export`, `unset`, `clear`, plus process-table emulation (`ps`,
 //! `top`, `kill`, `free`, `uptime`).
 //!
-//! There is no real process table — every row is fabricated from a static base
+//! There is no real process table â€” every row is fabricated from a static base
 //! plus the session's own fake shell PID. `kill` never signals anything; it
 //! only validates the target PID against the fake table and returns the message
 //! a real shell would.
 
 use super::CommandResult;
 use crate::clock;
-use crate::shell::{Pending, Screen, Shell};
+use crate::shell::{Pending, Shell};
 use crate::vfs::snapshot::{USR_BIN, USR_SBIN};
+
+mod process;
+mod top;
+
+pub use process::{kill, pkill, process_name, process_pid, process_table, ps};
+pub use top::{top, TopScreen};
+
+fn is_root(shell: &Shell) -> bool {
+    shell.uid == 0
+}
 
 /// Emulated kernel release (`uname -r`).
 const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
@@ -132,12 +142,12 @@ pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.hostname))
 }
 
-/// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
+/// `nproc` â€” matches the single-core `/proc/cpuinfo` snapshot.
 pub fn nproc(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.persona.cpu_cores))
 }
 
-/// `lscpu` — describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
+/// `lscpu` â€” describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
 /// from the deployment persona so the three cannot drift apart.
 pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     let p = &shell.persona;
@@ -175,13 +185,13 @@ pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     ))
 }
 
-/// `bash`/`sh` — the shell this session already claims to be.
+/// `bash`/`sh` â€” the shell this session already claims to be.
 ///
 /// Three ways a payload arrives, all of which now run:
 ///
 /// - `-c LINE`, the classic `sh -c "cd /tmp; wget ...; ./x"`;
 /// - piped stdin, which is what `... | base64 -d | sh` and `curl ... | sh`
-///   produce — the single most common staging idiom there is;
+///   produce â€” the single most common staging idiom there is;
 /// - a script operand, read back out of the VFS, which is what the
 ///   `wget`-then-`chmod +x`-then-run sequence ends in.
 ///
@@ -241,15 +251,15 @@ const MAX_SCRIPT_LINES: usize = 4096;
 /// Run each line of `text` as a shell command, accumulating both streams.
 ///
 /// This is what makes a dropped script observable: the download was already
-/// captured, but until the body actually ran, nothing downstream of it — the
-/// second-stage fetch, the persistence attempt, the credential change — was
+/// captured, but until the body actually ran, nothing downstream of it â€” the
+/// second-stage fetch, the persistence attempt, the credential change â€” was
 /// ever seen.
 fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
     let mut out = String::new();
     let mut errs = String::new();
     let mut status = 0;
     // `Shell::execute` clears `captures` on entry, so each line would otherwise
-    // wipe the one before it — a script that fetched two payloads would log
+    // wipe the one before it â€” a script that fetched two payloads would log
     // only the second. Accumulate across the whole body and hand the lot back,
     // the way command substitution already does for its subshell.
     let mut collected = std::mem::take(&mut shell.captures);
@@ -349,9 +359,9 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
 
 /// `scp` run as an interactive command.
 ///
-/// The binary has to exist — uploads to this host succeed, which means the
-/// server side runs `scp -t` — but an interactive copy would need a real
-/// network, so it fails as a refused connection — a "timed out" that returns
+/// The binary has to exist â€” uploads to this host succeed, which means the
+/// server side runs `scp -t` â€” but an interactive copy would need a real
+/// network, so it fails as a refused connection â€” a "timed out" that returns
 /// instantly would be a tell in itself. Transfer mode (`-t`/`-f`) never reaches
 /// this handler: the SSH layer intercepts it before the shell sees it.
 pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
@@ -473,7 +483,7 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
 /// exactly like real `su`; a non-root user is prompted for the target's
 /// password first. The honeypot does not gate the switch on a correct password
 /// (the attacker already authenticated over SSH, and denying here yields no
-/// forensic benefit) — but the attempted password *is* captured, and the
+/// forensic benefit) â€” but the attempted password *is* captured, and the
 /// realistic `Password:` prompt removes the "instant, password-less root" tell.
 ///
 /// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
@@ -563,7 +573,7 @@ fn interpret_escapes(s: &str) -> (String, bool) {
             // ones; with no digits at all both are the character itself.
             // ponytail: a command's output is a `String`, so a code above 127
             // becomes that Unicode scalar's UTF-8 bytes where real echo writes
-            // the single byte — `echo -e '\xff' | wc -c` reads 3, not 2.
+            // the single byte â€” `echo -e '\xff' | wc -c` reads 3, not 2.
             // Upgrade when command output becomes a byte buffer.
             Some('0') => out.push(take_code(&mut chars, 8, 3).unwrap_or('\0')),
             Some('x') => match take_code(&mut chars, 16, 2) {
@@ -636,537 +646,6 @@ pub fn clear(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("\x1b[H\x1b[2J\x1b[3J")
 }
 
-/// One row of the fabricated process table.
-struct Proc {
-    pid: u32,
-    ppid: u32,
-    user: String,
-    tty: &'static str,
-    stat: &'static str,
-    /// %CPU.
-    cpu: &'static str,
-    /// %MEM.
-    mem: &'static str,
-    /// Virtual size in KiB.
-    vsz: u32,
-    /// Resident set size in KiB.
-    rss: u32,
-    time: &'static str,
-    /// `ps`'s START column: the boot date for daemons, `HH:MM` for anything
-    /// started in the last day.
-    start: String,
-    cmd: String,
-}
-
-/// The system processes a Debian 12 VM shows, all started at boot — so their
-/// START column is the boot date, not a date fixed at compile time that a
-/// long-running honeypot eventually reports as older than its own uptime.
-fn base_table() -> Vec<Proc> {
-    let boot = clock::format(clock::boot_time(), "%b%d");
-    vec![
-        Proc {
-            pid: 1,
-            ppid: 0,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "Ss",
-            cpu: "0.0",
-            mem: "0.4",
-            vsz: 167404,
-            rss: 13072,
-            time: "0:02",
-            start: boot.clone(),
-            cmd: "/sbin/init".to_string(),
-        },
-        Proc {
-            pid: 2,
-            ppid: 0,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "S",
-            cpu: "0.0",
-            mem: "0.0",
-            vsz: 0,
-            rss: 0,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "[kthreadd]".to_string(),
-        },
-        Proc {
-            pid: 312,
-            ppid: 1,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "Ss",
-            cpu: "0.0",
-            mem: "0.3",
-            vsz: 24684,
-            rss: 9216,
-            time: "0:01",
-            start: boot.clone(),
-            cmd: "/lib/systemd/systemd-journald".to_string(),
-        },
-        Proc {
-            pid: 334,
-            ppid: 1,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "Ss",
-            cpu: "0.0",
-            mem: "0.2",
-            vsz: 21916,
-            rss: 6400,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "/lib/systemd/systemd-udevd".to_string(),
-        },
-        Proc {
-            pid: 501,
-            ppid: 1,
-            user: "systemd+".to_string(),
-            tty: "?",
-            stat: "Ssl",
-            cpu: "0.0",
-            mem: "0.3",
-            vsz: 90264,
-            rss: 9088,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "/lib/systemd/systemd-resolved".to_string(),
-        },
-        Proc {
-            pid: 512,
-            ppid: 1,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "Ss",
-            cpu: "0.0",
-            mem: "0.2",
-            vsz: 6892,
-            rss: 4992,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "/usr/sbin/cron -f".to_string(),
-        },
-        Proc {
-            pid: 528,
-            ppid: 1,
-            user: "message+".to_string(),
-            tty: "?",
-            stat: "Ss",
-            cpu: "0.0",
-            mem: "0.2",
-            vsz: 8460,
-            rss: 4736,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "/usr/bin/dbus-daemon --system".to_string(),
-        },
-        Proc {
-            pid: 604,
-            ppid: 1,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "Ss",
-            cpu: "0.0",
-            mem: "0.4",
-            vsz: 15420,
-            rss: 9472,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups".to_string(),
-        },
-        Proc {
-            pid: 611,
-            ppid: 1,
-            user: "root".to_string(),
-            tty: "?",
-            stat: "Ssl",
-            cpu: "0.0",
-            mem: "0.5",
-            vsz: 313196,
-            rss: 12544,
-            time: "0:01",
-            start: boot.clone(),
-            cmd: "/usr/lib/systemd/systemd-logind".to_string(),
-        },
-        Proc {
-            pid: 1188,
-            ppid: 1,
-            user: "root".to_string(),
-            tty: "tty1",
-            stat: "Ss+",
-            cpu: "0.0",
-            mem: "0.1",
-            vsz: 5612,
-            rss: 3200,
-            time: "0:00",
-            start: boot.clone(),
-            cmd: "/sbin/agetty -o -p -- \\u --noclear tty1 linux".to_string(),
-        },
-    ]
-}
-
-/// The command line as typed, which is what `ps`/`top` show for the process
-/// doing the asking.
-fn invocation(name: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name} {}", args.join(" "))
-    }
-}
-
-/// Build the full table including this session's own login chain. `running` is
-/// the command asking for the table: it is itself in the process list it
-/// prints, so `top` must not report `ps aux` as the process at the top.
-/// The `(pid, command)` pairs the fabricated process table holds.
-///
-/// `pidof`, `pgrep` and `killall` all read this, so none of them can disagree
-/// with what `ps` prints — three commands inventing their own tables would
-/// contradict each other on the first cross-check.
-pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
-    session_table(shell, "ps")
-        .into_iter()
-        .map(|p| (p.pid, p.cmd))
-        .collect()
-}
-
-/// The executable name a `ps` command line reports, the way `/proc/PID/comm`
-/// would: the first word, minus any directory, minus the `sshd: ` title prefix
-/// a privilege-separated daemon rewrites its argv to, minus the brackets a
-/// kernel thread is shown in.
-///
-/// Without this, `pidof sshd` misses the one process an attacker is guaranteed
-/// to look for — `ps` prints `sshd: /usr/sbin/sshd -D [listener]`, whose first
-/// word is `sshd:`.
-pub fn process_name(cmd: &str) -> &str {
-    let first = cmd.split_whitespace().next().unwrap_or(cmd);
-    let first = first.strip_suffix(':').unwrap_or(first);
-    let first = first.rsplit('/').next().unwrap_or(first);
-    first.trim_start_matches('[').trim_end_matches(']')
-}
-
-/// The pid of the first process whose executable name is `name`, if any.
-pub fn process_pid(shell: &Shell, name: &str) -> Option<u32> {
-    process_table(shell)
-        .into_iter()
-        .find(|(_, cmd)| process_name(cmd) == name)
-        .map(|(pid, _)| pid)
-}
-
-fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
-    let mut table = base_table();
-    let user = shell.username.clone();
-    let sshd_pid = shell.pid.saturating_sub(2).max(1000);
-    let bash_pid = shell.pid;
-    let ps_pid = shell.pid + 1;
-    let login = clock::format(shell.login, "%H:%M");
-    let now = clock::format(clock::now(), "%H:%M");
-
-    table.push(Proc {
-        pid: sshd_pid,
-        ppid: 604,
-        user: user.clone(),
-        tty: "?",
-        stat: "Ss",
-        cpu: "0.0",
-        mem: "0.4",
-        vsz: 17668,
-        rss: 10880,
-        time: "0:00",
-        start: login.clone(),
-        cmd: format!("sshd: {}@pts/0", shell.username),
-    });
-    table.push(Proc {
-        pid: bash_pid,
-        ppid: sshd_pid,
-        user: user.clone(),
-        tty: "pts/0",
-        stat: "Ss",
-        cpu: "0.0",
-        mem: "0.2",
-        vsz: 8228,
-        rss: 5376,
-        time: "0:00",
-        start: login.clone(),
-        cmd: "-bash".to_string(),
-    });
-    table.push(Proc {
-        pid: ps_pid,
-        ppid: bash_pid,
-        user: user.clone(),
-        tty: "pts/0",
-        stat: "R+",
-        cpu: "0.0",
-        mem: "0.1",
-        vsz: 10072,
-        rss: 3200,
-        time: "0:00",
-        start: now,
-        cmd: running.to_string(),
-    });
-    table
-}
-
-/// `ps [aux|-ef|...]`
-pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
-    let joined: String = args.join("");
-    let table = session_table(shell, &invocation("ps", args));
-
-    // `ps aux` / `ps -ef` style: show every process. Bare `ps` shows only this
-    // session's processes on its tty.
-    let show_all = joined.contains('a')
-        || joined.contains('e')
-        || joined.contains('A')
-        || args.iter().any(|a| a == "-ef" || a == "aux");
-    let ef = args.iter().any(|a| a == "-ef") || joined.contains('f') && !joined.contains('u');
-    let user_fmt = joined.contains('u') || args.iter().any(|a| a == "aux");
-
-    let mut out = String::new();
-    if ef {
-        out.push_str("UID          PID    PPID  C STIME TTY          TIME CMD\n");
-        for p in &table {
-            if !show_all && p.tty != "pts/0" {
-                continue;
-            }
-            out.push_str(&format!(
-                "{:<8} {:>6} {:>7}  0 {:>5} {:<8} {:>8} {}\n",
-                p.user, p.pid, p.ppid, p.start, p.tty, p.time, p.cmd
-            ));
-        }
-    } else if user_fmt {
-        out.push_str(
-            "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n",
-        );
-        for p in &table {
-            if !show_all && p.tty != "pts/0" {
-                continue;
-            }
-            out.push_str(&format!(
-                "{:<8} {:>5} {:>4} {:>4} {:>6} {:>5} {:<8} {:<4} {:>5} {:>6} {}\n",
-                p.user, p.pid, p.cpu, p.mem, p.vsz, p.rss, p.tty, p.stat, p.start, p.time, p.cmd
-            ));
-        }
-    } else {
-        out.push_str("    PID TTY          TIME CMD\n");
-        for p in &table {
-            if !show_all && p.tty != "pts/0" {
-                continue;
-            }
-            out.push_str(&format!(
-                "{:>7} {:<12} {:>5} {}\n",
-                p.pid,
-                p.tty,
-                p.time,
-                p.cmd.split_whitespace().next().unwrap_or(&p.cmd)
-            ));
-        }
-    }
-    CommandResult::ok(out)
-}
-
-/// One `top` display, able to redraw itself at any later instant.
-///
-/// The process rows are fixed when the command runs — this box has one session
-/// on it, and nothing starts or exits while an attacker watches — but the
-/// header carries the clock and the uptime, which are exactly what a viewer
-/// checks to see whether the screen is alive. Holding only the rendered rows
-/// keeps this free of any borrow on the shell, so the network layer can redraw
-/// it on a timer without reaching back into the session.
-#[derive(Clone)]
-pub struct TopScreen {
-    rows: Vec<String>,
-    total: usize,
-    running: usize,
-}
-
-impl TopScreen {
-    /// Render the whole display as of now.
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("top - {}\n", clock::uptime_banner()));
-        out.push_str(&format!(
-            "Tasks: {:>3} total,   {} running, {:>3} sleeping,   0 stopped,   0 zombie\n",
-            self.total,
-            self.running,
-            self.total - self.running
-        ));
-        out.push_str(
-            "%Cpu(s):  0.3 us,  0.2 sy,  0.0 ni, 99.4 id,  0.1 wa,  0.0 hi,  0.0 si,  0.0 st\n",
-        );
-        out.push_str(
-            "MiB Mem :   1993.4 total,   1468.3 free,    179.0 used,    346.0 buff/cache\n",
-        );
-        out.push_str(
-            "MiB Swap:      0.0 total,      0.0 free,      0.0 used.   1723.6 avail Mem\n",
-        );
-        out.push('\n');
-        out.push_str(
-            "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n",
-        );
-        for row in &self.rows {
-            out.push_str(row);
-        }
-        out
-    }
-}
-
-/// `top [-b] [-n N]`
-///
-/// On a terminal, real `top` takes the screen and redraws every three seconds
-/// until `q`. The display is built here; the holding is the network layer's,
-/// which is the only layer allowed to own a timer. Batch mode (`-b`), an
-/// iteration count (`-n`), a pipe, and any channel without a terminal all get
-/// the one-shot dump instead — the same cases real `top` prints once for.
-pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
-    let table = session_table(shell, &invocation("top", args));
-    let running = table.iter().filter(|p| p.stat.starts_with('R')).count();
-    let rows = table
-        .iter()
-        .map(|p| {
-            format!(
-                "{:>7} {:<8}  20   0 {:>7} {:>6} {:>6} {} {:>5} {:>5}   {:>7} {}\n",
-                p.pid,
-                p.user,
-                p.vsz,
-                p.rss,
-                p.rss / 2,
-                &p.stat[..1],
-                p.cpu,
-                p.mem,
-                p.time,
-                p.cmd.split_whitespace().next().unwrap_or(&p.cmd)
-            )
-        })
-        .collect();
-    let screen = TopScreen {
-        rows,
-        total: table.len(),
-        running,
-    };
-
-    let batch = args
-        .iter()
-        .any(|a| a == "-b" || a == "--batch" || (a.starts_with('-') && a.contains('n')));
-    if !batch && shell.interactive && shell.stdout_is_tty {
-        // The display paints itself once the network layer picks it up, so the
-        // command writes nothing: a frame here would be painted twice.
-        shell.screen = Some(Screen::Top(screen));
-        return CommandResult::empty();
-    }
-    CommandResult::ok(screen.render())
-}
-
-/// `kill [-SIG] PID...`
-pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
-    let mut pids: Vec<&str> = Vec::new();
-    let mut list = false;
-    for arg in args {
-        match arg.as_str() {
-            "-l" | "--list" => list = true,
-            // Signal specifiers (e.g. -9, -SIGKILL, -s TERM): accepted, ignored.
-            s if s.starts_with('-') => {}
-            other => pids.push(other),
-        }
-    }
-
-    if list {
-        return CommandResult::ok(
-            " 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 4) SIGILL\t 5) SIGTRAP\n\
-             6) SIGABRT\t 7) SIGBUS\t 8) SIGFPE\t 9) SIGKILL\t10) SIGUSR1\n\
-            11) SIGSEGV\t12) SIGUSR2\t13) SIGPIPE\t14) SIGALRM\t15) SIGTERM\n",
-        );
-    }
-
-    if pids.is_empty() {
-        return CommandResult::err(
-            "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]\n",
-            2,
-        );
-    }
-
-    let table = session_table(shell, &invocation("kill", args));
-    let mut out = String::new();
-    let mut status = 0;
-    for pid_str in pids {
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            out.push_str(&format!(
-                "-bash: kill: {pid_str}: arguments must be process or job IDs\n"
-            ));
-            status = 1;
-            continue;
-        };
-        match table.iter().find(|p| p.pid == pid) {
-            None => {
-                out.push_str(&format!("-bash: kill: ({pid}) - No such process\n"));
-                status = 1;
-            }
-            Some(p) => {
-                // Non-root may only signal its own processes; system PIDs are
-                // owned by root, so an unprivileged attacker is denied.
-                if shell.uid != 0 && p.user != shell.username {
-                    out.push_str(&format!("-bash: kill: ({pid}) - Operation not permitted\n"));
-                    status = 1;
-                }
-                // Otherwise: silently "succeed" without affecting anything.
-            }
-        }
-    }
-    if status == 0 {
-        CommandResult::empty()
-    } else {
-        CommandResult::err(out, status)
-    }
-}
-
-/// `pkill [-SIGNAL] NAME`
-///
-/// Matches process names (substring) in the same fake table `ps`/`kill` use,
-/// applying the same ownership rule as `kill`. Tab-completion has always
-/// offered `pkill`; this closes the gap where it fell through to "command not
-/// found".
-pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
-    let names: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-
-    if names.is_empty() {
-        return CommandResult::err(
-            "pkill: no matching criteria specified\nTry `pkill --help' for more information.\n",
-            2,
-        );
-    }
-
-    let table = session_table(shell, &invocation("pkill", args));
-    let mut out = String::new();
-    let mut matched_any = false;
-    let mut denied = false;
-    for name in &names {
-        for p in table.iter().filter(|p| p.cmd.contains(name)) {
-            if shell.uid != 0 && p.user != shell.username {
-                out.push_str(&format!(
-                    "pkill: killing pid {} failed: Operation not permitted\n",
-                    p.pid
-                ));
-                denied = true;
-            } else {
-                matched_any = true;
-            }
-        }
-    }
-
-    if denied {
-        CommandResult::err(out, 1)
-    } else if matched_any {
-        CommandResult::empty()
-    } else {
-        CommandResult::err("", 1)
-    }
-}
-
 /// `free [-h|-m|-g]`
 pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human");
@@ -1174,7 +653,7 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let giga = args.iter().any(|a| a == "-g");
 
     // Base figures in KiB, matching `/proc/meminfo` and `top`'s header. The
-    // columns must add up — `total = used + free + buff/cache` is what a real
+    // columns must add up â€” `total = used + free + buff/cache` is what a real
     // `free` prints, and a row that doesn't balance is arithmetic anyone can
     // check in one command.
     // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
@@ -1262,7 +741,7 @@ pub const BUILTINS: &[&str] = &[
     "cd", "export", "unset", "history", "exit", "logout", "alias", "source",
 ];
 
-/// `history` — print the session's command history, bash-style.
+/// `history` â€” print the session's command history, bash-style.
 pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
     if args.iter().any(|a| a == "-c") {
         shell.history.clear();
@@ -1298,7 +777,7 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
 
 /// Resolve a known command name to the absolute path `which` would print, or
 /// `None` if it is not a recognised external binary. Resolves against the
-/// listed set (`USR_BIN`/`USR_SBIN` — the same names `ls /usr/bin` shows),
+/// listed set (`USR_BIN`/`USR_SBIN` â€” the same names `ls /usr/bin` shows),
 /// not the runnable registry, so `which gzip` finds it even though `gzip`
 /// isn't wired into `commands::dispatch`.
 fn binary_path(name: &str) -> Option<String> {
@@ -1314,7 +793,7 @@ fn binary_path(name: &str) -> Option<String> {
     }
 }
 
-/// `w` — who is logged on and what they are doing. A single fabricated session
+/// `w` â€” who is logged on and what they are doing. A single fabricated session
 /// for the current user; other connections are never revealed.
 pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     let header = format!(" {}\n", clock::uptime_banner());
@@ -1328,7 +807,7 @@ pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{header}{cols}{row}"))
 }
 
-/// `last` — listing of recent logins. Fabricated, but anchored to the same
+/// `last` â€” listing of recent logins. Fabricated, but anchored to the same
 /// boot and previous-login instants PAM's `Last login` banner reports, so the
 /// two cannot contradict each other.
 pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
@@ -1358,7 +837,7 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
 pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
     // Every tmpfs size is derived from the persona's `MemTotal` the way the
-    // kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
+    // kernel and systemd size them â€” devtmpfs and /dev/shm at half of RAM,
     // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
     // `free` reports is a two-command honeypot check.
     let mem = shell.persona.mem_total_kb;
@@ -1412,7 +891,7 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `mount` — print the (fabricated) mount table.
+/// `mount` â€” print the (fabricated) mount table.
 pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
         proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
@@ -1448,7 +927,7 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// `groups [USER]...` — the group memberships mirrored from `id`.
+/// `groups [USER]...` â€” the group memberships mirrored from `id`.
 pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     let line = if shell.uid == 0 {
         "root".to_string()
@@ -1458,17 +937,17 @@ pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{line}\n"))
 }
 
-/// `arch` — machine hardware name, matching `uname -m`.
+/// `arch` â€” machine hardware name, matching `uname -m`.
 pub fn arch(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{MACHINE}\n"))
 }
 
-/// `tty` — the pseudo-terminal this session runs on (matches `ps`/`w`).
+/// `tty` â€” the pseudo-terminal this session runs on (matches `ps`/`w`).
 pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("/dev/pts/0\n")
 }
 
-/// `lsb_release [-a|-s|-i|-d|-r|-c]` — Debian 12 (bookworm) release info.
+/// `lsb_release [-a|-s|-i|-d|-r|-c]` â€” Debian 12 (bookworm) release info.
 ///
 /// A near-universal fingerprinting step in automated recon; the values match
 /// the `/etc/os-release` snapshot the VFS presents.
@@ -1549,7 +1028,7 @@ const DMESG_BUFFER: &str = "\
 [    2.310000] e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex\n\
 [    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
 
-/// `dmesg` — the kernel ring buffer.
+/// `dmesg` â€” the kernel ring buffer.
 ///
 /// Debian 12 ships `kernel.dmesg_restrict=1`, so an unprivileged user gets a
 /// permission error; only root sees the (fabricated) buffer.
@@ -1563,7 +1042,7 @@ pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(DMESG_BUFFER)
 }
 
-/// `date [-u] [+FORMAT]` — the current UTC time.
+/// `date [-u] [+FORMAT]` â€” the current UTC time.
 ///
 /// The emulated host runs in UTC, so the `-u` flag is a no-op. Setting the
 /// clock (`date MMDDhhmm...`) would require root and is accepted as a no-op
