@@ -276,6 +276,16 @@ pub enum Separator {
     OrIf,
 }
 
+impl Separator {
+    pub fn permits(self, previous_status: i32) -> bool {
+        match self {
+            Separator::Always => true,
+            Separator::AndIf => previous_status == 0,
+            Separator::OrIf => previous_status != 0,
+        }
+    }
+}
+
 /// One command of a compound line, with the operator that gates it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Segment<'a> {

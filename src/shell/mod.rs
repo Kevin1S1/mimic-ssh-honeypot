@@ -9,8 +9,14 @@
 pub mod arith;
 pub mod complete;
 pub mod env;
+mod exec;
+mod expand;
 pub mod line;
 pub mod parser;
+mod pending;
+mod redirect;
+
+pub use pending::Pending;
 
 use crate::commands;
 use crate::persona::Persona;
@@ -63,6 +69,11 @@ impl Output {
         out.push(stdout, stderr);
         out
     }
+
+    fn prepend_stderr(&mut self, text: &str) {
+        self.text.insert_str(0, text);
+        self.stderr.insert_str(0, text);
+    }
 }
 
 /// A structured event produced by a command that the network layer drains and
@@ -111,59 +122,6 @@ pub enum Capture {
     },
 }
 
-/// A follow-up line of input a command is waiting for. While a shell has a
-/// pending prompt, the network layer collects the next line (with echo
-/// suppressed) and feeds it back via [`Shell::resume`], rather than treating it
-/// as a new command.
-#[derive(Debug, Clone)]
-pub enum Pending {
-    /// `su [USER]` is waiting for the target's password before switching.
-    SuPassword {
-        /// The account to become once a password is supplied.
-        target: String,
-    },
-    /// `passwd [USER]` is collecting a new secret. Real `passwd` asks twice and
-    /// refuses if the two differ, so both prompts are emulated: the second one
-    /// is where a script that pipes the same line twice succeeds and a typo
-    /// fails, which is the behaviour a bot's `passwd` wrapper is written for.
-    NewPassword {
-        /// The account whose password is being set.
-        target: String,
-        /// The first answer, once given.
-        first: Option<String>,
-    },
-    /// A here-document (`cat << EOF`) is collecting its body. The line that
-    /// opened it runs once a line holds the delimiter and nothing else.
-    Heredoc {
-        /// The command line with the `<<` operator and delimiter removed.
-        command: String,
-        /// The line exactly as it was typed, for the capture.
-        raw: String,
-        /// What ends the body, and how the body is treated.
-        doc: parser::Heredoc,
-        /// The lines collected so far, each newline-terminated.
-        body: String,
-    },
-}
-
-impl Pending {
-    /// Whether the client's answer is echoed back as it is typed. A password
-    /// is not; a here-document body is ordinary input and bash's readline
-    /// echoes it under its continuation prompt.
-    pub fn echoes(&self) -> bool {
-        matches!(self, Pending::Heredoc { .. })
-    }
-
-    /// The prompt shown while this is outstanding, if the shell draws one.
-    /// `su` writes its own; a here-document gets bash's `PS2`.
-    pub fn prompt(&self) -> Option<&'static str> {
-        match self {
-            Pending::SuPassword { .. } | Pending::NewPassword { .. } => None,
-            Pending::Heredoc { .. } => Some("> "),
-        }
-    }
-}
-
 /// A full-screen display or terminal hold a command asked to take over with.
 /// The network layer takes it after the line runs and owns the redraw timer
 /// and keystroke handling — this layer never has a clock or a channel of its
@@ -187,54 +145,13 @@ pub enum Screen {
 /// belong to the connection rather than to the logged-in identity.
 const CONNECTION_VARS: &[&str] = &["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"];
 
-/// The bit bucket. Writes to it are discarded instead of filling the VFS —
-/// `> /dev/null` is in most bot payloads, and a real one never grows.
-const DEV_NULL: &str = "/dev/null";
-
-/// An opened redirect target: where a stream's output goes, and whether it adds
-/// to what is already there.
-#[derive(Debug, Clone)]
-struct Sink {
-    /// The expanded target path, for error messages.
-    path: String,
-    /// The node the output lands in, fixed when the target was opened. `None`
-    /// is `/dev/null`.
-    node: Option<NodeId>,
-    /// `>>`: keep the existing contents.
-    append: bool,
-}
-
-/// Which sink each of a stage's output streams was pointed at. `None` means the
-/// stream still reaches the client.
-#[derive(Debug, Default)]
-struct Sinks {
-    /// Target for `>`, `1>`, and the stdout half of `&>`.
-    stdout: Option<Sink>,
-    /// Target for `2>` and the stderr half of `&>`.
-    stderr: Option<Sink>,
-    /// `2>&1` while stdout was still the terminal: the two share one
-    /// descriptor, so what the command writes to stderr comes back to the
-    /// client on stdout — which is what puts it in the pipe that
-    /// `cmd 2>&1 | grep` is built around.
-    stderr_merged: bool,
-    /// `>&2`/`1>&2`, the mirror case.
-    stdout_merged: bool,
-}
-
-/// The session state a command substitution runs on a copy of, restored when
-/// its subshell ends. The filesystem is deliberately not in here: a real
-/// subshell shares it with its parent.
-struct Subshell {
-    env: Env,
-    cwd: NodeId,
-    prev_cwd: NodeId,
-    home: NodeId,
-    username: String,
-    uid: u32,
-    gid: u32,
-    pending: Option<Pending>,
-    screen: Option<Screen>,
-}
+const ROOT_USER: &str = "root";
+const ROOT_HOME: &str = "/root";
+const ROOT_UID: u32 = 0;
+const REGULAR_UID: u32 = 1000;
+const SHELL_PID: u32 = 1337;
+const HOME_DIR_MODE: u32 = 0o755;
+const REGULAR_FILE_MODE: u32 = 0o644;
 
 /// Per-session shell.
 pub struct Shell {
@@ -332,21 +249,9 @@ impl Shell {
     /// created on demand.
     pub fn with_persona(username: &str, hostname: &str, persona: Persona) -> Self {
         let mut vfs = snapshot::build(hostname, &persona);
-        let user = if username.is_empty() {
-            "root"
-        } else {
-            username
-        };
-
-        let (uid, gid, home_path) = if user == "root" {
-            (0, 0, "/root".to_string())
-        } else {
-            (1000, 1000, format!("/home/{user}"))
-        };
-
-        // Ensure the home directory exists (attackers may log in as any name).
-        let home = ensure_home(&mut vfs, &home_path, uid, gid);
-        let env = Env::login(user, &home_path, hostname);
+        let account = Account::named(username);
+        let home = account.ensure_home(&mut vfs);
+        let env = Env::login(account.name, &account.home, hostname);
 
         Self {
             vfs,
@@ -354,12 +259,12 @@ impl Shell {
             cwd: home,
             home,
             prev_cwd: home,
-            username: user.to_string(),
+            username: account.name.to_string(),
             hostname: hostname.to_string(),
-            uid,
-            gid,
+            uid: account.uid,
+            gid: account.gid,
             last_status: 0,
-            pid: 1337,
+            pid: SHELL_PID,
             login: crate::clock::now(),
             nesting: 0,
             subst_budget: commands::MAX_COMMAND_OUTPUT_BYTES,
@@ -401,7 +306,7 @@ impl Shell {
 
     /// The interactive prompt string (no trailing newline).
     pub fn prompt(&self) -> String {
-        let sigil = if self.uid == 0 { '#' } else { '$' };
+        let sigil = if self.uid == ROOT_UID { '#' } else { '$' };
         let cwd = self.cwd_path();
         let home = self.vfs.path_of(self.home);
         let display = if cwd == home {
@@ -423,788 +328,107 @@ impl Shell {
         parser::tokenize(&expanded)
     }
 
-    /// Expand `$VAR`, `${VAR}`, `$?`, `$$`, `$(…)`, `` `…` `` and `$((…))` in
-    /// `line`, respecting the quoting around each one: single quotes suppress
-    /// expansion entirely, double quotes suppress the word splitting the
-    /// tokenizer would otherwise do, and a backslash protects the character
-    /// after it.
-    fn expand(&mut self, line: &str) -> String {
-        self.expand_with(line, Expansion::Words)
-    }
-
-    /// The body of [`Shell::expand`], parameterised by what its result feeds.
-    fn expand_with(&mut self, line: &str, mode: Expansion) -> String {
-        let mut out = String::new();
-        let mut in_single = false;
-        let mut in_double = false;
-        // A here-document body is a command's stdin, not shell source: quotes
-        // in it are ordinary characters, so the quote state never leaves
-        // `false` and every expanded value is emitted exactly as it is.
-        let words = mode == Expansion::Words;
-        let mut chars = line.char_indices().peekable();
-
-        while let Some((i, c)) = chars.next() {
-            // A substitution is one word however much it holds, so it is
-            // recognised before the character-by-character rules below.
-            if !in_single && (c == '$' || c == '`') {
-                if let Some(subst) = parser::substitution_at(line, i) {
-                    let body = &line[subst.body.0..subst.body.1];
-                    let value = if subst.arithmetic {
-                        self.arithmetic(body)
-                    } else {
-                        self.substitute(body)
-                    };
-                    emit(&mut out, mode, &value, in_double);
-                    while chars.peek().is_some_and(|(j, _)| *j < subst.end) {
-                        chars.next();
-                    }
-                    continue;
-                }
-            }
-            match c {
-                '\\' if !in_single => {
-                    if words {
-                        // The escape reaches the tokenizer intact, so whatever
-                        // it protects stays data — including a `$` that would
-                        // expand.
-                        out.push(c);
-                        if let Some((_, next)) = chars.next() {
-                            out.push(next);
-                        }
-                    } else if matches!(chars.peek(), Some((_, '$' | '`' | '\\'))) {
-                        // In a body a backslash protects only what could still
-                        // expand; before anything else it is a plain character.
-                        let (_, next) = chars.next().expect("peeked");
-                        out.push(next);
-                    } else {
-                        out.push(c);
-                    }
-                }
-                '\'' if words && !in_double => {
-                    in_single = !in_single;
-                    out.push(c);
-                }
-                '"' if words && !in_single => {
-                    in_double = !in_double;
-                    out.push(c);
-                }
-                '$' if !in_single => match chars.peek().map(|&(_, n)| n) {
-                    Some('?') => {
-                        chars.next();
-                        emit(&mut out, mode, &self.last_status.to_string(), in_double);
-                    }
-                    Some('$') => {
-                        chars.next();
-                        emit(&mut out, mode, &self.pid.to_string(), in_double);
-                    }
-                    Some('#') => {
-                        chars.next();
-                        emit(&mut out, mode, "0", in_double);
-                    }
-                    Some('0') => {
-                        chars.next();
-                        emit(&mut out, mode, "-bash", in_double);
-                    }
-                    Some('*') | Some('@') => {
-                        chars.next();
-                        emit(&mut out, mode, "", in_double);
-                    }
-                    Some(d) if d.is_ascii_digit() => {
-                        chars.next();
-                        emit(&mut out, mode, "", in_double);
-                    }
-                    Some('{') => {
-                        chars.next();
-                        let mut name = String::new();
-                        for (_, n) in chars.by_ref() {
-                            if n == '}' {
-                                break;
-                            }
-                            name.push(n);
-                        }
-                        let val = match name.as_str() {
-                            "#" => "0".to_string(),
-                            "0" => "-bash".to_string(),
-                            "?" => self.last_status.to_string(),
-                            "$" => self.pid.to_string(),
-                            "*" | "@" => String::new(),
-                            _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) => {
-                                String::new()
-                            }
-                            _ => self.env.get(&name).unwrap_or("").to_string(),
-                        };
-                        emit(&mut out, mode, &val, in_double);
-                    }
-                    Some(n) if n.is_alphabetic() || n == '_' => {
-                        let mut name = String::new();
-                        while let Some(&(_, n)) = chars.peek() {
-                            if n.is_alphanumeric() || n == '_' {
-                                name.push(n);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                        emit(&mut out, mode, self.env.get(&name).unwrap_or(""), in_double);
-                    }
-                    _ => out.push('$'),
-                },
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// Run a substitution's body and return the text bash would splice into the
-    /// line: the command's *stdout* with its trailing newlines stripped.
-    /// Anything the body wrote to stderr is not part of the value — it is held
-    /// for the outer line to emit, so `echo $(ls /nosuch)` reports the error
-    /// and echoes an empty argument, exactly as bash does.
-    ///
-    /// The body is a command line of its own — `$(cd /tmp; ls | wc -l)` — so it
-    /// runs through [`Shell::execute`], in a subshell: what it changes about the
-    /// session itself (working directory, environment, identity) is discarded
-    /// when it ends, while what it writes to the filesystem stays, exactly as a
-    /// real subshell's fork boundary falls. It also cannot end the session
-    /// (bash's subshell exit does not log the parent out), whatever it captured
-    /// is added to the outer line's captures rather than replacing them, and
-    /// both the nesting depth and the per-line output budget bound what it can
-    /// spend.
-    fn substitute(&mut self, body: &str) -> String {
-        // Every level here is a stack frame that `dispatch`'s cap never sees:
-        // the descent runs through expansion, before any command is reached.
-        if self.nesting >= commands::MAX_NESTED_COMMANDS {
-            return String::new();
-        }
-        self.nesting += 1;
-        self.subst_depth += 1;
-        let session = Subshell {
-            env: self.env.clone(),
-            cwd: self.cwd,
-            prev_cwd: self.prev_cwd,
-            home: self.home,
-            username: self.username.clone(),
-            uid: self.uid,
-            gid: self.gid,
-            pending: self.pending.clone(),
-            screen: self.screen.clone(),
-        };
-        let saved = std::mem::take(&mut self.captures);
-        let output = self.execute(body);
-        let inner = std::mem::replace(&mut self.captures, saved);
-        self.captures.extend(inner);
-        self.env = session.env;
-        self.cwd = session.cwd;
-        self.prev_cwd = session.prev_cwd;
-        self.home = session.home;
-        self.username = session.username;
-        self.uid = session.uid;
-        self.gid = session.gid;
-        self.pending = session.pending;
-        // A substitution runs in a subshell with no terminal of its own, so
-        // `echo $(top)` captures a dump and does not take the screen.
-        self.screen = session.screen;
-        self.nesting -= 1;
-        self.subst_depth -= 1;
-
-        // Held stderr is capped like any other stream: a line has room for
-        // hundreds of substitutions, and each one's stderr is only bounded on
-        // its own.
-        self.subst_stderr.push_str(&output.stderr);
-        commands::truncate_stream(&mut self.subst_stderr, commands::MAX_COMMAND_OUTPUT_BYTES);
-        let mut value = output.stdout;
-        if output.exit {
-            // `logout` is what an interactive shell prints on its way out; a
-            // subshell that exits prints nothing.
-            if let Some(rest) = value.strip_suffix(commands::LOGOUT) {
-                value.truncate(rest.len());
-            }
-        }
-        while value.ends_with('\n') {
-            value.pop();
-        }
-
-        // One command's output is already capped, but a line has room for
-        // hundreds of substitutions; the budget bounds their sum the way
-        // `execute` bounds a chained line's.
-        if value.len() > self.subst_budget {
-            let mut cut = self.subst_budget;
-            while cut > 0 && !value.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            value.truncate(cut);
-        }
-        self.subst_budget -= value.len();
-        value
-    }
-
-    /// Evaluate an `$((…))` body and return the number it comes to.
-    ///
-    /// The body is expanded first, so `$((x + $(echo 1)))` works, and bare
-    /// names resolve against the environment. A malformed expression or a
-    /// division by zero comes to zero rather than the syntax error bash prints,
-    /// because expansion has no channel to fail on.
-    // ponytail: no arithmetic syntax errors; upgrade when expansion can report
-    // a failure back to the command line.
-    fn arithmetic(&mut self, body: &str) -> String {
-        if self.nesting >= commands::MAX_NESTED_COMMANDS {
-            return "0".to_string();
-        }
-        self.nesting += 1;
-        let expanded = self.expand(body);
-        self.nesting -= 1;
-        arith::eval(&self.env, &expanded).unwrap_or(0).to_string()
-    }
-
     /// Switch this session's effective identity to `user` (`su`), as if a
     /// fresh login shell for that account. Mirrors [`Shell::new`]'s
     /// root/non-root split so `su`, `su root`, and `su <name>` all land the
     /// attacker in a believable home directory with a matching environment.
     pub fn switch_user(&mut self, user: &str) {
-        let user = if user.is_empty() { "root" } else { user };
-        let (uid, gid, home_path) = if user == "root" {
-            (0, 0, "/root".to_string())
-        } else {
-            (1000, 1000, format!("/home/{user}"))
-        };
-        let home = ensure_home(&mut self.vfs, &home_path, uid, gid);
+        let account = Account::named(user);
+        let home = account.ensure_home(&mut self.vfs);
         // `su` inherits the connection environment from the caller's shell —
         // only the login variables are rebuilt for the new identity.
         let connection: Vec<(&str, String)> = CONNECTION_VARS
             .iter()
             .filter_map(|key| self.env.get(key).map(|value| (*key, value.to_string())))
             .collect();
-        self.env = Env::login(user, &home_path, &self.hostname);
+        self.env = Env::login(account.name, &account.home, &self.hostname);
         for (key, value) in connection {
             self.env.set(key, &value);
         }
-        self.username = user.to_string();
-        self.uid = uid;
-        self.gid = gid;
+        self.username = account.name.to_string();
+        self.uid = account.uid;
+        self.gid = account.gid;
         self.cwd = home;
         self.home = home;
         self.prev_cwd = home;
     }
+}
 
-    /// Complete a [`Pending`] interactive prompt with the line the client just
-    /// entered (e.g. the password for `su`). Clears the pending state and
-    /// returns the resulting output.
-    pub fn resume(&mut self, input: &str) -> Output {
-        match self.pending.take() {
-            Some(Pending::SuPassword { target }) => {
-                // Capture the attempted password as forensic data, then switch.
-                // The honeypot keeps the attacker engaged rather than gating on
-                // a real credential (same rationale as `sudo`/`su`), but a
-                // realistic `Password:` prompt still has to appear first.
-                self.captures.push(Capture::SuAuth {
-                    target: target.clone(),
-                    password: input.to_string(),
-                });
-                self.switch_user(&target);
-                Output::default()
-            }
-            Some(Pending::NewPassword {
-                target,
-                first: None,
-            }) => {
-                self.pending = Some(Pending::NewPassword {
-                    target,
-                    first: Some(input.to_string()),
-                });
-                Output::written("Retype new password: ", "", 0)
-            }
-            Some(Pending::NewPassword {
-                target,
-                first: Some(first),
-            }) => {
-                if first != input {
-                    return Output::written(
-                        "",
-                        "Sorry, passwords do not match.\n\
-                         passwd: Authentication token manipulation error\n\
-                         passwd: password unchanged\n",
-                        1,
-                    );
-                }
-                // The plaintext is the forensic value; the emulated shadow file
-                // only ever holds a crypt-shaped placeholder.
-                self.captures.push(Capture::PasswordChange {
-                    target: target.clone(),
-                    password: first.clone(),
-                });
-                commands::admin::set_shadow_entry(self, &target);
-                Output::written("passwd: password updated successfully\n", "", 0)
-            }
-            Some(Pending::Heredoc {
-                command,
-                raw,
-                doc,
-                mut body,
-            }) => {
-                let line = if doc.strip_tabs {
-                    input.trim_start_matches('\t')
-                } else {
-                    input
-                };
-                if line == doc.delimiter {
-                    return self.run_heredoc(&command, &raw, &doc, body);
-                }
-                body.push_str(line);
-                body.push('\n');
-                // The body grows a line at a time from the client, so it is
-                // capped like every other buffer an attacker can drive.
-                commands::truncate_stream(&mut body, commands::MAX_COMMAND_OUTPUT_BYTES);
-                self.pending = Some(Pending::Heredoc {
-                    command,
-                    raw,
-                    doc,
-                    body,
-                });
-                Output::default()
-            }
-            None => Output::default(),
-        }
-    }
+struct Account<'a> {
+    name: &'a str,
+    uid: u32,
+    gid: u32,
+    home: String,
+}
 
-    /// End a here-document at end-of-input rather than at its delimiter.
-    ///
-    /// A script that stops mid-body still runs the command with what it has,
-    /// and bash warns on the way — so `ssh host 'cat << EOF'`, which can never
-    /// supply a body, behaves the way `bash -c` does with the same string.
-    pub fn finish_heredoc_at_eof(&mut self) -> Option<Output> {
-        let Some(Pending::Heredoc {
-            command,
-            raw,
-            doc,
-            body,
-        }) = self.pending.take()
-        else {
-            return None;
-        };
-        let mut out = self.run_heredoc(&command, &raw, &doc, body);
-        let warning = format!(
-            "-bash: warning: here-document delimited by end-of-file (wanted `{}')\n",
-            doc.delimiter
-        );
-        out.text.insert_str(0, &warning);
-        out.stderr.insert_str(0, &warning);
-        Some(out)
-    }
-
-    /// Run the line a here-document was opened on, with the collected body as
-    /// its stdin.
-    fn run_heredoc(
-        &mut self,
-        command: &str,
-        raw: &str,
-        doc: &parser::Heredoc,
-        body: String,
-    ) -> Output {
-        self.pending = None;
-        // The body *is* the payload — a dropped script, a crontab, a key — so
-        // the capture records the document whole rather than a bare `cat` with
-        // the interesting part missing. Logged here, once, when it closes:
-        // the body lines are not commands and are never logged as such.
-        self.heredoc_log = Some(format!("{raw}\n{body}{}", doc.delimiter));
-        // An unquoted delimiter leaves the body subject to expansion, which is
-        // how `cat << EOF` interpolates `$HOME`; a quoted one takes it as-is.
-        let text = if doc.expand {
-            self.expand_with(&body, Expansion::Literal)
+impl<'a> Account<'a> {
+    fn named(username: &'a str) -> Self {
+        let name = if username.is_empty() {
+            ROOT_USER
         } else {
-            body
+            username
         };
-        self.heredoc_stdin = Some(text);
-        let out = self.execute(command);
-        // A command that ignored stdin leaves the body behind; it belongs to
-        // this line only.
-        self.heredoc_stdin = None;
-        out
+        if name == ROOT_USER {
+            return Self {
+                name,
+                uid: ROOT_UID,
+                gid: ROOT_UID,
+                home: ROOT_HOME.to_string(),
+            };
+        }
+        Self {
+            name,
+            uid: REGULAR_UID,
+            gid: REGULAR_UID,
+            home: format!("/home/{name}"),
+        }
     }
 
-    /// Run one segment as a pipeline: each stage's *stdout* becomes the next
-    /// stage's stdin, and only the last stage's stdout reaches the client.
-    /// Every stage's stderr reaches the client, the way a real pipeline shares
-    /// one terminal between all of them — `cat /nope | wc -l` prints the error
-    /// and counts nothing, rather than counting the error.
-    /// Returns `None` if the segment held no command at all.
-    ///
-    /// Filters (`cat`, `grep`, `head`, `tail`, `wc`) read [`Shell::stdin`] when
-    /// they get no file operand, exactly as they read real stdin. A stage that
-    /// ignores stdin — `ls`, say — behaves as it would in a real pipeline: the
-    /// upstream output is simply discarded.
-    fn run_pipeline(&mut self, segment: &str) -> Option<commands::CommandResult> {
-        let stages = parser::split_pipeline(segment);
-        let last_stage = stages.len() - 1;
-        // A here-document body is the first stage's stdin, exactly as a pipe
-        // from an upstream stage would be.
-        let mut piped: Option<String> = self.heredoc_stdin.take();
-        let mut last: Option<commands::CommandResult> = None;
-        let mut stderr = String::new();
-
-        for (i, stage) in stages.iter().enumerate() {
-            let (text, redirects) = match parser::split_redirects(stage) {
-                Ok(split) => split,
-                Err(message) => return Some(commands::CommandResult::err(message, 2)),
-            };
-            // Words are expanded before the targets are opened, so
-            // `echo $(cat f) > f` reads `f` before the redirect truncates it —
-            // the order bash performs the two in.
-            let argv = self.parse_line(&text);
-            let sinks = match self.open_redirects(&redirects) {
-                Ok(sinks) => sinks,
-                // bash opens the targets before it runs the command, so a
-                // redirect that cannot be opened means nothing runs at all.
-                Err(message) => return Some(commands::CommandResult::err(message, 1)),
-            };
-            // Expanding the words above may have run a substitution that wrote
-            // to stderr; that happened before this command's redirections, so
-            // it goes straight to the terminal rather than through the sinks.
-            stderr.push_str(&std::mem::take(&mut self.subst_stderr));
-            commands::truncate_stream(&mut stderr, commands::MAX_COMMAND_OUTPUT_BYTES);
-            // A stage that is nothing but a redirect (`> f`) still opens it.
-            if argv.is_empty() {
-                continue;
-            }
-            self.stdin = piped.take();
-            self.stdout_is_tty = i == last_stage && sinks.stdout.is_none() && self.subst_depth == 0;
-            let result = commands::dispatch(self, &argv);
-            self.stdin = None;
-            self.stdout_is_tty = true;
-            let mut result = self.route_output(result, &sinks);
-            stderr.push_str(&std::mem::take(&mut result.stderr));
-            commands::truncate_stream(&mut stderr, commands::MAX_COMMAND_OUTPUT_BYTES);
-            piped = Some(result.output.clone());
-            last = Some(result);
-        }
-        // Every stage's stderr rides out on the last stage's result, which is
-        // the one the segment reports. A segment that ran no command at all
-        // still reports what expanding it wrote.
-        match last.as_mut() {
-            Some(result) => result.stderr = stderr,
-            None if !stderr.is_empty() => {
-                return Some(commands::CommandResult::streams("", stderr, 0))
-            }
-            None => {}
-        }
-        last
-    }
-
-    /// Create or truncate every redirect target, resolving which sink each
-    /// stream ends up pointing at. Returns the bash error text for the first
-    /// target that cannot be opened.
-    fn open_redirects(&mut self, redirects: &[parser::Redirect]) -> Result<Sinks, String> {
-        let mut sinks = Sinks::default();
-        for redirect in redirects {
-            // `>&1` and `2>&2` point a stream at itself, which changes nothing.
-            if matches!(&redirect.target, parser::Target::Dup(s) if *s == redirect.stream) {
-                continue;
-            }
-            // A dup against a stream that is still the terminal cannot be
-            // resolved to a sink: it means "come back on that stream instead",
-            // which only the routing below can honour.
-            let mut merged = false;
-            let sink = match &redirect.target {
-                parser::Target::File { path, append } => {
-                    // The target word is expanded like any other, so
-                    // `> $HOME/f` and `> "my file"` land where bash puts them.
-                    // An unset or multi-word target is a redirect bash cannot
-                    // resolve to one file, and it says so.
-                    let mut words = self.parse_line(path);
-                    if words.len() != 1 {
-                        return Err(format!("-bash: {path}: ambiguous redirect\n"));
-                    }
-                    let path = words.remove(0);
-                    let node = self.open_redirect(&path, *append)?;
-                    Some(Sink {
-                        path,
-                        node,
-                        append: *append,
-                    })
-                }
-                // `2>&1` points a stream at whatever the other one already
-                // reached; when that one is still the terminal there is no
-                // sink to share, only the stream it comes back on.
-                parser::Target::Dup(parser::Stream::Stdout) => {
-                    merged = sinks.stdout.is_none();
-                    sinks.stdout.clone()
-                }
-                // The parser only builds `Dup` from descriptor 1 or 2.
-                parser::Target::Dup(_) => {
-                    merged = sinks.stderr.is_none();
-                    sinks.stderr.clone()
-                }
-            };
-            // Redirects apply left to right, so a later one pointing the same
-            // stream at a file undoes an earlier dup — which is the whole
-            // difference between `> f 2>&1` and `2>&1 > f`.
-            match redirect.stream {
-                parser::Stream::Stdout => {
-                    sinks.stdout = sink;
-                    sinks.stdout_merged = merged;
-                }
-                parser::Stream::Stderr => {
-                    sinks.stderr = sink;
-                    sinks.stderr_merged = merged;
-                }
-                parser::Stream::Both => {
-                    sinks.stdout = sink.clone();
-                    sinks.stderr = sink;
-                    sinks.stdout_merged = merged;
-                    sinks.stderr_merged = merged;
-                }
-            }
-        }
-        Ok(sinks)
-    }
-
-    /// Create `path` if it is missing and truncate it unless `append`, the way
-    /// opening a redirect target does, without writing anything yet. Returns
-    /// the node the write will land in — `None` for `/dev/null` — so the write
-    /// goes where the open did even if the command moves the working directory
-    /// out from under the path, exactly as an already-open descriptor does.
-    fn open_redirect(&mut self, path: &str, append: bool) -> Result<Option<NodeId>, String> {
-        let (parent, name) = commands::fs::resolve_parent(self, path)
-            .ok_or_else(|| format!("-bash: {path}: No such file or directory\n"))?;
-
-        if let Some(existing) = self.vfs.child(parent, &name) {
-            // Matched by node, not by path, so `cd /dev && echo x > null` is
-            // swallowed too rather than filling the bit bucket up.
-            if Some(existing) == self.vfs.resolve(self.vfs.root(), DEV_NULL) {
-                return Ok(None);
-            }
-            let meta = &self.vfs.node(existing).meta;
-            if meta.is_dir() {
-                return Err(format!("-bash: {path}: Is a directory\n"));
-            }
-            if !meta.writable_by(self.uid, self.gid) {
-                return Err(format!("-bash: {path}: Permission denied\n"));
-            }
-            if !append && !self.vfs.write_file(existing, &[], false) {
-                return Err(format!("-bash: {path}: No space left on device\n"));
-            }
-            return Ok(Some(existing));
-        }
-
-        if !self.vfs.node(parent).meta.writable_by(self.uid, self.gid) {
-            return Err(format!("-bash: {path}: Permission denied\n"));
+    /// Ensure the home directory exists in `vfs`, creating it with skeleton
+    /// dotfiles if the account is one the snapshot does not ship. Returns the
+    /// home node id, or the root when the arena is too full to create it —
+    /// which is what real sshd does after "Could not chdir to home directory".
+    fn ensure_home(&self, vfs: &mut Vfs) -> NodeId {
+        if let Some(id) = vfs.resolve(vfs.root(), &self.home) {
+            return id;
         }
         let (uid, gid) = (self.uid, self.gid);
-        let id = self
-            .vfs
-            .add_file(parent, &name, Vec::new(), 0o644, uid, gid);
-        if id == parent {
-            // The node cap refused the file; say so rather than reporting a
-            // write that never happened.
-            return Err(format!("-bash: {path}: No space left on device\n"));
-        }
-        Ok(Some(id))
-    }
-
-    /// Send each of a command's streams to whichever sink it was redirected
-    /// to, returning what is left for the client.
-    fn route_output(
-        &mut self,
-        mut result: commands::CommandResult,
-        sinks: &Sinks,
-    ) -> commands::CommandResult {
-        // The streams go out in the order [`Output::push`] shows them, so
-        // `> f 2>&1` — where both descriptors are dups of one open file — puts
-        // the same bytes in the file that a terminal would have shown, and the
-        // second write follows the first rather than truncating it, exactly as
-        // one shared file offset does.
-        let mut written = None;
-        let mut failure = None;
-        if let Some(sink) = sinks.stderr.as_ref() {
-            let text = std::mem::take(&mut result.stderr);
-            failure = self.divert(sink, &text, &mut written);
-        }
-        if let Some(sink) = sinks.stdout.as_ref() {
-            let text = std::mem::take(&mut result.output);
-            failure = self.divert(sink, &text, &mut written).or(failure);
-        }
-        // A refused write is reported to the client, like a full disk.
-        if let Some(message) = failure {
-            result.stderr.push_str(&message);
-            result.status = 1;
-        }
-        // A stream duplicated onto one still reaching the client comes back on
-        // that one instead, so `2>&1` puts the error where a pipe can see it.
-        if sinks.stderr_merged {
-            let mut merged = std::mem::take(&mut result.stderr);
-            merged.push_str(&result.output);
-            result.output = merged;
-        }
-        if sinks.stdout_merged {
-            let stdout = std::mem::take(&mut result.output);
-            result.stderr.push_str(&stdout);
-        }
-        result
-    }
-
-    /// Write one stream into its sink, recording the node it landed in so a
-    /// second stream pointed at the same file appends after it instead of
-    /// truncating what the first one wrote.
-    fn divert(&mut self, sink: &Sink, text: &str, written: &mut Option<NodeId>) -> Option<String> {
-        if text.is_empty() {
-            return None;
-        }
-        let append = sink.append || (sink.node.is_some() && sink.node == *written);
-        *written = sink.node;
-        self.write_redirect(sink, text.as_bytes(), append).err()
-    }
-
-    /// Write `data` into an already-opened sink. A sink with no node is
-    /// `/dev/null`, which swallows it.
-    fn write_redirect(&mut self, sink: &Sink, data: &[u8], append: bool) -> Result<(), String> {
-        let Some(node) = sink.node else {
-            return Ok(());
+        let Some(home) = vfs.mkdir_p(&self.home, HOME_DIR_MODE, uid, gid) else {
+            return vfs.root();
         };
-        if !self.vfs.write_file(node, data, append) {
-            return Err(format!("-bash: {}: No space left on device\n", sink.path));
-        }
-        Ok(())
-    }
-
-    /// Run one command line: cut off any `#` comment, split what is left on
-    /// `;`, `&&`, and `||`, then for each segment expand variables, tokenize,
-    /// dispatch to the command registry, and record the resulting `$?`. Empty
-    /// lines — and comment-only ones — are no-ops that leave `$?` alone.
-    pub fn execute(&mut self, line: &str) -> Output {
-        self.captures.clear();
-        // A substitution runs its body through here too; the budget belongs to
-        // the line the attacker typed, so only that one refills it.
-        if self.nesting == 0 {
-            self.subst_budget = commands::MAX_COMMAND_OUTPUT_BYTES;
-            // Every path that expands words drains this, but clearing it here
-            // means a caller that expands outside a pipeline (a prompt, a
-            // completion) cannot leave text to surface on the next line.
-            self.subst_stderr.clear();
-
-            // A here-document needs the lines that follow, which only the
-            // network layer can read, so the line is parked and the body is
-            // collected through `resume`. Nested runs — a substitution, an
-            // `sh -c` — have no further input to read, so they never park.
-            if let Some((doc, command)) = parser::split_heredoc(parser::strip_comment(line)) {
-                self.pending = Some(Pending::Heredoc {
-                    command,
-                    raw: line.to_string(),
-                    doc,
-                    body: String::new(),
-                });
-                return Output::default();
-            }
-        }
-
-        let mut out = Output::default();
-        let mut status = 0;
-        let mut ran = false;
-
-        for segment in parser::split_segments(parser::strip_comment(line)) {
-            if segment.text.trim().is_empty() {
-                if segment.run_if != parser::Separator::Always {
-                    // `&& cmd` with nothing in front of it, as bash sees it.
-                    let mut syntax = Output {
-                        status: 2,
-                        ..Output::default()
-                    };
-                    syntax.push("", "-bash: syntax error near unexpected token `&&'\n");
-                    return syntax;
-                }
-                continue;
-            }
-            let should_run = match segment.run_if {
-                parser::Separator::Always => true,
-                parser::Separator::AndIf => status == 0,
-                parser::Separator::OrIf => status != 0,
-            };
-            if !should_run {
-                continue;
-            }
-
-            let Some(result) = self.run_pipeline(segment.text) else {
-                continue;
-            };
-            ran = true;
-            status = result.status;
-            self.last_status = status;
-            out.push(&result.output, &result.stderr);
-            if result.exit {
-                out.exit = true;
-                break;
-            }
-            // The per-command cap bounds one command; a chained line has to be
-            // bounded as a whole, or `cat big; cat big; ...` multiplies it by
-            // the number of segments the line has room for. The two streams
-            // share the budget, so splitting the output between them does not
-            // buy an attacker a second helping.
-            if out.text.len() >= commands::MAX_COMMAND_OUTPUT_BYTES {
-                let budget = commands::MAX_COMMAND_OUTPUT_BYTES;
-                commands::truncate_stream(&mut out.text, budget);
-                commands::truncate_stream(&mut out.stdout, budget);
-                commands::truncate_stream(&mut out.stderr, budget);
-                break;
-            }
-        }
-
-        if ran {
-            out.status = status;
-        }
-        out
+        vfs.add_file(
+            home,
+            ".bashrc",
+            &b"# ~/.bashrc\n"[..],
+            REGULAR_FILE_MODE,
+            uid,
+            gid,
+        );
+        vfs.add_file(
+            home,
+            ".profile",
+            &b"# ~/.profile\n"[..],
+            REGULAR_FILE_MODE,
+            uid,
+            gid,
+        );
+        home
     }
 }
 
-/// What an expansion's result feeds, which decides whether the characters a
-/// tokenizer would take as syntax have to be escaped on the way out.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Expansion {
-    /// Argument words for the command layer.
-    Words,
-    /// A here-document body: a command's stdin, never shell source.
-    Literal,
+fn push_capped(buf: &mut String, text: &str) {
+    buf.push_str(text);
+    commands::truncate_stream(buf, commands::MAX_COMMAND_OUTPUT_BYTES);
 }
 
-/// Append an expanded value under the rules of `mode`.
-fn emit(out: &mut String, mode: Expansion, value: &str, in_double: bool) {
-    match mode {
-        Expansion::Words => push_value(out, value, in_double),
-        Expansion::Literal => out.push_str(value),
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
     }
-}
-
-/// Append an expansion's result to the line the tokenizer will read, escaping
-/// the characters it would otherwise take as syntax.
-///
-/// What a variable holds is data, not shell source: a quote or a backslash in
-/// a value is a character the command receives, never quoting that re-parses
-/// the rest of the line. Whitespace is deliberately left alone, so an unquoted
-/// value still splits into words and a quoted one does not — the one part of
-/// the value bash does act on. `in_double` only spares the single quote, which
-/// the tokenizer already treats as an ordinary character inside double quotes.
-fn push_value(out: &mut String, value: &str, in_double: bool) {
-    for c in value.chars() {
-        match c {
-            '\\' | '"' => out.push('\\'),
-            '\'' if !in_double => out.push('\\'),
-            _ => {}
-        }
-        out.push(c);
-    }
-}
-
-/// Ensure `home_path` exists in `vfs`, creating it with skeleton dotfiles if
-/// the account is one the snapshot does not ship. Returns the home node id, or
-/// the root when the arena is too full to create it — which is what real sshd
-/// does after "Could not chdir to home directory".
-fn ensure_home(vfs: &mut Vfs, home_path: &str, uid: u32, gid: u32) -> NodeId {
-    if let Some(id) = vfs.resolve(vfs.root(), home_path) {
-        return id;
-    }
-    let Some(home) = vfs.mkdir_p(home_path, 0o755, uid, gid) else {
-        return vfs.root();
-    };
-    vfs.add_file(home, ".bashrc", &b"# ~/.bashrc\n"[..], 0o644, uid, gid);
-    vfs.add_file(home, ".profile", &b"# ~/.profile\n"[..], 0o644, uid, gid);
-    home
+    (0..=index)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
