@@ -5,18 +5,16 @@ use rand::SeedableRng;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, PrivateKey};
 
+const ED25519_KEY_FILE: &str = "ssh_host_ed25519_key";
+const RSA_KEY_FILE: &str = "ssh_host_rsa_key";
+
 pub fn load_or_create(dir: &Path) -> Result<Vec<PrivateKey>> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating host key dir {}", dir.display()))?;
 
-    let mut keys = Vec::new();
+    let mut keys = vec![ensure_key(&dir.join(ED25519_KEY_FILE), Algorithm::Ed25519)?];
 
-    keys.push(ensure_key(
-        &dir.join("ssh_host_ed25519_key"),
-        Algorithm::Ed25519,
-    )?);
-
-    match ensure_key(&dir.join("ssh_host_rsa_key"), Algorithm::Rsa { hash: None }) {
+    match ensure_key(&dir.join(RSA_KEY_FILE), Algorithm::Rsa { hash: None }) {
         Ok(key) => keys.push(key),
         Err(err) => tracing::warn!(event = "host_key_skip", algo = "rsa", error = %err),
     }
@@ -26,15 +24,19 @@ pub fn load_or_create(dir: &Path) -> Result<Vec<PrivateKey>> {
 
 fn ensure_key(path: &Path, algorithm: Algorithm) -> Result<PrivateKey> {
     if path.exists() {
-        let key = PrivateKey::read_openssh_file(path)
-            .with_context(|| format!("loading host key {}", path.display()))?;
-        return Ok(key);
+        load_key(path)
+    } else {
+        create_key(path, algorithm)
     }
+}
 
-    let mut rng = rand::rngs::StdRng::try_from_rng(&mut rand::rngs::SysRng)
-        .map_err(|e| anyhow::anyhow!("initializing rng: {e}"))?;
-    let key = PrivateKey::random(&mut rng, algorithm)
-        .map_err(|e| anyhow::anyhow!("generating host key: {e}"))?;
+fn load_key(path: &Path) -> Result<PrivateKey> {
+    PrivateKey::read_openssh_file(path)
+        .with_context(|| format!("loading host key {}", path.display()))
+}
+
+fn create_key(path: &Path, algorithm: Algorithm) -> Result<PrivateKey> {
+    let key = generate_key(algorithm)?;
     let pem = key
         .to_openssh(LineEnding::LF)
         .map_err(|e| anyhow::anyhow!("encoding host key: {e}"))?;
@@ -43,14 +45,21 @@ fn ensure_key(path: &Path, algorithm: Algorithm) -> Result<PrivateKey> {
     Ok(key)
 }
 
+fn generate_key(algorithm: Algorithm) -> Result<PrivateKey> {
+    let mut rng = rand::rngs::StdRng::try_from_rng(&mut rand::rngs::SysRng)
+        .map_err(|e| anyhow::anyhow!("initializing rng: {e}"))?;
+    PrivateKey::random(&mut rng, algorithm).map_err(|e| anyhow::anyhow!("generating host key: {e}"))
+}
+
 #[cfg(unix)]
 fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    const OWNER_READ_WRITE: u32 = 0o600;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(OWNER_READ_WRITE)
         .open(path)?;
     file.write_all(contents)
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
@@ -19,47 +19,32 @@ impl RejectReason {
     }
 }
 
-#[derive(Default)]
-struct RegistryInner {
-    per_ip: HashMap<IpAddr, usize>,
-}
-
 pub struct ConnectionRegistry {
-    inner: Mutex<RegistryInner>,
-    total: AtomicUsize,
+    connections_per_ip: Mutex<HashMap<IpAddr, usize>>,
+    active_total: AtomicUsize,
     max_sessions: usize,
-    per_ip: usize,
+    max_per_ip: usize,
 }
 
 impl ConnectionRegistry {
-    pub fn new(max_sessions: usize, per_ip: usize) -> Arc<Self> {
+    pub fn new(max_sessions: usize, max_per_ip: usize) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(RegistryInner::default()),
-            total: AtomicUsize::new(0),
+            connections_per_ip: Mutex::new(HashMap::new()),
+            active_total: AtomicUsize::new(0),
             max_sessions,
-            per_ip,
+            max_per_ip,
         })
     }
 
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionGuard, RejectReason> {
-        if self
-            .total
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |x| {
-                if x >= self.max_sessions {
-                    None
-                } else {
-                    Some(x + 1)
-                }
-            })
-            .is_err()
-        {
+        if !self.try_reserve_global_slot() {
             return Err(RejectReason::GlobalLimit);
         }
 
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let count = inner.per_ip.entry(ip).or_insert(0);
-        if *count >= self.per_ip {
-            self.total.fetch_sub(1, Ordering::Release);
+        let mut connections_per_ip = self.lock_connections_per_ip();
+        let count = connections_per_ip.entry(ip).or_insert(0);
+        if *count >= self.max_per_ip {
+            self.release_global_slot();
             return Err(RejectReason::PerIpLimit);
         }
         *count += 1;
@@ -72,19 +57,41 @@ impl ConnectionRegistry {
 
     #[allow(dead_code)]
     pub fn active(&self) -> usize {
-        self.total.load(Ordering::Relaxed)
+        self.active_total.load(Ordering::Relaxed)
+    }
+
+    fn try_reserve_global_slot(&self) -> bool {
+        self.active_total
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |x| {
+                if x >= self.max_sessions {
+                    None
+                } else {
+                    Some(x + 1)
+                }
+            })
+            .is_ok()
+    }
+
+    fn release_global_slot(&self) {
+        self.active_total.fetch_sub(1, Ordering::Release);
+    }
+
+    fn lock_connections_per_ip(&self) -> MutexGuard<'_, HashMap<IpAddr, usize>> {
+        self.connections_per_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn release(&self, ip: IpAddr) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = inner.per_ip.get_mut(&ip) {
+        let mut connections_per_ip = self.lock_connections_per_ip();
+        if let Some(count) = connections_per_ip.get_mut(&ip) {
             *count -= 1;
             if *count == 0 {
-                inner.per_ip.remove(&ip);
+                connections_per_ip.remove(&ip);
             }
         }
-        drop(inner);
-        self.total.fetch_sub(1, Ordering::Release);
+        drop(connections_per_ip);
+        self.release_global_slot();
     }
 }
 
@@ -157,6 +164,6 @@ mod tests {
             let _g = reg.try_acquire(ip(1)).expect("allowed");
         }
 
-        assert_eq!(reg.inner.lock().unwrap().per_ip.len(), 0);
+        assert_eq!(reg.connections_per_ip.lock().unwrap().len(), 0);
     }
 }
