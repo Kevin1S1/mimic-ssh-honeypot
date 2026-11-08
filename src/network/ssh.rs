@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
 const MAX_COMMAND_LEN: usize = 4096;
@@ -30,37 +30,63 @@ const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
 
+const EDITOR_HISTORY_LEN: usize = 1000;
+
+const AUTH_REJECTION_DELAY: Duration = Duration::from_secs(2);
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+const CTRL_C: u8 = 0x03;
+
+const CTRL_X: u8 = 0x18;
+
+const ESC: u8 = 0x1b;
+
+const BACKSPACE: u8 = 0x08;
+
+const DELETE: u8 = 0x7f;
+
+const DEFAULT_TERMINAL_COLS: u32 = 80;
+
+const DEFAULT_TERMINAL_ROWS: u32 = 24;
+
+const MAX_TERMINAL_DIMENSION: u32 = 10_000;
+
+const FALLBACK_TERM: &str = "xterm-256color";
+
+const MAX_TERM_LEN: usize = 64;
+
+const MAX_ENV_VALUE_LEN: usize = 256;
+
+const MAX_ACCEPTED_ENV: usize = 32;
+
+const SCP_READY_ACK: u8 = 0;
+
+const SCP_SOURCE_EXIT_STATUS: u32 = 1;
+
+const DEFAULT_SCP_TARGET: &str = "/tmp";
+
+const SSH_TTY_PATH: &str = "/dev/pts/0";
+
+const LAST_LOGIN_TIME_FORMAT: &str = "%a %b %e %H:%M:%S %Y";
+
+const UPLOAD_DIR_MODE: u32 = 0o755;
+
+const FILE_PERMISSION_BITS: u32 = 0o7777;
+
+const LISTING_WIDTH: usize = 80;
+
+const LISTING_COLUMN_GAP: usize = 2;
+
 pub async fn serve(config: Arc<Config>) -> Result<()> {
     let host_keys = super::hostkey::load_or_create(&config.host_key_dir)?;
-
-    let persona = Arc::new(
-        crate::persona::Persona::from_seed(persona_seed(&host_keys, &config.sensor_name))
-            .with_host_keys(host_key_files(&host_keys)),
-    );
-
-    let mut methods = MethodSet::empty();
-    methods.push(MethodKind::Password);
-    methods.push(MethodKind::PublicKey);
-
-    let server_config = Arc::new(ServerConfig {
-        server_id: russh::SshId::Standard(std::borrow::Cow::Owned(config.server_id.clone())),
-        methods,
-
-        preferred: debian_openssh_preferred(),
-        auth_rejection_time: Duration::from_secs(2),
-
-        auth_rejection_time_initial: Some(Duration::from_secs(0)),
-
-        max_auth_attempts: crate::config::MAX_AUTH_ATTEMPTS as usize,
-        inactivity_timeout: Some(Duration::from_secs(config.idle_timeout_secs)),
-        keys: host_keys,
-        ..Default::default()
-    });
+    let persona = Arc::new(deployment_persona(&host_keys, &config.sensor_name));
+    let server_config = Arc::new(russh_server_config(&config, host_keys));
 
     let registry = ConnectionRegistry::new(config.max_sessions, config.per_ip_connections);
-    let session_counter = Arc::new(AtomicU64::new(1));
-    let initial_quarantine_bytes = measure_dir_size(&config.quarantine_dir);
-    let global_quarantine_bytes = Arc::new(AtomicU64::new(initial_quarantine_bytes));
+    let global_quarantine_bytes =
+        Arc::new(AtomicU64::new(measure_dir_size(&config.quarantine_dir)));
+    let mut next_session_id: u64 = 1;
 
     let listener = TcpListener::bind((config.listen_addr, config.port))
         .await
@@ -86,7 +112,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             Ok(pair) => pair,
             Err(err) => {
                 event::accept_error(&err.to_string());
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
         };
@@ -100,84 +126,131 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             }
         };
 
-        let session_id = session_counter.fetch_add(1, Ordering::Relaxed);
+        let session_id = next_session_id;
+        next_session_id += 1;
         event::connection_opened(session_id, peer);
 
         let local = stream
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::new(config.listen_addr, config.port));
-        let authenticated = Arc::new(AtomicBool::new(false));
-
-        let handler = MimicHandler {
-            config: Arc::clone(&config),
-            persona: Arc::clone(&persona),
+        let handler = MimicHandler::new(
+            Arc::clone(&config),
+            Arc::clone(&persona),
+            Arc::clone(&global_quarantine_bytes),
             session_id,
             peer,
             local,
-            pty: false,
-            auth_attempts: 0,
-            authenticated: Arc::clone(&authenticated),
-            username: String::new(),
-            editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
-            shell_started: false,
-            shell: None,
-            active_channel: None,
-            scp: None,
-            sftp: None,
-            quarantine_bytes: 0,
-            global_quarantine_bytes: Arc::clone(&global_quarantine_bytes),
-            password_buf: None,
-            line_buf: Vec::new(),
-            screen: None,
-            pty_term: None,
-            accepted_env: Vec::new(),
-            banner_logged: false,
-            opened_at: std::time::Instant::now(),
-            command_count: 0,
-            _guard: guard,
-        };
-
-        let server_config = Arc::clone(&server_config);
-        let login_deadline = Instant::now() + LOGIN_GRACE;
-        let deadline = Instant::now() + Duration::from_secs(config.max_session_secs);
-        tokio::spawn(async move {
-            match russh::server::run_stream(server_config, stream, handler).await {
-                Ok(session) => {
-                    let watchdog = tokio::spawn({
-                        let handle = session.handle();
-                        async move {
-                            tokio::time::sleep_until(login_deadline.min(deadline)).await;
-                            if authenticated.load(Ordering::Relaxed) {
-                                tokio::time::sleep_until(deadline).await;
-                                event::session_timeout(session_id, peer);
-                            } else {
-                                event::login_timeout(session_id, peer);
-                            }
-                            let _ = handle
-                                .disconnect(Disconnect::ByApplication, String::new(), String::new())
-                                .await;
-                        }
-                    });
-
-                    if let Err(err) = session.await {
-                        tracing::debug!(
-                            event = "session_error",
-                            session_id,
-                            error = %err,
-                        );
-                    }
-                    watchdog.abort();
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        event = "handshake_error",
-                        session_id,
-                        error = %err,
-                    );
-                }
-            }
-        });
+            guard,
+        );
+        let deadlines = SessionDeadlines::starting_now(config.max_session_secs);
+        tokio::spawn(run_connection(
+            Arc::clone(&server_config),
+            stream,
+            handler,
+            deadlines,
+        ));
     }
+}
+
+fn russh_server_config(config: &Config, host_keys: Vec<russh::keys::PrivateKey>) -> ServerConfig {
+    ServerConfig {
+        server_id: russh::SshId::Standard(std::borrow::Cow::Owned(config.server_id.clone())),
+        methods: method_set(&[MethodKind::Password, MethodKind::PublicKey]),
+        preferred: debian_openssh_preferred(),
+        auth_rejection_time: AUTH_REJECTION_DELAY,
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        max_auth_attempts: crate::config::MAX_AUTH_ATTEMPTS as usize,
+        inactivity_timeout: Some(Duration::from_secs(config.idle_timeout_secs)),
+        keys: host_keys,
+        ..Default::default()
+    }
+}
+
+fn method_set(kinds: &[MethodKind]) -> MethodSet {
+    let mut methods = MethodSet::empty();
+    for kind in kinds {
+        methods.push(*kind);
+    }
+    methods
+}
+
+fn reject_back_to_password() -> Auth {
+    Auth::Reject {
+        proceed_with_methods: Some(method_set(&[MethodKind::Password])),
+        partial_success: false,
+    }
+}
+
+struct SessionDeadlines {
+    login: Instant,
+    session: Instant,
+}
+
+impl SessionDeadlines {
+    fn starting_now(max_session_secs: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            login: now + LOGIN_GRACE,
+            session: now + Duration::from_secs(max_session_secs),
+        }
+    }
+}
+
+async fn run_connection(
+    server_config: Arc<ServerConfig>,
+    stream: TcpStream,
+    handler: MimicHandler,
+    deadlines: SessionDeadlines,
+) {
+    let session_id = handler.session_id;
+    let peer = handler.peer;
+    let authenticated = Arc::clone(&handler.authenticated);
+    let session = match russh::server::run_stream(server_config, stream, handler).await {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::debug!(event = "handshake_error", session_id, error = %err);
+            return;
+        }
+    };
+
+    let watchdog = tokio::spawn(enforce_deadlines(
+        session.handle(),
+        authenticated,
+        session_id,
+        peer,
+        deadlines,
+    ));
+    if let Err(err) = session.await {
+        tracing::debug!(event = "session_error", session_id, error = %err);
+    }
+    watchdog.abort();
+}
+
+async fn enforce_deadlines(
+    handle: russh::server::Handle,
+    authenticated: Arc<AtomicBool>,
+    session_id: u64,
+    peer: SocketAddr,
+    deadlines: SessionDeadlines,
+) {
+    tokio::time::sleep_until(deadlines.login.min(deadlines.session)).await;
+    if authenticated.load(Ordering::Relaxed) {
+        tokio::time::sleep_until(deadlines.session).await;
+        event::session_timeout(session_id, peer);
+    } else {
+        event::login_timeout(session_id, peer);
+    }
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, String::new(), String::new())
+        .await;
+}
+
+fn deployment_persona(
+    host_keys: &[russh::keys::PrivateKey],
+    sensor_name: &str,
+) -> crate::persona::Persona {
+    crate::persona::Persona::from_seed(persona_seed(host_keys, sensor_name))
+        .with_host_keys(host_key_files(host_keys))
 }
 
 fn host_key_files(keys: &[russh::keys::PrivateKey]) -> Vec<(String, String)> {
@@ -391,7 +464,50 @@ fn measure_dir_size(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
+fn new_line_editor() -> LineEditor {
+    LineEditor::new(MAX_COMMAND_LEN, EDITOR_HISTORY_LEN)
+}
+
 impl MimicHandler {
+    fn new(
+        config: Arc<Config>,
+        persona: Arc<crate::persona::Persona>,
+        global_quarantine_bytes: Arc<AtomicU64>,
+        session_id: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+        guard: ConnectionGuard,
+    ) -> Self {
+        Self {
+            config,
+            persona,
+            session_id,
+            peer,
+            local,
+            pty: false,
+            auth_attempts: 0,
+            authenticated: Arc::new(AtomicBool::new(false)),
+            username: String::new(),
+            editor: new_line_editor(),
+            shell_started: false,
+            shell: None,
+            active_channel: None,
+            scp: None,
+            sftp: None,
+            quarantine_bytes: 0,
+            global_quarantine_bytes,
+            password_buf: None,
+            line_buf: Vec::new(),
+            screen: None,
+            pty_term: None,
+            accepted_env: Vec::new(),
+            banner_logged: false,
+            opened_at: std::time::Instant::now(),
+            command_count: 0,
+            _guard: guard,
+        }
+    }
+
     fn try_open_channel(&mut self, channel: u32) -> bool {
         if self.active_channel.is_some() {
             return false;
@@ -418,7 +534,7 @@ impl MimicHandler {
         if self.active_channel == Some(channel) {
             self.drain_sftp_uploads();
             self.active_channel = None;
-            self.editor = LineEditor::new(MAX_COMMAND_LEN, 1000);
+            self.editor = new_line_editor();
             self.shell = None;
             self.scp = None;
             self.sftp = None;
@@ -741,94 +857,49 @@ impl MimicHandler {
     }
 
     fn drain_captures(&mut self) {
-        let (session_id, peer) = (self.session_id, self.peer);
         let captures = std::mem::take(&mut self.shell().captures);
         for capture in captures {
             match capture {
                 Capture::Download { tool, url, dest } => {
-                    event::download(session_id, peer, &tool, &url, &dest);
+                    event::download(self.session_id, self.peer, &tool, &url, &dest);
                 }
                 Capture::ScriptCommand { line, status } => {
                     self.log_command(&line, CommandSource::Script, Some(status));
                 }
                 Capture::PasswordChange { target, password } => {
-                    event::auth_attempt(
-                        session_id,
-                        peer,
-                        &target,
-                        "chpasswd",
-                        Some(&password),
-                        None,
-                        true,
-                    );
+                    self.log_captured_password(&target, "chpasswd", &password);
                 }
                 Capture::SuAuth { target, password } => {
-                    event::auth_attempt(
-                        session_id,
-                        peer,
-                        &target,
-                        "su",
-                        Some(&password),
-                        None,
-                        true,
-                    );
+                    self.log_captured_password(&target, "su", &password);
                 }
             }
         }
     }
 
+    fn log_captured_password(&self, target: &str, method: &str, password: &str) {
+        event::auth_attempt(
+            self.session_id,
+            self.peer,
+            target,
+            method,
+            Some(password),
+            None,
+            true,
+        );
+    }
+
     fn store_upload(&mut self, file: scp::CompletedFile) {
-        let (session_id, peer) = (self.session_id, self.peer);
-        let quarantine_dir = self.config.quarantine_dir.clone();
-
-        let mut hasher = Sha256::new();
-        hasher.update(&file.data);
-        let stored_sha256 = hex(&hasher.finalize());
-
-        let target = self
-            .scp
-            .as_ref()
-            .map(|s| s.target().to_string())
-            .unwrap_or_else(|| "/tmp".to_string());
-        let recursive = self.scp.as_ref().map(|s| s.recursive()).unwrap_or(false);
+        let target = self.scp.as_ref().map_or_else(
+            || DEFAULT_SCP_TARGET.to_string(),
+            |s| s.target().to_string(),
+        );
+        let recursive = self.scp.as_ref().is_some_and(ScpSink::recursive);
         let dest_path = self.write_to_vfs(&target, recursive, &file);
-
-        let session_cap = self
-            .config
-            .max_upload_bytes
-            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
-        let global_cap = self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
-            self.config
-                .max_upload_bytes
-                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
-        });
-        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
-
-        let stored_path =
-            if self.quarantine_bytes.saturating_add(file.data.len() as u64) > session_cap {
-                event::quarantine_session_cap(session_id, peer);
-                String::new()
-            } else if current_global.saturating_add(file.data.len() as u64) > global_cap {
-                event::quarantine_global_cap(session_id, peer);
-                String::new()
-            } else {
-                match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
-                    Ok((p, written)) => {
-                        self.quarantine_bytes += written;
-                        self.global_quarantine_bytes
-                            .fetch_add(written, Ordering::Relaxed);
-                        p
-                    }
-                    Err(err) => {
-                        event::quarantine_error(session_id, peer, &err.to_string());
-                        String::new()
-                    }
-                }
-            };
+        let (stored_sha256, stored_path) = self.quarantine(&file.data);
 
         event::upload(
-            session_id,
-            peer,
+            self.session_id,
+            self.peer,
             &file.name,
             &dest_path,
             file.size,
@@ -840,52 +911,11 @@ impl MimicHandler {
     }
 
     fn store_sftp_upload(&mut self, upload: sftp::SftpCompletedUpload) {
-        let (session_id, peer) = (self.session_id, self.peer);
-        let quarantine_dir = self.config.quarantine_dir.clone();
-
-        let mut hasher = Sha256::new();
-        hasher.update(&upload.data);
-        let stored_sha256 = hex(&hasher.finalize());
-
-        let session_cap = self
-            .config
-            .max_upload_bytes
-            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
-        let global_cap = self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
-            self.config
-                .max_upload_bytes
-                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
-        });
-        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
-
-        let stored_path = if self
-            .quarantine_bytes
-            .saturating_add(upload.data.len() as u64)
-            > session_cap
-        {
-            event::quarantine_session_cap(session_id, peer);
-            String::new()
-        } else if current_global.saturating_add(upload.data.len() as u64) > global_cap {
-            event::quarantine_global_cap(session_id, peer);
-            String::new()
-        } else {
-            match write_quarantine(&quarantine_dir, &stored_sha256, &upload.data) {
-                Ok((p, written)) => {
-                    self.quarantine_bytes += written;
-                    self.global_quarantine_bytes
-                        .fetch_add(written, Ordering::Relaxed);
-                    p
-                }
-                Err(err) => {
-                    event::quarantine_error(session_id, peer, &err.to_string());
-                    String::new()
-                }
-            }
-        };
+        let (stored_sha256, stored_path) = self.quarantine(&upload.data);
 
         event::upload(
-            session_id,
-            peer,
+            self.session_id,
+            self.peer,
             &upload.name,
             &upload.dest_path,
             upload.size,
@@ -896,42 +926,65 @@ impl MimicHandler {
         );
     }
 
+    fn quarantine(&mut self, data: &[u8]) -> (String, String) {
+        let sha256 = sha256_hex(data);
+        let stored_path = self.write_within_quarantine_caps(&sha256, data);
+        (sha256, stored_path.unwrap_or_default())
+    }
+
+    fn write_within_quarantine_caps(&mut self, sha256: &str, data: &[u8]) -> Option<String> {
+        let size = data.len() as u64;
+        let global_bytes = self.global_quarantine_bytes.load(Ordering::Relaxed);
+        if self.quarantine_bytes.saturating_add(size) > self.session_quarantine_cap() {
+            event::quarantine_session_cap(self.session_id, self.peer);
+            return None;
+        }
+        if global_bytes.saturating_add(size) > self.global_quarantine_cap() {
+            event::quarantine_global_cap(self.session_id, self.peer);
+            return None;
+        }
+        match write_quarantine(&self.config.quarantine_dir, sha256, data) {
+            Ok((stored_path, written)) => {
+                self.quarantine_bytes += written;
+                self.global_quarantine_bytes
+                    .fetch_add(written, Ordering::Relaxed);
+                Some(stored_path)
+            }
+            Err(err) => {
+                event::quarantine_error(self.session_id, self.peer, &err.to_string());
+                None
+            }
+        }
+    }
+
+    fn session_quarantine_cap(&self) -> u64 {
+        self.config
+            .max_upload_bytes
+            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER)
+    }
+
+    fn global_quarantine_cap(&self) -> u64 {
+        self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
+            self.config
+                .max_upload_bytes
+                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
+        })
+    }
+
     fn write_to_vfs(&mut self, target: &str, recursive: bool, file: &scp::CompletedFile) -> String {
-        let (uid, gid) = (self.shell().uid, self.shell().gid);
-        let cwd = self.shell().cwd;
-
-        let (dir_path, name): (String, String) = {
-            let shell = self.shell();
-            let target_abs = abs_path(&shell.vfs.path_of(cwd), target);
-            let mut base = target_abs.clone();
-            if !file.rel_dir.is_empty() {
-                base = format!("{}/{}", base.trim_end_matches('/'), file.rel_dir);
-            }
-
-            let target_is_dir = shell
-                .vfs
-                .resolve(cwd, &base)
-                .map(|id| shell.vfs.node(id).meta.is_dir())
-                .unwrap_or(false);
-
-            if target_is_dir || target.ends_with('/') || recursive || !file.rel_dir.is_empty() {
-                (base, file.name.clone())
-            } else {
-                let (d, n) = crate::vfs::Vfs::split_path(base.trim_end_matches('/'));
-                (d.to_string(), n.to_string())
-            }
-        };
+        let shell = self.shell();
+        let (uid, gid) = (shell.uid, shell.gid);
+        let (dir_path, name) = upload_destination(shell, target, recursive, file);
 
         let intended = format!("{}/{name}", dir_path.trim_end_matches('/'));
-        let shell = self.shell();
-        let Some(parent) = shell.vfs.mkdir_p(&dir_path, 0o755, uid, gid) else {
+        let Some(parent) = shell.vfs.mkdir_p(&dir_path, UPLOAD_DIR_MODE, uid, gid) else {
             return intended;
         };
         let id = shell.vfs.add_file(
             parent,
             &name,
             file.data.clone(),
-            file.mode & 0o7777,
+            file.mode & FILE_PERMISSION_BITS,
             uid,
             gid,
         );
@@ -942,10 +995,41 @@ impl MimicHandler {
     }
 }
 
+fn upload_destination(
+    shell: &Shell,
+    target: &str,
+    recursive: bool,
+    file: &scp::CompletedFile,
+) -> (String, String) {
+    let cwd = shell.cwd;
+    let target_abs = abs_path(&shell.vfs.path_of(cwd), target);
+    let base = if file.rel_dir.is_empty() {
+        target_abs
+    } else {
+        format!("{}/{}", target_abs.trim_end_matches('/'), file.rel_dir)
+    };
+
+    let target_is_dir = shell
+        .vfs
+        .resolve(cwd, &base)
+        .is_some_and(|id| shell.vfs.node(id).meta.is_dir());
+
+    if target_is_dir || target.ends_with('/') || recursive || !file.rel_dir.is_empty() {
+        return (base, file.name.clone());
+    }
+    let (dir, name) = crate::vfs::Vfs::split_path(base.trim_end_matches('/'));
+    (dir.to_string(), name.to_string())
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex(&Sha256::digest(data))
+}
+
 pub(super) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
@@ -965,40 +1049,42 @@ fn write_quarantine(
     sha256: &str,
     data: &[u8],
 ) -> std::io::Result<(String, u64)> {
-    use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(sha256);
-
     let newly_written = if path.exists() {
         0
     } else {
         let staging = dir.join(format!("{sha256}.partial"));
-
-        match create_restricted(&staging) {
-            Ok(mut file) => {
-                let result = file.write_all(data).and_then(|()| file.sync_all());
-                drop(file);
-                if let Err(e) = result {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(e);
-                }
-                match std::fs::rename(&staging, &path) {
-                    Ok(()) => data.len() as u64,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&staging);
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => 0,
-            Err(e) => return Err(e),
-        }
+        write_via_staging(&staging, &path, data)?
     };
-    let stored = path.to_string_lossy().into_owned();
+    Ok((normalised_path_string(&path), newly_written))
+}
 
+fn write_via_staging(
+    staging: &std::path::Path,
+    path: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<u64> {
+    use std::io::Write;
+    let mut file = match create_restricted(staging) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let written = file.write_all(data).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(staging, path)) {
+        let _ = std::fs::remove_file(staging);
+        return Err(e);
+    }
+    Ok(data.len() as u64)
+}
+
+fn normalised_path_string(path: &std::path::Path) -> String {
+    let stored = path.to_string_lossy().into_owned();
     #[cfg(windows)]
     let stored = stored.replace('\\', "/");
-    Ok((stored, newly_written))
+    stored
 }
 
 #[cfg(unix)]
@@ -1039,18 +1125,13 @@ impl Handler for MimicHandler {
         if accepted {
             self.username = user.to_string();
             self.authenticated.store(true, Ordering::Relaxed);
-            jitter_for(0).await;
-            Ok(Auth::Accept)
-        } else {
-            jitter_for(0).await;
-
-            let mut proceed_with_methods = MethodSet::empty();
-            proceed_with_methods.push(MethodKind::Password);
-            Ok(Auth::Reject {
-                proceed_with_methods: Some(proceed_with_methods),
-                partial_success: false,
-            })
         }
+        jitter_for(0).await;
+        Ok(if accepted {
+            Auth::Accept
+        } else {
+            reject_back_to_password()
+        })
     }
 
     async fn auth_publickey(
@@ -1070,13 +1151,7 @@ impl Handler for MimicHandler {
             Some(&fingerprint),
             false,
         );
-
-        let mut proceed_with_methods = MethodSet::empty();
-        proceed_with_methods.push(MethodKind::Password);
-        Ok(Auth::Reject {
-            proceed_with_methods: Some(proceed_with_methods),
-            partial_success: false,
-        })
+        Ok(reject_back_to_password())
     }
 
     async fn channel_open_session(
@@ -1582,34 +1657,19 @@ mod tests {
         let registry = ConnectionRegistry::new(10, 10);
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let guard = registry.try_acquire(peer.ip()).expect("slot available");
-        MimicHandler {
+        let mut handler = MimicHandler::new(
             config,
-            persona: Arc::new(crate::persona::Persona::sample()),
-            session_id: 1,
+            Arc::new(crate::persona::Persona::sample()),
+            Arc::new(AtomicU64::new(0)),
+            1,
             peer,
-            local: "127.0.0.1:2222".parse().unwrap(),
-            pty: false,
-            auth_attempts: 0,
-            authenticated: Arc::new(AtomicBool::new(true)),
-            username: "root".to_string(),
-            editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
-            shell_started: false,
-            shell: None,
-            active_channel: None,
-            scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
-            sftp: None,
-            quarantine_bytes: 0,
-            global_quarantine_bytes: Arc::new(AtomicU64::new(0)),
-            password_buf: None,
-            line_buf: Vec::new(),
-            screen: None,
-            pty_term: None,
-            accepted_env: Vec::new(),
-            banner_logged: false,
-            opened_at: std::time::Instant::now(),
-            command_count: 0,
-            _guard: guard,
-        }
+            "127.0.0.1:2222".parse().unwrap(),
+            guard,
+        );
+        handler.authenticated.store(true, Ordering::Relaxed);
+        handler.username = "root".to_string();
+        handler.scp = Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes));
+        handler
     }
 
     #[test]
