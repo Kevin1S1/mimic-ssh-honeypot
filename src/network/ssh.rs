@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
 /// Maximum bytes accepted for a single command line, on both the interactive
@@ -49,6 +49,15 @@ const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 /// can fill every slot and blind the sensor.
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
 
+const CTRL_C: u8 = 0x03;
+const BACKSPACE: u8 = 0x08;
+const CTRL_X: u8 = 0x18;
+const ESC: u8 = 0x1b;
+const DELETE: u8 = 0x7f;
+
+const SCP_READY: u8 = 0;
+const SCP_FAILURE_STATUS: i32 = 1;
+
 /// Build the russh server config and serve connections forever.
 pub async fn serve(config: Arc<Config>) -> Result<()> {
     // Persist host keys so the server fingerprint stays stable across restarts.
@@ -62,40 +71,18 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         crate::persona::Persona::from_seed(persona_seed(&host_keys, &config.sensor_name))
             .with_host_keys(host_key_files(&host_keys)),
     );
-
-    let mut methods = MethodSet::empty();
-    methods.push(MethodKind::Password);
-    methods.push(MethodKind::PublicKey);
-
-    let server_config = Arc::new(ServerConfig {
-        server_id: russh::SshId::Standard(std::borrow::Cow::Owned(config.server_id.clone())),
-        methods,
-        // Algorithm ordering trimmed to resemble Debian 12 OpenSSH 9.2's
-        // server offer (no sntrup761, umac, or group-exchange).
-        preferred: debian_openssh_preferred(),
-        auth_rejection_time: Duration::from_secs(2),
-        // NOT a fingerprint, despite how it reads: russh applies this only to
-        // the `none` probe every client sends first to discover auth methods
-        // (see `initial_auth_until` in russh's `server::encrypted`). Real sshd
-        // answers that probe immediately; password and publickey rejections
-        // still take the full two seconds. Without it every connection would
-        // stall 2s before the password prompt, which *would* be a tell.
-        auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        // Debian 12 sshd defaults to `MaxAuthTries 6`; russh defaults to 10.
-        // A client that keeps getting prompted past six is a one-connection
-        // honeypot check.
-        max_auth_attempts: crate::config::MAX_AUTH_ATTEMPTS as usize,
-        inactivity_timeout: Some(Duration::from_secs(config.idle_timeout_secs)),
-        keys: host_keys,
-        ..Default::default()
-    });
+    let server_config = Arc::new(server_config(&config, host_keys));
 
     // Connection caps are enforced at accept time, before any crypto state is
     // allocated, so a connection flood is shed cheaply.
     let registry = ConnectionRegistry::new(config.max_sessions, config.per_ip_connections);
-    let session_counter = Arc::new(AtomicU64::new(1));
+    let session_counter = AtomicU64::new(1);
     let initial_quarantine_bytes = measure_dir_size(&config.quarantine_dir);
-    let global_quarantine_bytes = Arc::new(AtomicU64::new(initial_quarantine_bytes));
+    let shared = SharedState {
+        config: Arc::clone(&config),
+        persona,
+        global_quarantine_bytes: Arc::new(AtomicU64::new(initial_quarantine_bytes)),
+    };
 
     let listener = TcpListener::bind((config.listen_addr, config.port))
         .await
@@ -130,7 +117,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
                 // Transient accept errors (e.g. fd exhaustion) shouldn't kill
                 // the listener; back off briefly and keep serving.
                 event::accept_error(&err.to_string());
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
         };
@@ -151,84 +138,135 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         let local = stream
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::new(config.listen_addr, config.port));
-        let authenticated = Arc::new(AtomicBool::new(false));
+        let handler = MimicHandler::new(&shared, session_id, peer, local, guard);
+        let deadlines = SessionDeadlines::starting_now(config.max_session_secs);
+        tokio::spawn(run_session(
+            Arc::clone(&server_config),
+            stream,
+            handler,
+            deadlines,
+        ));
+    }
+}
 
-        let handler = MimicHandler {
-            config: Arc::clone(&config),
-            persona: Arc::clone(&persona),
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+const HISTORY_CAPACITY: usize = 1000;
+
+fn new_line_editor() -> LineEditor {
+    LineEditor::new(MAX_COMMAND_LEN, HISTORY_CAPACITY)
+}
+
+struct SharedState {
+    config: Arc<Config>,
+    persona: Arc<crate::persona::Persona>,
+    global_quarantine_bytes: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionDeadlines {
+    login: Instant,
+    session: Instant,
+}
+
+impl SessionDeadlines {
+    fn starting_now(max_session_secs: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            login: now + LOGIN_GRACE,
+            session: now + Duration::from_secs(max_session_secs),
+        }
+    }
+}
+
+async fn run_session(
+    server_config: Arc<ServerConfig>,
+    stream: TcpStream,
+    handler: MimicHandler,
+    deadlines: SessionDeadlines,
+) {
+    let (session_id, peer) = (handler.session_id, handler.peer);
+    let authenticated = Arc::clone(&handler.authenticated);
+    let session = match russh::server::run_stream(server_config, stream, handler).await {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::debug!(
+                event = "handshake_error",
+                session_id,
+                error = %err,
+            );
+            return;
+        }
+    };
+    // Bound the absolute session lifetime, independent of the
+    // idle timeout, so no connection can be held open forever.
+    // The cap has to ask the session to disconnect: a
+    // `RunningSession` only wraps the session task's
+    // `JoinHandle`, so dropping it (as a `timeout` would)
+    // detaches that task and leaves the session — and the
+    // connection slot its handler holds — running.
+    let watchdog = tokio::spawn(enforce_deadlines(
+        session.handle(),
+        authenticated,
+        deadlines,
+        session_id,
+        peer,
+    ));
+    if let Err(err) = session.await {
+        tracing::debug!(
+            event = "session_error",
             session_id,
-            peer,
-            local,
-            pty: false,
-            auth_attempts: 0,
-            authenticated: Arc::clone(&authenticated),
-            username: String::new(),
-            editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
-            shell_started: false,
-            shell: None,
-            active_channel: None,
-            scp: None,
-            sftp: None,
-            quarantine_bytes: 0,
-            global_quarantine_bytes: Arc::clone(&global_quarantine_bytes),
-            password_buf: None,
-            line_buf: Vec::new(),
-            screen: None,
-            pty_term: None,
-            accepted_env: Vec::new(),
-            banner_logged: false,
-            opened_at: std::time::Instant::now(),
-            command_count: 0,
-            _guard: guard,
-        };
+            error = %err,
+        );
+    }
+    watchdog.abort();
+}
 
-        let server_config = Arc::clone(&server_config);
-        let login_deadline = Instant::now() + LOGIN_GRACE;
-        let deadline = Instant::now() + Duration::from_secs(config.max_session_secs);
-        tokio::spawn(async move {
-            match russh::server::run_stream(server_config, stream, handler).await {
-                Ok(session) => {
-                    // Bound the absolute session lifetime, independent of the
-                    // idle timeout, so no connection can be held open forever.
-                    // The cap has to ask the session to disconnect: a
-                    // `RunningSession` only wraps the session task's
-                    // `JoinHandle`, so dropping it (as a `timeout` would)
-                    // detaches that task and leaves the session — and the
-                    // connection slot its handler holds — running.
-                    let watchdog = tokio::spawn({
-                        let handle = session.handle();
-                        async move {
-                            tokio::time::sleep_until(login_deadline.min(deadline)).await;
-                            if authenticated.load(Ordering::Relaxed) {
-                                tokio::time::sleep_until(deadline).await;
-                                event::session_timeout(session_id, peer);
-                            } else {
-                                event::login_timeout(session_id, peer);
-                            }
-                            let _ = handle
-                                .disconnect(Disconnect::ByApplication, String::new(), String::new())
-                                .await;
-                        }
-                    });
+async fn enforce_deadlines(
+    handle: russh::server::Handle,
+    authenticated: Arc<AtomicBool>,
+    deadlines: SessionDeadlines,
+    session_id: u64,
+    peer: SocketAddr,
+) {
+    tokio::time::sleep_until(deadlines.login.min(deadlines.session)).await;
+    if authenticated.load(Ordering::Relaxed) {
+        tokio::time::sleep_until(deadlines.session).await;
+        event::session_timeout(session_id, peer);
+    } else {
+        event::login_timeout(session_id, peer);
+    }
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, String::new(), String::new())
+        .await;
+}
 
-                    if let Err(err) = session.await {
-                        tracing::debug!(
-                            event = "session_error",
-                            session_id,
-                            error = %err,
-                        );
-                    }
-                    watchdog.abort();
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        event = "handshake_error",
-                        session_id,
-                        error = %err,
-                    );
-                }
-            }
-        });
+fn server_config(config: &Config, host_keys: Vec<russh::keys::PrivateKey>) -> ServerConfig {
+    let mut methods = MethodSet::empty();
+    methods.push(MethodKind::Password);
+    methods.push(MethodKind::PublicKey);
+
+    ServerConfig {
+        server_id: russh::SshId::Standard(std::borrow::Cow::Owned(config.server_id.clone())),
+        methods,
+        // Algorithm ordering trimmed to resemble Debian 12 OpenSSH 9.2's
+        // server offer (no sntrup761, umac, or group-exchange).
+        preferred: debian_openssh_preferred(),
+        auth_rejection_time: Duration::from_secs(2),
+        // NOT a fingerprint, despite how it reads: russh applies this only to
+        // the `none` probe every client sends first to discover auth methods
+        // (see `initial_auth_until` in russh's `server::encrypted`). Real sshd
+        // answers that probe immediately; password and publickey rejections
+        // still take the full two seconds. Without it every connection would
+        // stall 2s before the password prompt, which *would* be a tell.
+        auth_rejection_time_initial: Some(Duration::from_secs(0)),
+        // Debian 12 sshd defaults to `MaxAuthTries 6`; russh defaults to 10.
+        // A client that keeps getting prompted past six is a one-connection
+        // honeypot check.
+        max_auth_attempts: crate::config::MAX_AUTH_ATTEMPTS as usize,
+        inactivity_timeout: Some(Duration::from_secs(config.idle_timeout_secs)),
+        keys: host_keys,
+        ..Default::default()
     }
 }
 
@@ -430,6 +468,25 @@ struct PtyRequest {
     rows: u32,
 }
 
+const DEFAULT_COLS: u32 = 80;
+const DEFAULT_ROWS: u32 = 24;
+const MAX_TERMINAL_DIMENSION: u32 = 10_000;
+
+impl PtyRequest {
+    fn export_size(&self, shell: &mut Shell) {
+        shell.env.set("COLUMNS", &self.cols.to_string());
+        shell.env.set("LINES", &self.rows.to_string());
+    }
+}
+
+fn terminal_dimension(requested: u32, fallback: u32) -> u32 {
+    if requested == 0 {
+        fallback
+    } else {
+        requested.min(MAX_TERMINAL_DIMENSION)
+    }
+}
+
 /// How often a full-screen command repaints. Real `top`'s default delay.
 const SCREEN_REFRESH: Duration = Duration::from_secs(3);
 
@@ -477,7 +534,7 @@ enum ScreenKind {
 /// just completed one of the quit commands (`q`, `q!`, `wq`, `wq!`, `x`);
 /// Ctrl-C quits unconditionally, the same escape hatch every screen kind has.
 fn vi_screen_input(hold: &mut ScreenHold, byte: u8) -> bool {
-    if byte == 0x03 {
+    if byte == CTRL_C {
         return true;
     }
     if let Some(buf) = hold.colon.as_mut() {
@@ -487,8 +544,8 @@ fn vi_screen_input(hold: &mut ScreenHold, byte: u8) -> bool {
                 hold.colon = None;
                 return matches!(cmd.as_str(), "q" | "q!" | "wq" | "wq!" | "x");
             }
-            0x1b => hold.colon = None, // Esc cancels the pending command.
-            0x08 | 0x7f => {
+            ESC => hold.colon = None,
+            BACKSPACE | DELETE => {
                 buf.pop();
             }
             0x20..=0x7e => buf.push(byte as char),
@@ -523,6 +580,43 @@ fn measure_dir_size(dir: &std::path::Path) -> u64 {
 }
 
 impl MimicHandler {
+    fn new(
+        shared: &SharedState,
+        session_id: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+        guard: ConnectionGuard,
+    ) -> Self {
+        Self {
+            config: Arc::clone(&shared.config),
+            persona: Arc::clone(&shared.persona),
+            session_id,
+            peer,
+            local,
+            pty: false,
+            auth_attempts: 0,
+            authenticated: Arc::new(AtomicBool::new(false)),
+            username: String::new(),
+            editor: new_line_editor(),
+            shell_started: false,
+            shell: None,
+            active_channel: None,
+            scp: None,
+            sftp: None,
+            quarantine_bytes: 0,
+            global_quarantine_bytes: Arc::clone(&shared.global_quarantine_bytes),
+            password_buf: None,
+            line_buf: Vec::new(),
+            screen: None,
+            pty_term: None,
+            accepted_env: Vec::new(),
+            banner_logged: false,
+            opened_at: std::time::Instant::now(),
+            command_count: 0,
+            _guard: guard,
+        }
+    }
+
     fn try_open_channel(&mut self, channel: u32) -> bool {
         if self.active_channel.is_some() {
             return false;
@@ -562,7 +656,7 @@ impl MimicHandler {
             // Before the shell is torn down: the drain writes into its VFS.
             self.drain_sftp_uploads();
             self.active_channel = None;
-            self.editor = LineEditor::new(MAX_COMMAND_LEN, 1000);
+            self.editor = new_line_editor();
             self.shell = None;
             self.scp = None;
             self.sftp = None;
@@ -635,6 +729,51 @@ impl MimicHandler {
         Ok(())
     }
 
+    async fn respond(
+        &mut self,
+        channel: ChannelId,
+        output: &Output,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        self.drain_captures();
+        jitter_for(output.text.len() + output.stdout.len() + output.stderr.len()).await;
+        self.write_output(channel, output, session)
+    }
+
+    fn show_prompt(
+        &mut self,
+        channel: ChannelId,
+        prompt: &str,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        self.editor.set_prompt(prompt);
+        session.data(channel, self.editor.render().to_vec())?;
+        Ok(())
+    }
+
+    fn show_shell_prompt(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let prompt = self.shell().prompt();
+        self.show_prompt(channel, &prompt, session)
+    }
+
+    fn end_shell_channel(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let status = self.shell().last_status as u32;
+        self.end_channel(channel, session, status)
+    }
+
+    fn logout(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
+        session.data(channel, self.out(LOGOUT))?;
+        self.end_shell_channel(channel, session)
+    }
+
     /// Emit what one completed line produced and end the channel if the line
     /// finished the session. Returns whether the session ended.
     async fn deliver(
@@ -643,11 +782,7 @@ impl MimicHandler {
         output: &Output,
         session: &mut Session,
     ) -> Result<bool, russh::Error> {
-        self.drain_captures();
-        // Response latency scaled by how much this command produced, so the
-        // timing profile correlates with workload the way a real shell's does.
-        jitter_for(output.text.len() + output.stdout.len() + output.stderr.len()).await;
-        self.write_output(channel, output, session)?;
+        self.respond(channel, output, session).await?;
         if output.exit {
             self.end_channel(channel, session, output.status as u32)?;
             return Ok(true);
@@ -783,9 +918,9 @@ impl MimicHandler {
             return false;
         };
         let quit = match hold.kind {
-            ScreenKind::Top => byte == b'q' || byte == 0x03,
-            ScreenKind::Nano => byte == 0x18 || byte == 0x03,
-            ScreenKind::Listen => byte == 0x03,
+            ScreenKind::Top => byte == b'q' || byte == CTRL_C,
+            ScreenKind::Nano => byte == CTRL_X || byte == CTRL_C,
+            ScreenKind::Listen => byte == CTRL_C,
             ScreenKind::Vi => vi_screen_input(hold, byte),
         };
         if quit {
@@ -793,6 +928,265 @@ impl MimicHandler {
             self.screen = None;
         }
         !quit
+    }
+
+    fn start_scp(
+        &mut self,
+        channel: ChannelId,
+        cmd: &str,
+        mode: ScpMode,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        match mode {
+            ScpMode::Sink { target, recursive } => {
+                self.log_command(cmd, CommandSource::Exec, None);
+                self.log_command(
+                    &format!("[scp upload to {target}]"),
+                    CommandSource::Transfer,
+                    None,
+                );
+                self.scp = Some(ScpSink::new(
+                    target,
+                    recursive,
+                    self.config.max_upload_bytes,
+                ));
+                // Signal "ready" so the client starts sending control messages.
+                session.data(channel, vec![SCP_READY])?;
+                Ok(())
+            }
+            ScpMode::Source { path } => {
+                // Download-from-honeypot is not emulated: report not found.
+                self.log_command(cmd, CommandSource::Exec, Some(SCP_FAILURE_STATUS));
+                let msg = format!("\x01scp: {path}: No such file or directory\n");
+                session.data(channel, msg.into_bytes())?;
+                self.end_channel(channel, session, SCP_FAILURE_STATUS as u32)
+            }
+        }
+    }
+
+    async fn run_exec(
+        &mut self,
+        channel: ChannelId,
+        cmd: &str,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        // A one-shot `exec` is never interactive, whatever the previous channel
+        // on this connection was.
+        self.shell().interactive = false;
+        let mut result = self.shell().execute(cmd);
+        // A here-document opened by a one-shot command can never be fed, so it
+        // ends at end-of-input with bash's warning — what `bash -c` does with
+        // the same string.
+        if let Some(finished) = self.shell().finish_heredoc_at_eof() {
+            self.log_closed_heredoc();
+            result = finished;
+        }
+        // A one-shot `exec` has no interactive stdin, so drop any prompt a
+        // command left pending (e.g. `su` awaiting a password).
+        self.shell().pending = None;
+        // Logged after the run so the event carries the exit status: a 127 is
+        // the signal that names a command worth emulating next.
+        self.log_command(cmd, CommandSource::Exec, Some(result.status));
+        self.respond(channel, &result, session).await?;
+        self.end_channel(channel, session, result.status as u32)
+    }
+
+    fn feed_sftp(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        // Builds the shell if this is the first use, so the borrow below
+        // always finds one.
+        let _ = self.shell();
+        let (resp, uploads) = {
+            let max_bytes = self.config.max_upload_bytes;
+            let shell = self.shell.as_mut().expect("shell just initialised");
+            let sftp = self.sftp.as_mut().expect("sftp active");
+            sftp.feed(data, shell, max_bytes)
+        };
+        for upload in uploads {
+            self.store_sftp_upload(upload);
+        }
+        send_if_any(session, channel, resp)
+    }
+
+    fn feed_scp(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let (acks, files) = self.scp.as_mut().expect("scp active").feed(data);
+        for file in files {
+            self.store_upload(file);
+        }
+        send_if_any(session, channel, acks)
+    }
+
+    fn feed_screen<'a>(
+        &mut self,
+        channel: ChannelId,
+        data: &'a [u8],
+        session: &mut Session,
+    ) -> Result<Option<&'a [u8]>, russh::Error> {
+        let Some(kind) = self.screen.as_ref().map(|hold| hold.kind) else {
+            return Ok(Some(data));
+        };
+        let Some(quit_at) = data.iter().position(|&byte| !self.screen_input(byte)) else {
+            return Ok(None);
+        };
+        let farewell = match kind {
+            // `top`, `vi` and `nano` clear the screen on their way out, as
+            // the real programs do; `nc -l` never painted one, so Ctrl-C
+            // out of it looks like any other interrupted foreground
+            // command instead of a display disappearing.
+            ScreenKind::Listen => "^C\n",
+            ScreenKind::Top | ScreenKind::Vi | ScreenKind::Nano => SCREEN_HOME,
+        };
+        session.data(channel, self.out(farewell))?;
+        self.show_shell_prompt(channel, session)?;
+        // Anything typed after the quit key is ordinary input again.
+        Ok(Some(&data[quit_at + 1..]))
+    }
+
+    async fn feed_terminal_byte(
+        &mut self,
+        channel: ChannelId,
+        byte: u8,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        // A command (e.g. `su`) is waiting for a password line: collect
+        // bytes with echo suppressed until Enter, then resume the shell.
+        if self.password_buf.is_some() {
+            return self.feed_password_byte(channel, byte, session).await;
+        }
+        match self.editor.input(byte) {
+            Reaction::Ignore => {}
+            Reaction::Write(bytes) => session.data(channel, bytes)?,
+            Reaction::Complete => {
+                let bytes = self.complete_current_word();
+                send_if_any(session, channel, bytes)?;
+            }
+            Reaction::Eof => {
+                // Ctrl-D on an empty line is end-of-input to a login
+                // shell, which announces itself before exiting — printed
+                // on the prompt line, exactly as `exit` does after its
+                // echoed newline.
+                self.logout(channel, session)?;
+                return Ok(true);
+            }
+            Reaction::Submit { echo, line } => {
+                session.data(channel, echo)?;
+                return self.submit_terminal_line(channel, &line, session).await;
+            }
+        }
+        Ok(false)
+    }
+
+    async fn submit_terminal_line(
+        &mut self,
+        channel: ChannelId,
+        line: &str,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        // A here-document body line is not a command: it answers
+        // the line that opened the document, and only that line is
+        // logged and run.
+        let ended = if self.shell().pending.as_ref().is_some_and(|p| p.echoes()) {
+            let output = self.shell().resume(line);
+            self.log_closed_heredoc();
+            self.deliver(channel, &output, session).await?
+        } else {
+            self.submit_line(channel, line, session).await?
+        };
+        if ended {
+            return Ok(true);
+        }
+        // A command took the screen (`top`): it paints itself and
+        // keeps the terminal until the client quits it, so no
+        // prompt is drawn.
+        if let Some(screen) = self.shell().screen.take() {
+            self.hold_screen(channel, screen, session)?;
+            return Ok(false);
+        }
+        // A command left an interactive prompt pending (e.g. `su`
+        // asking for a password, `<< EOF` collecting a body): a
+        // password is collected with echo suppressed, while a
+        // here-document body is ordinary input under `PS2`.
+        let continuation = match self.shell().pending.as_ref() {
+            None => None,
+            Some(pending) if !pending.echoes() => {
+                self.password_buf = Some(Vec::new());
+                return Ok(false);
+            }
+            Some(pending) => pending.prompt(),
+        };
+        match continuation {
+            Some(ps2) => self.show_prompt(channel, ps2, session)?,
+            None => self.show_shell_prompt(channel, session)?,
+        }
+        Ok(false)
+    }
+
+    async fn feed_password_byte(
+        &mut self,
+        channel: ChannelId,
+        byte: u8,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        match byte {
+            b'\r' | b'\n' => return self.submit_password(channel, session).await,
+            CTRL_C => {
+                // Ctrl-C aborts the prompt, like a real terminal.
+                self.password_buf = None;
+                self.shell().pending = None;
+                session.data(channel, b"\r\n".to_vec())?;
+                self.show_shell_prompt(channel, session)?;
+            }
+            BACKSPACE | DELETE => {
+                // Backspace: edit the buffer without echoing. Drop the
+                // whole character, not one byte of it.
+                if let Some(buf) = self.password_buf.as_mut() {
+                    while buf.pop().is_some_and(is_continuation) {}
+                }
+            }
+            0x20..=0x7e | 0x80..=0xff => {
+                // Printable byte: buffer it (bounded), no echo.
+                if let Some(buf) = self.password_buf.as_mut() {
+                    if buf.len() < MAX_COMMAND_LEN {
+                        buf.push(byte);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn submit_password(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, russh::Error> {
+        let password = self.password_buf.take().unwrap_or_default();
+        let password = String::from_utf8_lossy(&password).into_owned();
+        session.data(channel, b"\r\n".to_vec())?;
+
+        let output = self.shell().resume(&password);
+        if self.deliver(channel, &output, session).await? {
+            return Ok(true);
+        }
+        // One answer can leave another prompt outstanding —
+        // `passwd` asks twice — so stay in echo-suppressed
+        // collection rather than drawing `PS1` over it.
+        if self.shell().pending.as_ref().is_some_and(|p| !p.echoes()) {
+            self.password_buf = Some(Vec::new());
+            return Ok(false);
+        }
+        self.show_shell_prompt(channel, session)?;
+        Ok(false)
     }
 
     /// Feed input to a shell channel that never asked for a PTY.
@@ -813,9 +1207,7 @@ impl MimicHandler {
                 // A client piping a file sends bare LF; tolerate a CRLF one.
                 b'\r' => {}
                 b'\n' => {
-                    let line = String::from_utf8_lossy(&std::mem::take(&mut self.line_buf))
-                        .trim_end_matches('\r')
-                        .to_string();
+                    let line = self.take_no_tty_line();
                     if self.run_no_tty_line(channel, &line, session).await? {
                         return Ok(());
                     }
@@ -831,6 +1223,37 @@ impl MimicHandler {
             }
         }
         Ok(())
+    }
+
+    async fn end_no_tty_shell(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        // A script whose last line has no newline still runs, the way
+        // bash runs what it has when the pipe reaches EOF.
+        if !self.line_buf.is_empty() {
+            let line = self.take_no_tty_line();
+            if self.run_no_tty_line(channel, &line, session).await? {
+                return Ok(());
+            }
+        }
+        // A script that stops mid-body still runs what it opened.
+        if let Some(output) = self.shell().finish_heredoc_at_eof() {
+            self.log_closed_heredoc();
+            if self.deliver(channel, &output, session).await? {
+                return Ok(());
+            }
+        }
+        // `logout` is what an *interactive* login shell prints on its
+        // way out. Reading a pipe, bash prints nothing.
+        self.end_shell_channel(channel, session)
+    }
+
+    fn take_no_tty_line(&mut self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut self.line_buf))
+            .trim_end_matches('\r')
+            .to_string()
     }
 
     /// Run one line read without a terminal, routing it to a pending prompt
@@ -919,8 +1342,7 @@ impl MimicHandler {
             // is a one-command tell.
             if let Some(pty) = self.pty_term.as_ref() {
                 shell.env.set("TERM", &pty.term);
-                shell.env.set("COLUMNS", &pty.cols.to_string());
-                shell.env.set("LINES", &pty.rows.to_string());
+                pty.export_size(&mut shell);
             }
             // Locale variables the client sent and `env_request` accepted.
             for (key, value) in &self.accepted_env {
@@ -969,6 +1391,18 @@ impl MimicHandler {
         )
     }
 
+    fn log_accepted_password(&self, target: &str, method: &str, password: &str) {
+        event::auth_attempt(
+            self.session_id,
+            self.peer,
+            target,
+            method,
+            Some(password),
+            None,
+            true,
+        );
+    }
+
     /// Drain and log any captures (downloads) the last command produced.
     fn drain_captures(&mut self) {
         let (session_id, peer) = (self.session_id, self.peer);
@@ -990,28 +1424,12 @@ impl MimicHandler {
                     // so credential dashboards pick it up alongside guesses —
                     // this is the secret the attacker chose, which is at least
                     // as interesting as the ones they tried.
-                    event::auth_attempt(
-                        session_id,
-                        peer,
-                        &target,
-                        "chpasswd",
-                        Some(&password),
-                        None,
-                        true,
-                    );
+                    self.log_accepted_password(&target, "chpasswd", &password);
                 }
                 Capture::SuAuth { target, password } => {
                     // A guessed password entered at an `su` prompt: log it as an
                     // authentication attempt (accepted, matching the switch).
-                    event::auth_attempt(
-                        session_id,
-                        peer,
-                        &target,
-                        "su",
-                        Some(&password),
-                        None,
-                        true,
-                    );
+                    self.log_accepted_password(&target, "su", &password);
                 }
             }
         }
@@ -1020,18 +1438,6 @@ impl MimicHandler {
     /// Persist one SCP-uploaded file: write it into the session VFS, copy it to
     /// the quarantine store on the real filesystem, and emit an `upload` event.
     fn store_upload(&mut self, file: scp::CompletedFile) {
-        let (session_id, peer) = (self.session_id, self.peer);
-        let quarantine_dir = self.config.quarantine_dir.clone();
-
-        // Content-address the captured bytes so identical payloads dedupe and
-        // the attacker-supplied filename never influences the stored path. This
-        // hashes what is stored; `file.payload_sha256` covers the whole upload,
-        // and the two differ once the cap truncates it.
-        let mut hasher = Sha256::new();
-        hasher.update(&file.data);
-        let stored_sha256 = hex(&hasher.finalize());
-
-        // Resolve the destination path inside the emulated filesystem.
         let target = self
             .scp
             .as_ref()
@@ -1039,115 +1445,79 @@ impl MimicHandler {
             .unwrap_or_else(|| "/tmp".to_string());
         let recursive = self.scp.as_ref().map(|s| s.recursive()).unwrap_or(false);
         let dest_path = self.write_to_vfs(&target, recursive, &file);
-
-        // Write to the quarantine store (real I/O is permitted in this layer),
-        // unless this session (or global store) has already hit its cumulative disk-write cap.
-        // The VFS mirror above is unaffected — it has its own independent
-        // node/byte caps — so the attacker's session still looks consistent.
-        let session_cap = self
-            .config
-            .max_upload_bytes
-            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
-        let global_cap = self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
-            self.config
-                .max_upload_bytes
-                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
-        });
-        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
-
-        let stored_path =
-            if self.quarantine_bytes.saturating_add(file.data.len() as u64) > session_cap {
-                event::quarantine_session_cap(session_id, peer);
-                String::new()
-            } else if current_global.saturating_add(file.data.len() as u64) > global_cap {
-                event::quarantine_global_cap(session_id, peer);
-                String::new()
-            } else {
-                match write_quarantine(&quarantine_dir, &stored_sha256, &file.data) {
-                    Ok((p, written)) => {
-                        self.quarantine_bytes += written;
-                        self.global_quarantine_bytes
-                            .fetch_add(written, Ordering::Relaxed);
-                        p
-                    }
-                    Err(err) => {
-                        event::quarantine_error(session_id, peer, &err.to_string());
-                        String::new()
-                    }
-                }
-            };
-
+        let stored = self.quarantine(&file.data);
         event::upload(
-            session_id,
-            peer,
+            self.session_id,
+            self.peer,
             &file.name,
             &dest_path,
             file.size,
             &file.payload_sha256,
-            &stored_sha256,
-            &stored_path,
+            &stored.sha256,
+            &stored.path,
             file.truncated,
         );
     }
 
-    /// Persist one SFTP-uploaded file: copy it to the quarantine store on the
-    /// real filesystem, and emit an `upload` event. (The file is already written
-    /// to the session VFS during SFTP close).
     fn store_sftp_upload(&mut self, upload: sftp::SftpCompletedUpload) {
-        let (session_id, peer) = (self.session_id, self.peer);
-        let quarantine_dir = self.config.quarantine_dir.clone();
-
-        let mut hasher = Sha256::new();
-        hasher.update(&upload.data);
-        let stored_sha256 = hex(&hasher.finalize());
-
-        let session_cap = self
-            .config
-            .max_upload_bytes
-            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
-        let global_cap = self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
-            self.config
-                .max_upload_bytes
-                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
-        });
-        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
-
-        let stored_path = if self
-            .quarantine_bytes
-            .saturating_add(upload.data.len() as u64)
-            > session_cap
-        {
-            event::quarantine_session_cap(session_id, peer);
-            String::new()
-        } else if current_global.saturating_add(upload.data.len() as u64) > global_cap {
-            event::quarantine_global_cap(session_id, peer);
-            String::new()
-        } else {
-            match write_quarantine(&quarantine_dir, &stored_sha256, &upload.data) {
-                Ok((p, written)) => {
-                    self.quarantine_bytes += written;
-                    self.global_quarantine_bytes
-                        .fetch_add(written, Ordering::Relaxed);
-                    p
-                }
-                Err(err) => {
-                    event::quarantine_error(session_id, peer, &err.to_string());
-                    String::new()
-                }
-            }
-        };
-
+        let stored = self.quarantine(&upload.data);
         event::upload(
-            session_id,
-            peer,
+            self.session_id,
+            self.peer,
             &upload.name,
             &upload.dest_path,
             upload.size,
             &upload.payload_sha256,
-            &stored_sha256,
-            &stored_path,
+            &stored.sha256,
+            &stored.path,
             upload.truncated,
         );
+    }
+
+    fn quarantine_session_cap(&self) -> u64 {
+        self.config
+            .max_upload_bytes
+            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER)
+    }
+
+    fn quarantine_global_cap(&self) -> u64 {
+        self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
+            self.config
+                .max_upload_bytes
+                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
+        })
+    }
+
+    fn quarantine(&mut self, data: &[u8]) -> QuarantinedPayload {
+        let sha256 = sha256_hex(data);
+        let path = self.write_within_caps(&sha256, data).unwrap_or_default();
+        QuarantinedPayload { sha256, path }
+    }
+
+    fn write_within_caps(&mut self, sha256: &str, data: &[u8]) -> Option<String> {
+        let (session_id, peer) = (self.session_id, self.peer);
+        let len = data.len() as u64;
+        if self.quarantine_bytes.saturating_add(len) > self.quarantine_session_cap() {
+            event::quarantine_session_cap(session_id, peer);
+            return None;
+        }
+        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
+        if current_global.saturating_add(len) > self.quarantine_global_cap() {
+            event::quarantine_global_cap(session_id, peer);
+            return None;
+        }
+        match write_quarantine(&self.config.quarantine_dir, sha256, data) {
+            Ok((path, written)) => {
+                self.quarantine_bytes += written;
+                self.global_quarantine_bytes
+                    .fetch_add(written, Ordering::Relaxed);
+                Some(path)
+            }
+            Err(err) => {
+                event::quarantine_error(session_id, peer, &err.to_string());
+                None
+            }
+        }
     }
 
     /// Materialise an uploaded file in the session VFS, returning its absolute
@@ -1205,6 +1575,17 @@ impl MimicHandler {
     }
 }
 
+fn send_if_any(
+    session: &mut Session,
+    channel: ChannelId,
+    bytes: Vec<u8>,
+) -> Result<(), russh::Error> {
+    if !bytes.is_empty() {
+        session.data(channel, bytes)?;
+    }
+    Ok(())
+}
+
 /// Hex-encode a byte slice.
 pub(super) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1212,6 +1593,15 @@ pub(super) fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex(&Sha256::digest(data))
+}
+
+struct QuarantinedPayload {
+    sha256: String,
+    path: String,
 }
 
 /// Resolve `path` against `cwd` into an absolute path string (no VFS lookup).
@@ -1335,12 +1725,7 @@ impl Handler for MimicHandler {
             // "Permission denied (publickey)", an obvious honeypot tell. Real
             // sshd re-prompts (up to MaxAuthTries), which is also required for
             // `accept_after` to ever see a second attempt on one connection.
-            let mut proceed_with_methods = MethodSet::empty();
-            proceed_with_methods.push(MethodKind::Password);
-            Ok(Auth::Reject {
-                proceed_with_methods: Some(proceed_with_methods),
-                partial_success: false,
-            })
+            Ok(reject_but_offer_password())
         }
     }
 
@@ -1366,12 +1751,7 @@ impl Handler for MimicHandler {
 
         // Reject public-key auth so clients fall back to password, which we can
         // capture in cleartext.
-        let mut proceed_with_methods = MethodSet::empty();
-        proceed_with_methods.push(MethodKind::Password);
-        Ok(Auth::Reject {
-            proceed_with_methods: Some(proceed_with_methods),
-            partial_success: false,
-        })
+        Ok(reject_but_offer_password())
     }
 
     async fn channel_open_session(
@@ -1413,16 +1793,8 @@ impl Handler for MimicHandler {
         // sanitised because it is attacker-controlled and reaches `env` output.
         self.pty_term = Some(PtyRequest {
             term: sanitise_term(term),
-            cols: if col_width == 0 {
-                80
-            } else {
-                col_width.min(10_000)
-            },
-            rows: if row_height == 0 {
-                24
-            } else {
-                row_height.min(10_000)
-            },
+            cols: terminal_dimension(col_width, DEFAULT_COLS),
+            rows: terminal_dimension(row_height, DEFAULT_ROWS),
         });
         session.channel_success(channel)?;
         Ok(())
@@ -1439,23 +1811,22 @@ impl Handler for MimicHandler {
         variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if variable_name == "LANG" || variable_name.starts_with("LC_") {
-            // Debian's stock *client* ssh_config ships `SendEnv LANG LC_*`, so
-            // ordinary clients hit this on every connection. Answering
-            // `channel_success` and then discarding the value is worse than
-            // refusing it: the server says "accepted" and `echo $LANG` still
-            // reports the built-in default.
-            const MAX_ACCEPTED_ENV: usize = 32;
-            if self.accepted_env.len() < MAX_ACCEPTED_ENV {
-                self.accepted_env.push((
-                    variable_name.to_string(),
-                    sanitise_env_value(variable_value),
-                ));
-            }
-            session.channel_success(channel)?;
-        } else {
+        if !is_locale_variable(variable_name) {
             session.channel_failure(channel)?;
+            return Ok(());
         }
+        // Debian's stock *client* ssh_config ships `SendEnv LANG LC_*`, so
+        // ordinary clients hit this on every connection. Answering
+        // `channel_success` and then discarding the value is worse than
+        // refusing it: the server says "accepted" and `echo $LANG` still
+        // reports the built-in default.
+        if self.accepted_env.len() < MAX_ACCEPTED_ENV {
+            self.accepted_env.push((
+                variable_name.to_string(),
+                sanitise_env_value(variable_value),
+            ));
+        }
+        session.channel_success(channel)?;
         Ok(())
     }
 
@@ -1473,17 +1844,10 @@ impl Handler for MimicHandler {
         // A resize updates COLUMNS/LINES for anything run afterwards, the way
         // bash's SIGWINCH handler does.
         if let Some(pty) = self.pty_term.as_mut() {
-            if col_width > 0 {
-                pty.cols = col_width.min(10_000);
-            }
-            if row_height > 0 {
-                pty.rows = row_height.min(10_000);
-            }
-        }
-        if let Some(shell) = self.shell.as_mut() {
-            if let Some(pty) = self.pty_term.as_ref() {
-                shell.env.set("COLUMNS", &pty.cols.to_string());
-                shell.env.set("LINES", &pty.rows.to_string());
+            pty.cols = terminal_dimension(col_width, pty.cols);
+            pty.rows = terminal_dimension(row_height, pty.rows);
+            if let Some(shell) = self.shell.as_mut() {
+                pty.export_size(shell);
             }
         }
         session.channel_success(channel)?;
@@ -1551,10 +1915,7 @@ impl Handler for MimicHandler {
             crate::clock::PREV_LOGIN_FROM,
         ));
         session.data(channel, last_login)?;
-        let prompt = self.shell().prompt();
-        self.editor.set_prompt(&prompt);
-        session.data(channel, self.editor.render().to_vec())?;
-        Ok(())
+        self.show_shell_prompt(channel, session)
     }
 
     async fn exec_request(
@@ -1570,56 +1931,9 @@ impl Handler for MimicHandler {
         // SCP transfer requests keep the channel open and drive a sub-protocol
         // over subsequent `data` frames rather than running a one-shot command.
         if let Some(mode) = scp::parse_scp(&cmd) {
-            match mode {
-                ScpMode::Sink { target, recursive } => {
-                    self.log_command(&cmd, CommandSource::Exec, None);
-                    self.log_command(
-                        &format!("[scp upload to {target}]"),
-                        CommandSource::Transfer,
-                        None,
-                    );
-                    self.scp = Some(ScpSink::new(
-                        target,
-                        recursive,
-                        self.config.max_upload_bytes,
-                    ));
-                    // Signal "ready" so the client starts sending control messages.
-                    session.data(channel, vec![0u8])?;
-                    return Ok(());
-                }
-                ScpMode::Source { path } => {
-                    // Download-from-honeypot is not emulated: report not found.
-                    self.log_command(&cmd, CommandSource::Exec, Some(1));
-                    let msg = format!("\x01scp: {path}: No such file or directory\n");
-                    session.data(channel, msg.into_bytes())?;
-                    self.end_channel(channel, session, 1)?;
-                    return Ok(());
-                }
-            }
+            return self.start_scp(channel, &cmd, mode, session);
         }
-
-        // A one-shot `exec` is never interactive, whatever the previous channel
-        // on this connection was.
-        self.shell().interactive = false;
-        let mut result = self.shell().execute(&cmd);
-        // A here-document opened by a one-shot command can never be fed, so it
-        // ends at end-of-input with bash's warning — what `bash -c` does with
-        // the same string.
-        if let Some(finished) = self.shell().finish_heredoc_at_eof() {
-            self.log_closed_heredoc();
-            result = finished;
-        }
-        // A one-shot `exec` has no interactive stdin, so drop any prompt a
-        // command left pending (e.g. `su` awaiting a password).
-        self.shell().pending = None;
-        // Logged after the run so the event carries the exit status: a 127 is
-        // the signal that names a command worth emulating next.
-        self.log_command(&cmd, CommandSource::Exec, Some(result.status));
-        self.drain_captures();
-        jitter_for(result.text.len() + result.stdout.len() + result.stderr.len()).await;
-        self.write_output(channel, &result, session)?;
-        self.end_channel(channel, session, result.status as u32)?;
-        Ok(())
+        self.run_exec(channel, &cmd, session).await
     }
 
     async fn data(
@@ -1628,189 +1942,23 @@ impl Handler for MimicHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Route bytes to the SFTP subsystem when active.
         if self.sftp.is_some() {
-            // Builds the shell if this is the first use, so the borrow below
-            // always finds one.
-            let _ = self.shell();
-            let (resp, uploads) = {
-                let max_bytes = self.config.max_upload_bytes;
-                let shell = self.shell.as_mut().expect("shell just initialised");
-                let sftp = self.sftp.as_mut().expect("sftp active");
-                sftp.feed(data, shell, max_bytes)
-            };
-            for upload in uploads {
-                self.store_sftp_upload(upload);
-            }
-            if !resp.is_empty() {
-                session.data(channel, resp)?;
-            }
-            return Ok(());
+            return self.feed_sftp(channel, data, session);
         }
-
-        // Route bytes to the SCP sink when an upload is in progress.
         if self.scp.is_some() {
-            let (acks, files) = self.scp.as_mut().expect("scp active").feed(data);
-            for file in files {
-                self.store_upload(file);
-            }
-            if !acks.is_empty() {
-                session.data(channel, acks)?;
-            }
-            return Ok(());
+            return self.feed_scp(channel, data, session);
         }
-
         // A shell channel that asked for no terminal reads lines rather than
         // running a line editor over them.
         if !self.pty {
             return self.feed_no_tty(channel, data, session).await;
         }
-
-        // A full-screen command has the terminal: keystrokes drive the display,
-        // not the line editor, until it quits and hands the prompt back.
-        let mut rest = data;
-        if let Some(kind) = self.screen.as_ref().map(|hold| hold.kind) {
-            let quit_at = data.iter().position(|&byte| !self.screen_input(byte));
-            let Some(i) = quit_at else {
-                return Ok(());
-            };
-            let bytes = match kind {
-                // `top`, `vi` and `nano` clear the screen on their way out, as
-                // the real programs do; `nc -l` never painted one, so Ctrl-C
-                // out of it looks like any other interrupted foreground
-                // command instead of a display disappearing.
-                ScreenKind::Listen => self.out("^C\n"),
-                ScreenKind::Top | ScreenKind::Vi | ScreenKind::Nano => self.out(SCREEN_HOME),
-            };
-            session.data(channel, bytes)?;
-            let prompt = self.shell().prompt();
-            self.editor.set_prompt(&prompt);
-            session.data(channel, self.editor.render().to_vec())?;
-            // Anything typed after the quit key is ordinary input again.
-            rest = &data[i + 1..];
-        }
-
+        let Some(rest) = self.feed_screen(channel, data, session)? else {
+            return Ok(());
+        };
         for &byte in rest {
-            // A command (e.g. `su`) is waiting for a password line: collect
-            // bytes with echo suppressed until Enter, then resume the shell.
-            if self.password_buf.is_some() {
-                match byte {
-                    b'\r' | b'\n' => {
-                        let password = String::from_utf8_lossy(
-                            self.password_buf.as_ref().expect("collecting"),
-                        )
-                        .into_owned();
-                        self.password_buf = None;
-                        session.data(channel, b"\r\n".to_vec())?;
-
-                        let output = self.shell().resume(&password);
-                        if self.deliver(channel, &output, session).await? {
-                            return Ok(());
-                        }
-                        // One answer can leave another prompt outstanding —
-                        // `passwd` asks twice — so stay in echo-suppressed
-                        // collection rather than drawing `PS1` over it.
-                        if self.shell().pending.as_ref().is_some_and(|p| !p.echoes()) {
-                            self.password_buf = Some(Vec::new());
-                            continue;
-                        }
-                        let prompt = self.shell().prompt();
-                        self.editor.set_prompt(&prompt);
-                        session.data(channel, self.editor.render().to_vec())?;
-                    }
-                    0x03 => {
-                        // Ctrl-C aborts the prompt, like a real terminal.
-                        self.password_buf = None;
-                        self.shell().pending = None;
-                        session.data(channel, b"\r\n".to_vec())?;
-                        let prompt = self.shell().prompt();
-                        self.editor.set_prompt(&prompt);
-                        session.data(channel, self.editor.render().to_vec())?;
-                    }
-                    0x08 | 0x7f => {
-                        // Backspace: edit the buffer without echoing. Drop the
-                        // whole character, not one byte of it.
-                        if let Some(buf) = self.password_buf.as_mut() {
-                            while buf.pop().is_some_and(is_continuation) {}
-                        }
-                    }
-                    0x20..=0x7e | 0x80..=0xff => {
-                        // Printable byte: buffer it (bounded), no echo.
-                        if let Some(buf) = self.password_buf.as_mut() {
-                            if buf.len() < MAX_COMMAND_LEN {
-                                buf.push(byte);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            match self.editor.input(byte) {
-                Reaction::Ignore => {}
-                Reaction::Write(bytes) => {
-                    session.data(channel, bytes)?;
-                }
-                Reaction::Complete => {
-                    let bytes = self.complete_current_word();
-                    if !bytes.is_empty() {
-                        session.data(channel, bytes)?;
-                    }
-                }
-                Reaction::Eof => {
-                    // Ctrl-D on an empty line is end-of-input to a login
-                    // shell, which announces itself before exiting — printed
-                    // on the prompt line, exactly as `exit` does after its
-                    // echoed newline.
-                    let bytes = self.out(LOGOUT);
-                    session.data(channel, bytes)?;
-                    let status = self.shell().last_status as u32;
-                    self.end_channel(channel, session, status)?;
-                    return Ok(());
-                }
-                Reaction::Submit { echo, line } => {
-                    session.data(channel, echo)?;
-
-                    // A here-document body line is not a command: it answers
-                    // the line that opened the document, and only that line is
-                    // logged and run.
-                    let ended = if self.shell().pending.as_ref().is_some_and(|p| p.echoes()) {
-                        let output = self.shell().resume(&line);
-                        self.log_closed_heredoc();
-                        self.deliver(channel, &output, session).await?
-                    } else {
-                        self.submit_line(channel, &line, session).await?
-                    };
-                    if ended {
-                        return Ok(());
-                    }
-                    // A command took the screen (`top`): it paints itself and
-                    // keeps the terminal until the client quits it, so no
-                    // prompt is drawn.
-                    if let Some(screen) = self.shell().screen.take() {
-                        self.hold_screen(channel, screen, session)?;
-                        continue;
-                    }
-                    // A command left an interactive prompt pending (e.g. `su`
-                    // asking for a password, `<< EOF` collecting a body): a
-                    // password is collected with echo suppressed, while a
-                    // here-document body is ordinary input under `PS2`.
-                    let continuation = match self.shell().pending.as_ref() {
-                        None => None,
-                        Some(pending) if !pending.echoes() => {
-                            self.password_buf = Some(Vec::new());
-                            continue;
-                        }
-                        Some(pending) => pending.prompt(),
-                    };
-                    let prompt = match continuation {
-                        Some(ps2) => ps2.to_string(),
-                        None => self.shell().prompt(),
-                    };
-                    self.editor.set_prompt(&prompt);
-                    session.data(channel, self.editor.render().to_vec())?;
-                }
+            if self.feed_terminal_byte(channel, byte, session).await? {
+                return Ok(());
             }
         }
         Ok(())
@@ -1834,34 +1982,11 @@ impl Handler for MimicHandler {
             // The client closed stdin. That is end-of-input to the shell just
             // as Ctrl-D is, so it ends immediately rather than holding the
             // session — and its connection slot — until the idle timeout.
-            if !self.pty {
-                // A script whose last line has no newline still runs, the way
-                // bash runs what it has when the pipe reaches EOF.
-                if !self.line_buf.is_empty() {
-                    let line = String::from_utf8_lossy(&std::mem::take(&mut self.line_buf))
-                        .trim_end_matches('\r')
-                        .to_string();
-                    if self.run_no_tty_line(channel, &line, session).await? {
-                        return Ok(());
-                    }
-                }
-                // A script that stops mid-body still runs what it opened.
-                if let Some(output) = self.shell().finish_heredoc_at_eof() {
-                    self.log_closed_heredoc();
-                    if self.deliver(channel, &output, session).await? {
-                        return Ok(());
-                    }
-                }
-                // `logout` is what an *interactive* login shell prints on its
-                // way out. Reading a pipe, bash prints nothing.
-                let status = self.shell().last_status as u32;
-                self.end_channel(channel, session, status)?;
-                return Ok(());
+            if self.pty {
+                self.logout(channel, session)?;
+            } else {
+                self.end_no_tty_shell(channel, session).await?;
             }
-            let bytes = self.out(LOGOUT);
-            session.data(channel, bytes)?;
-            let status = self.shell().last_status as u32;
-            self.end_channel(channel, session, status)?;
         }
         Ok(())
     }
@@ -1892,6 +2017,24 @@ impl Drop for MimicHandler {
     }
 }
 
+fn reject_but_offer_password() -> Auth {
+    let mut proceed_with_methods = MethodSet::empty();
+    proceed_with_methods.push(MethodKind::Password);
+    Auth::Reject {
+        proceed_with_methods: Some(proceed_with_methods),
+        partial_success: false,
+    }
+}
+
+const MAX_ACCEPTED_ENV: usize = 32;
+const MAX_TERM_LEN: usize = 64;
+const MAX_ENV_VALUE_LEN: usize = 256;
+const FALLBACK_TERM: &str = "xterm-256color";
+
+fn is_locale_variable(name: &str) -> bool {
+    name == "LANG" || name.starts_with("LC_")
+}
+
 /// Keep only what a terminal name can legally hold, bounded.
 ///
 /// `TERM` is attacker-controlled and reaches `env` output, so it is restricted
@@ -1901,10 +2044,10 @@ fn sanitise_term(term: &str) -> String {
     let cleaned: String = term
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
-        .take(64)
+        .take(MAX_TERM_LEN)
         .collect();
     if cleaned.is_empty() {
-        "xterm-256color".to_string()
+        FALLBACK_TERM.to_string()
     } else {
         cleaned
     }
@@ -1919,7 +2062,7 @@ fn sanitise_env_value(value: &str) -> String {
     value
         .chars()
         .filter(|c| !c.is_control())
-        .take(256)
+        .take(MAX_ENV_VALUE_LEN)
         .collect()
 }
 
@@ -1988,34 +2131,17 @@ mod tests {
         let registry = ConnectionRegistry::new(10, 10);
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let guard = registry.try_acquire(peer.ip()).expect("slot available");
-        MimicHandler {
+        let shared = SharedState {
             config,
             persona: Arc::new(crate::persona::Persona::sample()),
-            session_id: 1,
-            peer,
-            local: "127.0.0.1:2222".parse().unwrap(),
-            pty: false,
-            auth_attempts: 0,
-            authenticated: Arc::new(AtomicBool::new(true)),
-            username: "root".to_string(),
-            editor: LineEditor::new(MAX_COMMAND_LEN, 1000),
-            shell_started: false,
-            shell: None,
-            active_channel: None,
-            scp: Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes)),
-            sftp: None,
-            quarantine_bytes: 0,
             global_quarantine_bytes: Arc::new(AtomicU64::new(0)),
-            password_buf: None,
-            line_buf: Vec::new(),
-            screen: None,
-            pty_term: None,
-            accepted_env: Vec::new(),
-            banner_logged: false,
-            opened_at: std::time::Instant::now(),
-            command_count: 0,
-            _guard: guard,
-        }
+        };
+        let local = "127.0.0.1:2222".parse().unwrap();
+        let mut handler = MimicHandler::new(&shared, 1, peer, local, guard);
+        handler.authenticated.store(true, Ordering::Relaxed);
+        handler.username = "root".to_string();
+        handler.scp = Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes));
+        handler
     }
 
     #[test]
