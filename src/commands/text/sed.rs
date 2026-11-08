@@ -129,8 +129,12 @@ fn apply_script(script: &str, line: &str) -> SedOutcome {
         ));
     }
 
-    let delim = script.as_bytes()[1] as char;
-    let body: Vec<&str> = script[2..].split(delim).collect();
+    let Some(delim) = script.chars().nth(1) else {
+        return SedOutcome::Error(
+            "sed: -e expression #1, char 1: unterminated `s' command\n".to_string(),
+        );
+    };
+    let body: Vec<&str> = script[1 + delim.len_utf8()..].split(delim).collect();
     if body.len() < 2 {
         return SedOutcome::Error(
             "sed: -e expression #1, char 3: unterminated `s' command\n".to_string(),
@@ -155,4 +159,17 @@ fn global_replacement_limit(pattern: &str, replacement: &str) -> usize {
     MAX_COMMAND_OUTPUT_BYTES
         .checked_div(growth)
         .map_or(usize::MAX, |n| n + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multibyte_delimiter_does_not_panic() {
+        match apply_script("s\u{221a}a\u{221a}b\u{221a}", "a") {
+            SedOutcome::Replaced(out) => assert_eq!(out, "b"),
+            _ => panic!("expected replacement"),
+        }
+    }
 }
