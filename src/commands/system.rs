@@ -1,30 +1,18 @@
-//! System and identity commands: `whoami`, `id`, `uname`, `hostname`, `echo`,
-//! `env`, `export`, `unset`, `clear`, plus process-table emulation (`ps`,
-//! `top`, `kill`, `free`, `uptime`).
-//!
-//! There is no real process table — every row is fabricated from a static base
-//! plus the session's own fake shell PID. `kill` never signals anything; it
-//! only validates the target PID against the fake table and returns the message
-//! a real shell would.
-
 use super::CommandResult;
 use crate::clock;
 use crate::shell::{Pending, Screen, Shell};
 use crate::vfs::snapshot::{USR_BIN, USR_SBIN};
 
-/// Emulated kernel release (`uname -r`).
 const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
-/// Emulated kernel version (`uname -v`).
+
 const KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)";
-/// Emulated machine hardware name (`uname -m`).
+
 const MACHINE: &str = "x86_64";
 
-/// `whoami`
 pub fn whoami(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.username))
 }
 
-/// `id`
 pub fn id(shell: &Shell, _args: &[String]) -> CommandResult {
     let line = if shell.uid == 0 {
         "uid=0(root) gid=0(root) groups=0(root)\n".to_string()
@@ -39,7 +27,6 @@ pub fn id(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(line)
 }
 
-/// `uname [OPTION]...`
 pub fn uname(shell: &Shell, args: &[String]) -> CommandResult {
     let mut sysname = false;
     let mut nodename = false;
@@ -127,18 +114,14 @@ pub fn uname(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", parts.join(" ")))
 }
 
-/// `hostname`
 pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.hostname))
 }
 
-/// `nproc` — matches the single-core `/proc/cpuinfo` snapshot.
 pub fn nproc(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{}\n", shell.persona.cpu_cores))
 }
 
-/// `lscpu` — describes the same CPU `/proc/cpuinfo` and `nproc` report, drawn
-/// from the deployment persona so the three cannot drift apart.
 pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     let p = &shell.persona;
     let cpu = &p.cpu;
@@ -175,19 +158,6 @@ pub fn lscpu(shell: &Shell, _args: &[String]) -> CommandResult {
     ))
 }
 
-/// `bash`/`sh` — the shell this session already claims to be.
-///
-/// Three ways a payload arrives, all of which now run:
-///
-/// - `-c LINE`, the classic `sh -c "cd /tmp; wget ...; ./x"`;
-/// - piped stdin, which is what `... | base64 -d | sh` and `curl ... | sh`
-///   produce — the single most common staging idiom there is;
-/// - a script operand, read back out of the VFS, which is what the
-///   `wget`-then-`chmod +x`-then-run sequence ends in.
-///
-/// Each line of a script or of stdin is run through the same shell that would
-/// have run it interactively, so the nesting cap and the output cap apply
-/// exactly as they do everywhere else.
 pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -202,10 +172,10 @@ pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
                 }
                 return super::dispatch(shell, &argv);
             }
-            // Interactive/login flags change nothing here.
+
             "-i" | "-l" | "-s" | "--login" | "-" => {}
             other if other.starts_with('-') => {}
-            // A script operand: read it out of the VFS and run it.
+
             other => {
                 let Some(id) = shell.vfs.resolve(shell.cwd, other) else {
                     return CommandResult::err(
@@ -222,62 +192,42 @@ pub fn shell_cmd(shell: &mut Shell, args: &[String]) -> CommandResult {
         }
     }
 
-    // No `-c` and no operand: a real shell reads its stdin. Over a pipe that is
-    // the payload; with no pipe there is nothing to read and it exits.
     match shell.stdin.clone() {
         Some(text) if !text.trim().is_empty() => run_script(shell, &text),
         _ => CommandResult::ok(""),
     }
 }
 
-/// How many lines of a script or of piped stdin `sh` will run.
-///
-/// The output cap alone does not bound this: a script of a million `true` lines
-/// produces nothing to truncate and still costs a parse per line. A VFS file
-/// can hold 8 MiB, so without a line cap an attacker buys arbitrary CPU for one
-/// upload.
 const MAX_SCRIPT_LINES: usize = 4096;
 
-/// Run each line of `text` as a shell command, accumulating both streams.
-///
-/// This is what makes a dropped script observable: the download was already
-/// captured, but until the body actually ran, nothing downstream of it — the
-/// second-stage fetch, the persistence attempt, the credential change — was
-/// ever seen.
 fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
     let mut out = String::new();
     let mut errs = String::new();
     let mut status = 0;
-    // `Shell::execute` clears `captures` on entry, so each line would otherwise
-    // wipe the one before it — a script that fetched two payloads would log
-    // only the second. Accumulate across the whole body and hand the lot back,
-    // the way command substitution already does for its subshell.
+
     let mut collected = std::mem::take(&mut shell.captures);
 
     for line in text.lines().take(MAX_SCRIPT_LINES) {
         let line = line.trim();
-        // Shebangs and comments are not commands.
+
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let result = shell.execute(line);
-        // The network layer logs a `command` event per line the *client*
-        // submits, and these lines came from a file. Capturing each one is what
-        // makes a dropped script observable rather than just its side effects.
+
         collected.push(crate::shell::Capture::ScriptCommand {
             line: line.to_string(),
             status: result.status,
         });
         collected.append(&mut shell.captures);
-        // `stdout` is the pipe view and `text` the terminal-combined one; a
-        // script's output is going onward as a stream, so only the former.
+
         out.push_str(&result.stdout);
         errs.push_str(&result.stderr);
         status = result.status;
         if result.exit {
             break;
         }
-        // Bounded like every other accumulated stream.
+
         if out.len() + errs.len() > super::MAX_COMMAND_OUTPUT_BYTES {
             break;
         }
@@ -286,10 +236,6 @@ fn run_script(shell: &mut Shell, text: &str) -> CommandResult {
     CommandResult::streams(out, errs, status)
 }
 
-/// `printf FORMAT [ARG]...`
-///
-/// Scripts reach for `printf` wherever `echo`'s portability is in doubt, which
-/// in practice means anywhere a payload builds a multi-line file.
 pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
     let Some(format) = args.first() else {
         return CommandResult::err("printf: usage: printf [-v var] format [arguments]\n", 2);
@@ -308,8 +254,7 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
                     'r' => out.push('\r'),
                     '0' => out.push('\0'),
                     '\\' => out.push('\\'),
-                    // An unknown escape is passed through as written, the way
-                    // bash's printf does rather than swallowing the backslash.
+
                     other => {
                         out.push('\\');
                         out.push(other);
@@ -347,13 +292,6 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `scp` run as an interactive command.
-///
-/// The binary has to exist — uploads to this host succeed, which means the
-/// server side runs `scp -t` — but an interactive copy would need a real
-/// network, so it fails as a refused connection — a "timed out" that returns
-/// instantly would be a tell in itself. Transfer mode (`-t`/`-f`) never reaches
-/// this handler: the SSH layer intercepts it before the shell sees it.
 pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
     let operands: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     if operands.len() < 2 {
@@ -365,9 +303,6 @@ pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
         );
     }
 
-    // A `host:path` operand means a real connection, which this host will never
-    // make. It fails as a refused connection rather than a timeout: a timeout
-    // that returns instantly is itself a tell.
     if let Some(host) = operands.iter().find_map(|op| {
         op.split_once(':')
             .map(|(h, _)| h.rsplit('@').next().unwrap_or(h))
@@ -379,25 +314,12 @@ pub fn scp(shell: &mut Shell, args: &[String]) -> CommandResult {
         );
     }
 
-    // Purely local operands: real scp just copies, so let `cp` do it.
     let argv: Vec<String> = std::iter::once("cp".to_string())
         .chain(operands.into_iter().cloned())
         .collect();
     super::dispatch(shell, &argv)
 }
 
-/// `sudo [-u USER] [-l] [-i | -s] COMMAND [ARG]...`
-///
-/// The honeypot never gates this on a real password: the attacker's session
-/// credentials were already accepted at login, and `id` already reports
-/// membership in the `sudo` group, so denying here would be an inconsistent
-/// tell for no forensic benefit. Elevation only lasts for the wrapped
-/// command; the caller's uid/gid are restored afterward.
-///
-/// `-i` and `-s` with no command are the exception: they are the two common
-/// ways an attacker asks for a root *shell*, so they switch the session's
-/// identity for good, the way [`su`] does. `-i` is a login shell (root's
-/// environment and home); `-s` keeps the directory the caller was in.
 pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut login_shell = false;
     let mut keep_cwd = false;
@@ -422,7 +344,7 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
             }
             "-u" => {
                 iter.next();
-                iter.next(); // consume the target username
+                iter.next();
             }
             other if other.starts_with('-') => {
                 iter.next();
@@ -432,10 +354,6 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
     }
     let rest: Vec<String> = iter.cloned().collect();
     if rest.is_empty() && login_shell {
-        // A root shell for the rest of the session. `-i` is a login shell, so
-        // the switch is all of it. `-s` is not: Debian's sudoers resets the
-        // environment but does not set `always_set_home`, so the caller keeps
-        // their directory and `$HOME` and only the identity changes.
         let (cwd, home) = (shell.cwd, shell.home);
         shell.switch_user("root");
         if keep_cwd {
@@ -466,47 +384,29 @@ pub fn sudo(shell: &mut Shell, args: &[String]) -> CommandResult {
     result
 }
 
-/// `su [-] [USER]`
-///
-/// Switches the session's effective identity, as a fresh login shell for
-/// `USER` (root if omitted). Root may switch to any account with no password,
-/// exactly like real `su`; a non-root user is prompted for the target's
-/// password first. The honeypot does not gate the switch on a correct password
-/// (the attacker already authenticated over SSH, and denying here yields no
-/// forensic benefit) — but the attempted password *is* captured, and the
-/// realistic `Password:` prompt removes the "instant, password-less root" tell.
-///
-/// ponytail: `-c COMMAND` is accepted but ignored beyond still switching
-/// identity; add transient (non-persistent) elevation if that distinction
-/// ever matters for captured sessions.
 pub fn su(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut target: Option<&str> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-c" | "--command" | "-s" | "--shell" | "-g" | "--group" => {
-                iter.next(); // takes a value; accepted, ignored
+                iter.next();
             }
-            other if other.starts_with('-') => {} // "-", "-l", "--login", ...: accepted, no-op
+            other if other.starts_with('-') => {}
             other => target = Some(other),
         }
     }
     let target = target.unwrap_or("root").to_string();
 
-    // Root switches identity without a password, like real `su`.
     if shell.uid == 0 {
         shell.switch_user(&target);
         return CommandResult::empty();
     }
 
-    // A non-root user must be prompted for the target's password. Defer the
-    // switch: the network layer collects the password line (echo suppressed)
-    // and calls `Shell::resume`, which captures it and performs the switch.
     shell.pending = Some(Pending::SuPassword { target });
     CommandResult::ok("Password: ")
 }
 
-/// `echo [-ne] [STRING]...`
 pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut no_newline = false;
     let mut interpret = false;
@@ -539,8 +439,6 @@ pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(text)
 }
 
-/// Interpret the backslash escapes `echo -e` understands. The flag is set by
-/// `\c`, which ends the output there and takes the trailing newline with it.
 fn interpret_escapes(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -559,18 +457,13 @@ fn interpret_escapes(s: &str) -> (String, bool) {
             Some('e') | Some('E') => out.push('\x1b'),
             Some('f') => out.push('\x0c'),
             Some('v') => out.push('\x0b'),
-            // `\0NNN` takes up to three octal digits, `\xHH` up to two hex
-            // ones; with no digits at all both are the character itself.
-            // ponytail: a command's output is a `String`, so a code above 127
-            // becomes that Unicode scalar's UTF-8 bytes where real echo writes
-            // the single byte — `echo -e '\xff' | wc -c` reads 3, not 2.
-            // Upgrade when command output becomes a byte buffer.
+
             Some('0') => out.push(take_code(&mut chars, 8, 3).unwrap_or('\0')),
             Some('x') => match take_code(&mut chars, 16, 2) {
                 Some(c) => out.push(c),
                 None => out.push_str("\\x"),
             },
-            // `\c` drops the rest of the output, trailing newline included.
+
             Some('c') => return (out, true),
             Some(other) => {
                 out.push('\\');
@@ -582,8 +475,6 @@ fn interpret_escapes(s: &str) -> (String, bool) {
     (out, false)
 }
 
-/// Read up to `max` digits in `radix` off `chars` and return the character
-/// they encode, or `None` if the next character is not a digit in that radix.
 fn take_code(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     radix: u32,
@@ -599,11 +490,10 @@ fn take_code(
         chars.next();
         digits += 1;
     }
-    // Every value a byte escape can name is a valid `char`.
+
     (digits > 0).then(|| char::from(value as u8))
 }
 
-/// `env` / `printenv`
 pub fn env(shell: &Shell, _args: &[String]) -> CommandResult {
     let mut out = String::new();
     for (key, value) in shell.env.iter() {
@@ -612,7 +502,6 @@ pub fn env(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `export [NAME=VALUE]...`
 pub fn export(shell: &mut Shell, args: &[String]) -> CommandResult {
     for arg in args {
         if let Some((name, value)) = arg.split_once('=') {
@@ -622,7 +511,6 @@ pub fn export(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `unset NAME...`
 pub fn unset(shell: &mut Shell, args: &[String]) -> CommandResult {
     for arg in args {
         shell.env.unset(arg);
@@ -630,37 +518,30 @@ pub fn unset(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `clear`
 pub fn clear(_shell: &Shell, _args: &[String]) -> CommandResult {
-    // ANSI: move cursor home, clear screen, clear scrollback.
     CommandResult::ok("\x1b[H\x1b[2J\x1b[3J")
 }
 
-/// One row of the fabricated process table.
 struct Proc {
     pid: u32,
     ppid: u32,
     user: String,
     tty: &'static str,
     stat: &'static str,
-    /// %CPU.
+
     cpu: &'static str,
-    /// %MEM.
+
     mem: &'static str,
-    /// Virtual size in KiB.
+
     vsz: u32,
-    /// Resident set size in KiB.
+
     rss: u32,
     time: &'static str,
-    /// `ps`'s START column: the boot date for daemons, `HH:MM` for anything
-    /// started in the last day.
+
     start: String,
     cmd: String,
 }
 
-/// The system processes a Debian 12 VM shows, all started at boot — so their
-/// START column is the boot date, not a date fixed at compile time that a
-/// long-running honeypot eventually reports as older than its own uptime.
 fn base_table() -> Vec<Proc> {
     let boot = clock::format(clock::boot_time(), "%b%d");
     vec![
@@ -807,8 +688,6 @@ fn base_table() -> Vec<Proc> {
     ]
 }
 
-/// The command line as typed, which is what `ps`/`top` show for the process
-/// doing the asking.
 fn invocation(name: &str, args: &[String]) -> String {
     if args.is_empty() {
         name.to_string()
@@ -817,14 +696,6 @@ fn invocation(name: &str, args: &[String]) -> String {
     }
 }
 
-/// Build the full table including this session's own login chain. `running` is
-/// the command asking for the table: it is itself in the process list it
-/// prints, so `top` must not report `ps aux` as the process at the top.
-/// The `(pid, command)` pairs the fabricated process table holds.
-///
-/// `pidof`, `pgrep` and `killall` all read this, so none of them can disagree
-/// with what `ps` prints — three commands inventing their own tables would
-/// contradict each other on the first cross-check.
 pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
     session_table(shell, "ps")
         .into_iter()
@@ -832,14 +703,6 @@ pub fn process_table(shell: &Shell) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// The executable name a `ps` command line reports, the way `/proc/PID/comm`
-/// would: the first word, minus any directory, minus the `sshd: ` title prefix
-/// a privilege-separated daemon rewrites its argv to, minus the brackets a
-/// kernel thread is shown in.
-///
-/// Without this, `pidof sshd` misses the one process an attacker is guaranteed
-/// to look for — `ps` prints `sshd: /usr/sbin/sshd -D [listener]`, whose first
-/// word is `sshd:`.
 pub fn process_name(cmd: &str) -> &str {
     let first = cmd.split_whitespace().next().unwrap_or(cmd);
     let first = first.strip_suffix(':').unwrap_or(first);
@@ -847,7 +710,6 @@ pub fn process_name(cmd: &str) -> &str {
     first.trim_start_matches('[').trim_end_matches(']')
 }
 
-/// The pid of the first process whose executable name is `name`, if any.
 pub fn process_pid(shell: &Shell, name: &str) -> Option<u32> {
     process_table(shell)
         .into_iter()
@@ -909,13 +771,10 @@ fn session_table(shell: &Shell, running: &str) -> Vec<Proc> {
     table
 }
 
-/// `ps [aux|-ef|...]`
 pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
     let joined: String = args.join("");
     let table = session_table(shell, &invocation("ps", args));
 
-    // `ps aux` / `ps -ef` style: show every process. Bare `ps` shows only this
-    // session's processes on its tty.
     let show_all = joined.contains('a')
         || joined.contains('e')
         || joined.contains('A')
@@ -966,14 +825,6 @@ pub fn ps(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// One `top` display, able to redraw itself at any later instant.
-///
-/// The process rows are fixed when the command runs — this box has one session
-/// on it, and nothing starts or exits while an attacker watches — but the
-/// header carries the clock and the uptime, which are exactly what a viewer
-/// checks to see whether the screen is alive. Holding only the rendered rows
-/// keeps this free of any borrow on the shell, so the network layer can redraw
-/// it on a timer without reaching back into the session.
 #[derive(Clone)]
 pub struct TopScreen {
     rows: Vec<String>,
@@ -982,7 +833,6 @@ pub struct TopScreen {
 }
 
 impl TopScreen {
-    /// Render the whole display as of now.
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("top - {}\n", clock::uptime_banner()));
@@ -1012,13 +862,6 @@ impl TopScreen {
     }
 }
 
-/// `top [-b] [-n N]`
-///
-/// On a terminal, real `top` takes the screen and redraws every three seconds
-/// until `q`. The display is built here; the holding is the network layer's,
-/// which is the only layer allowed to own a timer. Batch mode (`-b`), an
-/// iteration count (`-n`), a pipe, and any channel without a terminal all get
-/// the one-shot dump instead — the same cases real `top` prints once for.
 pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
     let table = session_table(shell, &invocation("top", args));
     let running = table.iter().filter(|p| p.stat.starts_with('R')).count();
@@ -1050,22 +893,19 @@ pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
         .iter()
         .any(|a| a == "-b" || a == "--batch" || (a.starts_with('-') && a.contains('n')));
     if !batch && shell.interactive && shell.stdout_is_tty {
-        // The display paints itself once the network layer picks it up, so the
-        // command writes nothing: a frame here would be painted twice.
         shell.screen = Some(Screen::Top(screen));
         return CommandResult::empty();
     }
     CommandResult::ok(screen.render())
 }
 
-/// `kill [-SIG] PID...`
 pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
     let mut pids: Vec<&str> = Vec::new();
     let mut list = false;
     for arg in args {
         match arg.as_str() {
             "-l" | "--list" => list = true,
-            // Signal specifiers (e.g. -9, -SIGKILL, -s TERM): accepted, ignored.
+
             s if s.starts_with('-') => {}
             other => pids.push(other),
         }
@@ -1103,13 +943,10 @@ pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
                 status = 1;
             }
             Some(p) => {
-                // Non-root may only signal its own processes; system PIDs are
-                // owned by root, so an unprivileged attacker is denied.
                 if shell.uid != 0 && p.user != shell.username {
                     out.push_str(&format!("-bash: kill: ({pid}) - Operation not permitted\n"));
                     status = 1;
                 }
-                // Otherwise: silently "succeed" without affecting anything.
             }
         }
     }
@@ -1120,12 +957,6 @@ pub fn kill(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// `pkill [-SIGNAL] NAME`
-///
-/// Matches process names (substring) in the same fake table `ps`/`kill` use,
-/// applying the same ownership rule as `kill`. Tab-completion has always
-/// offered `pkill`; this closes the gap where it fell through to "command not
-/// found".
 pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
     let names: Vec<&str> = args
         .iter()
@@ -1167,27 +998,18 @@ pub fn pkill(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// `free [-h|-m|-g]`
 pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human");
     let mega = args.iter().any(|a| a == "-m");
     let giga = args.iter().any(|a| a == "-g");
 
-    // Base figures in KiB, matching `/proc/meminfo` and `top`'s header. The
-    // columns must add up — `total = used + free + buff/cache` is what a real
-    // `free` prints, and a row that doesn't balance is arithmetic anyone can
-    // check in one command.
-    // buff/cache = Buffers + Cached + SReclaimable, and used is whatever is
-    // left, exactly as procps derives them from `/proc/meminfo`.
-    // Derived from the persona's `MemTotal` with the same proportions
-    // `/proc/meminfo` uses, so the two agree for any deployment.
     let total = shell.persona.mem_total_kb;
     let free_mem = total * 73 / 100;
     let available = total * 86 / 100;
     let shared = 992u64;
-    // buff/cache = Buffers + Cached + SReclaimable.
+
     let buff = total * 13 / 1000 + total * 139 / 1000 + total * 20 / 1000;
-    // used is whatever is left, so the row balances by construction.
+
     let used = total.saturating_sub(free_mem).saturating_sub(buff);
 
     let fmt = |kb: u64| -> String {
@@ -1224,7 +1046,6 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// Human-readable size for `free -h` (Gi/Mi/Ki units).
 fn human_kib(kb: u64) -> String {
     let bytes = kb as f64 * 1024.0;
     const UNITS: [&str; 5] = ["B", "Ki", "Mi", "Gi", "Ti"];
@@ -1237,32 +1058,20 @@ fn human_kib(kb: u64) -> String {
     if unit == 0 {
         format!("{}B", value as u64)
     } else if value < 10.0 {
-        // procps only spends a decimal place where it buys precision: `1.9Gi`,
-        // but `992Ki` and `346Mi`. `992.0Ki` is a byte-for-byte mismatch.
         format!("{value:.1}{}", UNITS[unit])
     } else {
         format!("{value:.0}{}", UNITS[unit])
     }
 }
 
-/// `uptime`
 pub fn uptime(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!(" {}\n", clock::uptime_banner()))
 }
 
-// --- Reconnaissance commands ---------------------------------------------
-//
-// The first things an attacker runs after login. Their *absence* is itself a
-// tell, so each emulates plausible, internally consistent output. As with the
-// process table, all values are fabricated and static (or per-session) so no
-// real host detail and no other honeypot session is ever exposed.
-
-/// Shell builtins that `which` reports as not on the PATH.
 pub const BUILTINS: &[&str] = &[
     "cd", "export", "unset", "history", "exit", "logout", "alias", "source",
 ];
 
-/// `history` — print the session's command history, bash-style.
 pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
     if args.iter().any(|a| a == "-c") {
         shell.history.clear();
@@ -1275,7 +1084,6 @@ pub fn history(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `which NAME...`
 pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
     if args.is_empty() {
         return CommandResult::empty();
@@ -1284,23 +1092,17 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut status = 0;
     for name in args {
         if BUILTINS.contains(&name.as_str()) {
-            status = 1; // builtins are not external binaries
+            status = 1;
         } else if let Some(path) = binary_path(name) {
             out.push_str(&format!("{path}\n"));
         } else {
             status = 1;
         }
     }
-    // A name that resolved still prints its path; `which` says nothing about
-    // the ones that did not, it only reports them in the exit status.
+
     CommandResult::streams(out, "", status)
 }
 
-/// Resolve a known command name to the absolute path `which` would print, or
-/// `None` if it is not a recognised external binary. Resolves against the
-/// listed set (`USR_BIN`/`USR_SBIN` — the same names `ls /usr/bin` shows),
-/// not the runnable registry, so `which gzip` finds it even though `gzip`
-/// isn't wired into `commands::dispatch`.
 fn binary_path(name: &str) -> Option<String> {
     if BUILTINS.contains(&name) {
         return None;
@@ -1314,8 +1116,6 @@ fn binary_path(name: &str) -> Option<String> {
     }
 }
 
-/// `w` — who is logged on and what they are doing. A single fabricated session
-/// for the current user; other connections are never revealed.
 pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     let header = format!(" {}\n", clock::uptime_banner());
     let cols = "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n";
@@ -1328,9 +1128,6 @@ pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{header}{cols}{row}"))
 }
 
-/// `last` — listing of recent logins. Fabricated, but anchored to the same
-/// boot and previous-login instants PAM's `Last login` banner reports, so the
-/// two cannot contradict each other.
 pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
     let (prev, prev_end) = clock::prev_login();
     let boot = clock::boot_time();
@@ -1354,13 +1151,9 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `df [-h]`
 pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
-    // Every tmpfs size is derived from the persona's `MemTotal` the way the
-    // kernel and systemd size them — devtmpfs and /dev/shm at half of RAM,
-    // /run and /run/user/<uid> at a tenth. A `df` implying more RAM than
-    // `free` reports is a two-command honeypot check.
+
     let mem = shell.persona.mem_total_kb;
     let disk = shell.persona.disk_total_kb;
     let udev = mem / 2 - 5270;
@@ -1412,7 +1205,6 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `mount` — print the (fabricated) mount table.
 pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
         proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
@@ -1425,14 +1217,11 @@ pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `crontab [-l|-e|-r]`
 pub fn crontab(shell: &Shell, args: &[String]) -> CommandResult {
     if args.iter().any(|a| a == "-l") {
         return CommandResult::err(format!("no crontab for {}\n", shell.username), 1);
     }
     if args.iter().any(|a| a == "-r" || a == "-e") {
-        // Removing/editing a non-existent crontab is a no-op / opens an editor;
-        // for an emulated session we simply report nothing.
         return CommandResult::empty();
     }
     CommandResult::err(
@@ -1442,13 +1231,10 @@ pub fn crontab(shell: &Shell, args: &[String]) -> CommandResult {
     )
 }
 
-/// Truncate `s` to at most `n` characters (ASCII usernames), for column
-/// alignment.
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// `groups [USER]...` — the group memberships mirrored from `id`.
 pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     let line = if shell.uid == 0 {
         "root".to_string()
@@ -1458,20 +1244,14 @@ pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{line}\n"))
 }
 
-/// `arch` — machine hardware name, matching `uname -m`.
 pub fn arch(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{MACHINE}\n"))
 }
 
-/// `tty` — the pseudo-terminal this session runs on (matches `ps`/`w`).
 pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("/dev/pts/0\n")
 }
 
-/// `lsb_release [-a|-s|-i|-d|-r|-c]` — Debian 12 (bookworm) release info.
-///
-/// A near-universal fingerprinting step in automated recon; the values match
-/// the `/etc/os-release` snapshot the VFS presents.
 pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
     let (mut want_i, mut want_d, mut want_r, mut want_c) = (false, false, false, false);
     let mut short = false;
@@ -1487,13 +1267,12 @@ pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
                     'd' => want_d = true,
                     'r' => want_r = true,
                     'c' => want_c = true,
-                    _ => {} // -v etc.: accepted, ignored
+                    _ => {}
                 }
             }
         }
     }
 
-    // Bare invocation or -a lists every field.
     let full = all || !(want_i || want_d || want_r || want_c);
     if full {
         want_i = true;
@@ -1529,7 +1308,6 @@ pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// A static kernel ring buffer for `dmesg`, shown only to root.
 const DMESG_BUFFER: &str = "\
 [    0.000000] Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n\
 [    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz-6.1.0-21-amd64 root=UUID=8f3a2b1c-4d5e-6f70-8192-a3b4c5d6e7f8 ro console=tty0 console=ttyS0,115200\n\
@@ -1549,10 +1327,6 @@ const DMESG_BUFFER: &str = "\
 [    2.310000] e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex\n\
 [    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
 
-/// `dmesg` — the kernel ring buffer.
-///
-/// Debian 12 ships `kernel.dmesg_restrict=1`, so an unprivileged user gets a
-/// permission error; only root sees the (fabricated) buffer.
 pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     if shell.uid != 0 {
         return CommandResult::err(
@@ -1563,20 +1337,11 @@ pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(DMESG_BUFFER)
 }
 
-/// `date [-u] [+FORMAT]` — the current UTC time.
-///
-/// The emulated host runs in UTC, so the `-u` flag is a no-op. Setting the
-/// clock (`date MMDDhhmm...`) would require root and is accepted as a no-op
-/// that echoes the current time back.
-///
-/// ponytail: read-only clock (uses the real host time, which is realistic for a
-/// live box); does not honour a `date STRING` set operand beyond echoing.
 pub fn date(_shell: &Shell, args: &[String]) -> CommandResult {
     let epoch = clock::now();
     let fmt = args
         .iter()
         .find_map(|a| a.strip_prefix('+'))
-        // Default C-locale form: `Wed Jul  8 12:34:56 UTC 2026`.
         .unwrap_or("%a %b %e %H:%M:%S %Z %Y");
     CommandResult::ok(format!("{}\n", clock::format(epoch, fmt)))
 }
@@ -1590,9 +1355,6 @@ mod tests {
         shell.execute(line).text
     }
 
-    /// The whole point of running a dropped script: the download was already
-    /// captured, but nothing downstream of it was observable until the body
-    /// actually ran.
     #[test]
     fn a_dropped_script_runs_its_body() {
         let mut shell = Shell::new("root", "debian");
@@ -1601,15 +1363,11 @@ mod tests {
         let out = shell.execute("sh /tmp/.x/p.sh");
         assert!(out.stdout.contains("uid=0(root)"), "{:?}", out.stdout);
         assert!(out.stdout.contains("root\n"), "{:?}", out.stdout);
-        // A missing script fails the way a real shell reports it.
+
         let missing = shell.execute("sh /tmp/nope.sh");
         assert_eq!(missing.status, 127);
     }
 
-    /// A `command` event is emitted per line the *client* submits, so without a
-    /// capture per script line the log would show `sh /tmp/p.sh` and nothing of
-    /// what it did — which is exactly the intelligence running the body exists
-    /// to recover.
     #[test]
     fn a_dropped_script_reports_each_line_it_ran() {
         use crate::shell::Capture;
@@ -1634,9 +1392,6 @@ mod tests {
         );
     }
 
-    /// `Shell::execute` clears captures on entry, so a script's lines would
-    /// overwrite each other's side effects — the second fetch of a two-stage
-    /// dropper is exactly the one an analyst needs.
     #[test]
     fn a_script_keeps_every_line_s_captures() {
         use crate::shell::Capture;
@@ -1665,9 +1420,6 @@ mod tests {
         );
     }
 
-    /// A script that runs itself is the obvious way to turn one upload into an
-    /// unbounded stack. `dispatch`'s nesting cap has to catch it, because a
-    /// stack overflow aborts the whole process rather than one session.
     #[test]
     fn a_self_running_script_hits_the_nesting_cap() {
         let mut shell = Shell::new("root", "debian");
@@ -1680,8 +1432,6 @@ mod tests {
         );
     }
 
-    /// A script's line count is not bounded by the output cap: a million `true`
-    /// lines produce nothing to truncate and still cost a parse each.
     #[test]
     fn a_script_runs_at_most_the_line_cap() {
         let mut shell = Shell::new("root", "debian");
@@ -1696,7 +1446,6 @@ mod tests {
 
     #[test]
     fn sudo_dash_i_and_dash_s_hand_over_a_root_shell() {
-        // `-i` is a login shell: root's identity, environment, and home.
         let mut shell = Shell::new("attacker", "debian");
         assert_eq!(run(&mut shell, "sudo -i"), "");
         assert_eq!(shell.last_status, 0);
@@ -1705,8 +1454,6 @@ mod tests {
         assert_eq!(shell.prompt(), "root@debian:~# ");
         assert_eq!(run(&mut shell, "echo $HOME"), "/root\n");
 
-        // `-s` changes the identity but not where the caller stood: Debian's
-        // sudoers does not set `always_set_home`, so `$HOME` stays theirs too.
         let mut shell = Shell::new("attacker", "debian");
         run(&mut shell, "cd /tmp");
         assert_eq!(run(&mut shell, "sudo -s"), "");
@@ -1715,8 +1462,6 @@ mod tests {
         assert_eq!(shell.prompt(), "root@debian:/tmp# ");
         assert_eq!(run(&mut shell, "echo $HOME"), "/home/attacker\n");
 
-        // A flag with a command still runs just that command as root, without
-        // handing over the session.
         let mut shell = Shell::new("attacker", "debian");
         assert_eq!(
             run(&mut shell, "sudo -i id"),
@@ -1724,7 +1469,6 @@ mod tests {
         );
         assert_eq!(run(&mut shell, "whoami"), "attacker\n");
 
-        // Everything else with no command is still the usage block.
         let mut shell = Shell::new("attacker", "debian");
         assert!(run(&mut shell, "sudo").contains("usage: sudo"));
         assert_eq!(run(&mut shell, "whoami"), "attacker\n");
@@ -1735,8 +1479,7 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "sh -c whoami"), "root\n");
         assert_eq!(run(&mut shell, "bash -c 'echo hi'"), "hi\n");
-        // A bare `bash`/`sh` is a subshell: nothing is printed and the next
-        // prompt is identical, so the attacker sees what a real one would.
+
         assert_eq!(run(&mut shell, "bash"), "");
         assert_eq!(shell.last_status, 0);
     }
@@ -1750,7 +1493,7 @@ mod tests {
             out.contains("Resource temporarily unavailable"),
             "expected the nesting cap to refuse, got {out:?}"
         );
-        // The counter unwinds: the next command runs normally.
+
         assert_eq!(run(&mut shell, "whoami"), "root\n");
     }
 
@@ -1796,7 +1539,7 @@ mod tests {
             run(&mut shell, "uname -a"),
             "Linux debian 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64 GNU/Linux\n"
         );
-        // Combined short flags.
+
         assert_eq!(run(&mut shell, "uname -sm"), "Linux x86_64\n");
     }
 
@@ -1805,17 +1548,15 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "echo hello world"), "hello world\n");
         assert_eq!(run(&mut shell, "echo -n hi"), "hi");
-        // Single quotes preserve the backslash so `echo -e` can interpret it.
+
         assert_eq!(run(&mut shell, r"echo -e 'a\tb'"), "a\tb\n");
-        // Without -e, the escape stays literal.
+
         assert_eq!(run(&mut shell, r"echo 'a\tb'"), "a\\tb\n");
-        // Double quotes leave a backslash alone unless it escapes one of the
-        // four characters that are special inside them, so `echo -e` gets the
-        // same string it would in bash.
+
         assert_eq!(run(&mut shell, "echo -e \"a\\tb\\nc\""), "a\tb\nc\n");
         assert_eq!(run(&mut shell, "echo \"a\\tb\""), "a\\tb\n");
         assert_eq!(run(&mut shell, "echo \"a\\\"b\\\\c\""), "a\"b\\c\n");
-        // The rest of the GNU escape table.
+
         assert_eq!(run(&mut shell, r"echo -e 'x\e[0m'"), "x\x1b[0m\n");
         assert_eq!(run(&mut shell, r"echo -e '\0101\x42\x2'"), "AB\x02\n");
         assert_eq!(run(&mut shell, r"echo -e 'no newline\c'"), "no newline");
@@ -1876,8 +1617,6 @@ mod tests {
     fn top_takes_the_screen_only_where_a_real_one_would() {
         let mut shell = Shell::new("root", "debian");
 
-        // On a terminal it takes the screen and prints nothing itself: the
-        // display paints from the network layer's redraw timer.
         let out = run(&mut shell, "top");
         assert_eq!(out, "");
         let screen = shell.screen.take().expect("top should hold the screen");
@@ -1886,7 +1625,6 @@ mod tests {
         };
         assert!(top.render().contains("Tasks:"));
 
-        // Batch mode and an iteration count are the one-shot dump.
         for line in ["top -b", "top -bn1", "top -n 1", "top --batch"] {
             assert!(
                 run(&mut shell, line).contains("Tasks:"),
@@ -1895,7 +1633,6 @@ mod tests {
             assert!(shell.screen.is_none(), "{line} should not hold the screen");
         }
 
-        // A pipe is not a terminal, and neither is a redirect.
         assert!(
             run(&mut shell, "top | wc -l")
                 .trim()
@@ -1910,14 +1647,11 @@ mod tests {
             "a redirect should not hold the screen"
         );
 
-        // Neither is a one-shot `exec`, whatever its stdout is.
         shell.interactive = false;
         assert!(run(&mut shell, "top").contains("Tasks:"));
         assert!(shell.screen.is_none(), "exec should not hold the screen");
         shell.interactive = true;
 
-        // A substitution runs in a subshell with no terminal of its own, so it
-        // captures a dump and hands the session back unheld.
         let sub = run(&mut shell, "echo $(top)");
         assert!(sub.contains("Tasks:"));
         assert!(
@@ -1931,20 +1665,13 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert!(run(&mut shell, "top -b").contains("Tasks:"));
         assert!(run(&mut shell, "free").contains("Mem:"));
-        // procps' scaling: a decimal place only below 10, so `1.9Gi` but
-        // `346Mi` — never `346.0Mi`. Asserted as the rule rather than against
-        // pinned figures, because the numbers now come from the deployment
-        // persona and differ per sensor by design.
+
         let human = run(&mut shell, "free -h");
         assert!(!human.contains(".0Mi"), "unexpected `free -h`: {human}");
         assert!(!human.contains(".0Gi"), "unexpected `free -h`: {human}");
         assert!(human.contains("Gi") || human.contains("Mi"), "{human}");
     }
 
-    /// Whatever RAM a deployment claims, every command that reports it must
-    /// report the same figure. `free` disagreeing with `/proc/meminfo` is a
-    /// two-command honeypot check, and the persona exists to make the two
-    /// impossible to set independently.
     #[test]
     fn memory_figures_agree_across_commands_for_every_persona() {
         for seed in 0..16u64 {
@@ -1958,7 +1685,6 @@ mod tests {
                 "seed={seed} meminfo={meminfo}"
             );
 
-            // `free` prints kB totals in its first column.
             let free_out = run(&mut shell, "free");
             let mem_line = free_out
                 .lines()
@@ -1973,8 +1699,6 @@ mod tests {
         }
     }
 
-    /// The same, for the CPU: `nproc`, `lscpu` and `/proc/cpuinfo` all read the
-    /// persona, so none of them can name a processor the others do not.
     #[test]
     fn cpu_figures_agree_across_commands_for_every_persona() {
         for seed in 0..16u64 {
@@ -2024,7 +1748,7 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "which wget"), "/usr/bin/wget\n");
         assert_eq!(run(&mut shell, "which ip"), "/usr/sbin/ip\n");
-        // Builtins are not external binaries: no output, status 1.
+
         assert_eq!(run(&mut shell, "which cd"), "");
         assert_eq!(shell.last_status, 1);
     }
@@ -2071,9 +1795,9 @@ mod tests {
     fn sudo_elevates_for_one_command_then_restores() {
         let mut shell = Shell::new("attacker", "debian");
         assert_eq!(shell.uid, 1000);
-        // A privileged apt subcommand is denied without sudo...
+
         assert!(run(&mut shell, "apt update").contains("Permission denied"));
-        // ...but succeeds prefixed with sudo, and uid is restored afterward.
+
         assert!(run(&mut shell, "sudo apt update").contains("Reading package lists"));
         assert_eq!(shell.uid, 1000);
     }
@@ -2088,12 +1812,11 @@ mod tests {
     #[test]
     fn su_switches_identity_and_home() {
         let mut shell = Shell::new("attacker", "debian");
-        // A non-root user is prompted for a password before the switch; the
-        // shell defers, exposing a pending prompt the network layer drives.
+
         assert_eq!(run(&mut shell, "su"), "Password: ");
         assert!(shell.pending.is_some());
         assert_eq!(shell.uid, 1000, "identity is unchanged until a password");
-        // Answering the prompt performs the switch and captures the attempt.
+
         assert_eq!(shell.resume("hunter2").text, "");
         assert!(shell.pending.is_none());
         assert_eq!(shell.username, "root");
@@ -2107,7 +1830,7 @@ mod tests {
             ),
             "the attempted password is captured as forensic data"
         );
-        // Root switches to any account without a password prompt.
+
         assert_eq!(run(&mut shell, "su someoneelse"), "");
         assert!(shell.pending.is_none());
         assert_eq!(shell.uid, 1000);
@@ -2119,8 +1842,7 @@ mod tests {
         let mut root = Shell::new("root", "debian");
         assert_eq!(run(&mut root, "pkill bash"), "");
         let mut user = Shell::new("attacker", "debian");
-        // The fake table's system processes are owned by root; a non-root
-        // session may not "kill" them.
+
         assert!(run(&mut user, "pkill sshd").contains("Operation not permitted"));
         assert!(run(&mut user, "pkill no-such-process").is_empty());
     }
@@ -2142,7 +1864,7 @@ mod tests {
         assert!(all.contains("Distributor ID:\tDebian"));
         assert!(all.contains("Description:\tDebian GNU/Linux 12 (bookworm)"));
         assert!(all.contains("Codename:\tbookworm"));
-        // Short selectors print just the value.
+
         assert_eq!(run(&mut shell, "lsb_release -cs"), "bookworm\n");
         assert_eq!(run(&mut shell, "lsb_release -rs"), "12\n");
     }
@@ -2159,50 +1881,42 @@ mod tests {
     #[test]
     fn date_default_and_format_specifiers() {
         let mut shell = Shell::new("root", "debian");
-        // Default form: `Wdy Mon DD HH:MM:SS UTC YYYY`.
+
         let default = run(&mut shell, "date");
         assert!(default.contains("UTC"));
         assert!(default.ends_with('\n'));
-        // %F/%T/%s formats are self-consistent with gmtime.
+
         let f = run(&mut shell, "date +%F");
         assert_eq!(f.matches('-').count(), 2);
         assert_eq!(run(&mut shell, "date +%%"), "%\n");
     }
 
-    /// `date`, `uptime`, `w`, `last` and `ps` all describe the same box. An
-    /// attacker comparing any two of them must not find a contradiction — a
-    /// login dated before the boot, or a daemon older than the uptime.
     #[test]
     fn the_recon_commands_agree_on_one_timeline() {
         let mut shell = Shell::new("root", "debian");
         let year = clock::format(clock::now(), "%Y");
 
-        // `date` and the `uptime`/`w`/`top` banners share a clock.
         assert!(run(&mut shell, "date").contains(&year));
         let banner = clock::uptime_banner();
         assert!(run(&mut shell, "uptime").contains(&banner));
         assert!(run(&mut shell, "w").contains(&banner));
         assert!(run(&mut shell, "top -b").contains(&banner));
 
-        // `last` reports this year's boot, not a date frozen at compile time.
         let last = run(&mut shell, "last");
         assert!(last.contains(&year), "last should be in {year}: {last}");
         assert!(last.contains("still logged in"));
         assert!(last.contains("wtmp begins"));
-        // The previous login `last` lists is the one PAM's banner announces.
+
         let (prev, _) = clock::prev_login();
         assert!(last.contains(&clock::format(prev, "%a %b %e %H:%M")));
 
-        // Daemons started at boot; nothing claims to predate the box.
         let ps = run(&mut shell, "ps aux");
         assert!(ps.contains(&clock::format(clock::boot_time(), "%b%d")));
-        // Snapshot files carry the install date, which is older still.
+
         let ls = run(&mut shell, "ls -l /etc/passwd");
         assert!(ls.contains(&clock::format(clock::install_time(), "%b %e")));
     }
 
-    /// Real `top` is in its own process list; showing `ps aux` as the running
-    /// process says the output came from somewhere else.
     #[test]
     fn top_and_ps_list_themselves_not_each_other() {
         let mut shell = Shell::new("root", "debian");
@@ -2212,8 +1926,6 @@ mod tests {
         assert!(run(&mut shell, "ps aux").contains("ps aux"));
     }
 
-    /// `free`'s columns must add up the way procps derives them, and agree
-    /// with both `/proc/meminfo` and `top`'s header.
     #[test]
     fn the_memory_figures_agree_across_commands() {
         let mut shell = Shell::new("root", "debian");
@@ -2230,15 +1942,13 @@ mod tests {
         let (total, used, free_mem, buff) = (cols[0], cols[1], cols[2], cols[4]);
         assert_eq!(total, used + free_mem + buff);
 
-        // MemTotal is where every other figure comes from.
         let meminfo = run(&mut shell, "cat /proc/meminfo");
         assert!(meminfo.contains(&format!("MemTotal:        {total} kB")));
-        // `df`'s tmpfs sizes are halves and tenths of it, so a `df` that
-        // implies more RAM than `free` reports cannot happen.
+
         let df = run(&mut shell, "df");
         assert!(df.contains(&format!("{}", total / 2)), "/dev/shm is RAM/2");
         assert!(df.contains(&format!("{}", total / 10)), "/run is RAM/10");
-        // `top`'s header is the same total in MiB.
+
         assert!(run(&mut shell, "top -b").contains(&format!("{:.1} total", total as f64 / 1024.0)));
     }
 }

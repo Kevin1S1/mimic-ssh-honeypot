@@ -1,25 +1,7 @@
-//! Integer arithmetic for `$((…))`.
-//!
-//! Bash evaluates the expression in 64-bit signed integers, wrapping on
-//! overflow, and treats an unset or non-numeric name as zero. This is the same
-//! shape: a tokenizer, a precedence-climbing parser, and no state of its own —
-//! names are read from the session [`Env`] and nothing is ever assigned.
-//!
-//! ponytail: only the operators below — no bitwise, shifts, `&&`/`||`,
-//! ternary, assignment, `++`/`--`, or bases other than decimal and `0x`;
-//! upgrade when a captured payload is seen using one.
-
 use super::env::Env;
 
-/// How deeply parentheses may nest before the expression is refused. Every
-/// level is a stack frame, and the expression text is attacker-supplied.
 const MAX_DEPTH: u32 = 32;
 
-/// Evaluate `expr`, returning `None` if it is malformed or divides by zero.
-///
-/// The caller decides what a failure looks like to the attacker; bash prints a
-/// syntax error and refuses to run the command, which the expansion layer has
-/// no channel for.
 pub fn eval(env: &Env, expr: &str) -> Option<i64> {
     let tokens = tokenize(expr)?;
     let mut parser = Parser {
@@ -29,7 +11,7 @@ pub fn eval(env: &Env, expr: &str) -> Option<i64> {
         env,
     };
     let value = parser.comparison()?;
-    // Trailing junk (`1 2`) is a syntax error, not a value.
+
     if parser.pos == tokens.len() {
         Some(value)
     } else {
@@ -37,14 +19,12 @@ pub fn eval(env: &Env, expr: &str) -> Option<i64> {
     }
 }
 
-/// One lexical element of an expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
-    /// A literal, already parsed from decimal or `0x` hex.
     Num(i64),
-    /// A variable name, resolved against the environment when it is used.
+
     Name(String),
-    /// An operator or parenthesis.
+
     Op(&'static str),
 }
 
@@ -120,7 +100,6 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    /// Consume the operator `op` if it is next.
     fn eat(&mut self, op: &'static str) -> bool {
         if self.tokens.get(self.pos) == Some(&Token::Op(op)) {
             self.pos += 1;
@@ -129,7 +108,6 @@ impl Parser<'_> {
         false
     }
 
-    /// Whichever of `ops` is next, consumed.
     fn eat_any(&mut self, ops: &[&'static str]) -> Option<&'static str> {
         let &Token::Op(op) = self.tokens.get(self.pos)? else {
             return None;
@@ -141,7 +119,6 @@ impl Parser<'_> {
         None
     }
 
-    /// `==`, `!=`, `<`, `<=`, `>`, `>=` — lowest precedence, yielding 1 or 0.
     fn comparison(&mut self) -> Option<i64> {
         let mut left = self.additive()?;
         while let Some(op) = self.eat_any(&["==", "!=", "<=", ">=", "<", ">"]) {
@@ -178,7 +155,7 @@ impl Parser<'_> {
             let right = self.unary()?;
             left = match op {
                 "*" => left.wrapping_mul(right),
-                // Division by zero is an error in bash too, not a value.
+
                 "/" => left.checked_div(right)?,
                 _ => left.checked_rem(right)?,
             };
@@ -211,7 +188,7 @@ impl Parser<'_> {
         self.pos += 1;
         match token {
             Token::Num(value) => Some(value),
-            // An unset or non-numeric name is zero, as it is in bash.
+
             Token::Name(name) => Some(
                 self.env
                     .get(&name)

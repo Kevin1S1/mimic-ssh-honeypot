@@ -1,29 +1,6 @@
-//! Text-processing commands: the plumbing shell one-liners are made of.
-//!
-//! These exist because of what they unblock rather than what they do on their
-//! own. An automated intrusion almost never runs a bare command — it runs a
-//! pipeline, and a pipeline dies at its first `command not found`. The single
-//! most common payload-delivery idiom in SSH botnets is
-//! `echo <base64> | base64 -d | sh`, which needs exactly one of these to work
-//! before anything downstream of it can be observed.
-//!
-//! Purely in-memory, like every other command module: input comes from the VFS
-//! or the pipeline, never from a real file.
-
 use super::{CommandResult, MAX_COMMAND_OUTPUT_BYTES};
 use crate::shell::{Screen, Shell};
 
-/// Read the operands as files, or fall back to the pipeline's stdin when there
-/// are none — the convention every filter here follows, and what real
-/// coreutils does.
-///
-/// The text is capped at [`MAX_COMMAND_OUTPUT_BYTES`] before any filter sees
-/// it. Every command in this module is a transform whose result is capped at
-/// that same figure anyway, and several of them *inflate* their input
-/// (`base64` by 4/3, `sed` by the length of a replacement) — so bounding the
-/// input is what keeps the peak allocation bounded, not just the result.
-///
-/// Returns the concatenated text plus any per-file errors and an exit status.
 fn input_text(shell: &Shell, tool: &str, files: &[&str]) -> (String, String, i32) {
     let mut text = String::new();
     let mut errs = String::new();
@@ -61,9 +38,6 @@ fn input_text(shell: &Shell, tool: &str, files: &[&str]) -> (String, String, i32
     (text, errs, status)
 }
 
-/// Cut `text` to [`MAX_COMMAND_OUTPUT_BYTES`] on a char boundary, silently —
-/// unlike the dispatch cap this is an *input* bound, so it must not inject a
-/// truncation notice into data a filter is about to transform.
 fn cap(text: &mut String) {
     if text.len() <= MAX_COMMAND_OUTPUT_BYTES {
         return;
@@ -75,8 +49,6 @@ fn cap(text: &mut String) {
     text.truncate(cut);
 }
 
-/// Split argv into flags and operands, treating everything after `--` as an
-/// operand.
 fn split_args(args: &[String]) -> (Vec<&str>, Vec<&str>) {
     let mut flags = Vec::new();
     let mut operands = Vec::new();
@@ -94,8 +66,6 @@ fn split_args(args: &[String]) -> (Vec<&str>, Vec<&str>) {
     }
     (flags, operands)
 }
-
-// --- base64 ---------------------------------------------------------------
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -129,7 +99,6 @@ fn b64_decode(text: &str) -> Option<Vec<u8>> {
     let mut bits = 0u32;
     let mut out = Vec::new();
     for c in text.chars() {
-        // Real `base64 -d` skips newlines; anything else invalid is an error.
         if c.is_ascii_whitespace() {
             continue;
         }
@@ -154,11 +123,6 @@ fn b64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `base64 [-d] [FILE]`
-///
-/// The one command in this module that is load-bearing on its own: staged
-/// payloads arrive base64-encoded far more often than any other way, so
-/// without it the interesting half of an intrusion never runs.
 pub fn base64(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let decode = flags
@@ -181,7 +145,7 @@ pub fn base64(shell: &Shell, args: &[String]) -> CommandResult {
         if wrap_zero {
             return CommandResult::ok(format!("{encoded}\n"));
         }
-        // Real `base64` wraps at 76 columns.
+
         let mut out = String::new();
         for chunk in encoded.as_bytes().chunks(76) {
             out.push_str(&String::from_utf8_lossy(chunk));
@@ -191,9 +155,6 @@ pub fn base64(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-// --- hashes ---------------------------------------------------------------
-
-/// `md5sum [FILE]...`
 pub fn md5sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command(shell, args, "md5sum", |data| {
         use md5::{Digest, Md5};
@@ -203,7 +164,6 @@ pub fn md5sum(shell: &Shell, args: &[String]) -> CommandResult {
     })
 }
 
-/// `sha1sum [FILE]...`
 pub fn sha1sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command(shell, args, "sha1sum", |data| {
         use sha1::{Digest, Sha1};
@@ -213,7 +173,6 @@ pub fn sha1sum(shell: &Shell, args: &[String]) -> CommandResult {
     })
 }
 
-/// `sha256sum [FILE]...`
 pub fn sha256sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command(shell, args, "sha256sum", |data| {
         use sha2::{Digest, Sha256};
@@ -223,7 +182,6 @@ pub fn sha256sum(shell: &Shell, args: &[String]) -> CommandResult {
     })
 }
 
-/// `sha512sum [FILE]...`
 pub fn sha512sum(shell: &Shell, args: &[String]) -> CommandResult {
     digest_command(shell, args, "sha512sum", |data| {
         use sha2::{Digest, Sha512};
@@ -233,7 +191,6 @@ pub fn sha512sum(shell: &Shell, args: &[String]) -> CommandResult {
     })
 }
 
-/// The shared implementation behind digest commands.
 fn digest_command(
     shell: &Shell,
     args: &[String],
@@ -269,15 +226,6 @@ fn digest_command(
     CommandResult::streams(out, errs, status)
 }
 
-// --- sed ------------------------------------------------------------------
-
-/// `sed [-n] [-e SCRIPT] [SCRIPT] [FILE]...`
-///
-/// ponytail: supports the substitution (`s/a/b/[g][i]`), delete (`d`) and
-/// print (`p`) commands over literal patterns — no regular expressions,
-/// address ranges, hold space, or `-i`. That covers the config-editing and
-/// line-filtering one-liners droppers use; upgrade when captured scripts need
-/// real regex.
 pub fn sed(shell: &Shell, args: &[String]) -> CommandResult {
     let mut quiet = false;
     let mut scripts: Vec<String> = Vec::new();
@@ -295,8 +243,7 @@ pub fn sed(shell: &Shell, args: &[String]) -> CommandResult {
         match a.as_str() {
             "-n" | "--quiet" | "--silent" => quiet = true,
             "-e" | "--expression" => expect_script = true,
-            // `-i` without a real filesystem write would be a lie; refuse the
-            // way sed does when it cannot edit in place.
+
             "-i" | "--in-place" => {
                 return CommandResult::err("sed: no input files while in-place editing\n", 1)
             }
@@ -359,10 +306,7 @@ pub fn sed(shell: &Shell, args: &[String]) -> CommandResult {
             out.push_str(&current);
             out.push('\n');
         }
-        // A substitution is the one transform here that grows its input without
-        // limit — `s/a/<4096 bytes>/g` over a megabyte of `a` is a gigabyte —
-        // so the accumulator is checked as it is built rather than trimmed
-        // afterwards by dispatch, which would already have paid for it.
+
         if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
             break;
         }
@@ -391,7 +335,7 @@ fn apply_sed_script(script: &str, line: &str) -> SedOutcome {
             script.chars().next().unwrap_or(' ')
         ));
     }
-    // The delimiter is whatever follows `s`, so `s|a|b|` works like `s/a/b/`.
+
     let delim = script.as_bytes()[1] as char;
     let body: Vec<&str> = script[2..].split(delim).collect();
     if body.len() < 2 {
@@ -410,10 +354,6 @@ fn apply_sed_script(script: &str, line: &str) -> SedOutcome {
         return SedOutcome::Unchanged;
     }
     let replaced = if global {
-        // One line can be the whole input, so a global substitution that grows
-        // what it matches has to be bounded here too and not only across lines:
-        // `s/a/<4 KiB>/g` over a megabyte of `a` would otherwise build a
-        // gigabyte before anything downstream could cap it.
         let grow = replacement.len().saturating_sub(pattern.len());
         let limit = MAX_COMMAND_OUTPUT_BYTES
             .checked_div(grow)
@@ -425,9 +365,6 @@ fn apply_sed_script(script: &str, line: &str) -> SedOutcome {
     SedOutcome::Replaced(replaced)
 }
 
-// --- cut ------------------------------------------------------------------
-
-/// `cut -d DELIM -f LIST [FILE]...` / `cut -c LIST [FILE]...`
 pub fn cut(shell: &Shell, args: &[String]) -> CommandResult {
     let mut delim = '\t';
     let mut fields: Option<String> = None;
@@ -478,7 +415,7 @@ pub fn cut(shell: &Shell, args: &[String]) -> CommandResult {
             out.push_str(&picked);
         } else {
             let parts: Vec<&str> = line.split(delim).collect();
-            // A line with no delimiter is passed through whole, like real cut.
+
             if parts.len() == 1 {
                 out.push_str(line);
             } else {
@@ -496,7 +433,6 @@ pub fn cut(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// Parse a `cut`-style list such as `1,3-5,7-` into inclusive 1-based ranges.
 fn parse_ranges(spec: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for part in spec.split(',') {
@@ -519,9 +455,6 @@ fn parse_ranges(spec: &str) -> Vec<(usize, usize)> {
     out
 }
 
-// --- tr -------------------------------------------------------------------
-
-/// `tr [-d] [-s] SET1 [SET2]`
 pub fn tr(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let delete = flags.iter().any(|f| f.contains('d'));
@@ -544,7 +477,7 @@ pub fn tr(shell: &Shell, args: &[String]) -> CommandResult {
             if delete {
                 continue;
             }
-            // Real tr pads a short SET2 with its final character.
+
             let mapped = set2.get(pos).or_else(|| set2.last()).copied().unwrap_or(c);
             if squeeze && last == Some(mapped) {
                 continue;
@@ -559,18 +492,8 @@ pub fn tr(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// The widest `tr` set that will be expanded.
-///
-/// A range is two characters on the wire and up to 1.1 million after expansion
-/// (`tr '\x01-\u{10FFFF}' x`), and every input character is then matched
-/// against the set linearly — so an unbounded set is both an allocation and a
-/// quadratic-time vector for a few bytes of argument. Real `tr` works over
-/// bytes, so 256 entries is already more than it can express; the margin is for
-/// the multi-byte sets a shell one-liner writes literally.
 const MAX_TR_SET: usize = 1024;
 
-/// Expand `a-z` ranges and the common escapes in a `tr` set, up to
-/// [`MAX_TR_SET`] characters.
 fn expand_set(spec: &str) -> Vec<char> {
     let chars: Vec<char> = spec.chars().collect();
     let mut out = Vec::new();
@@ -597,7 +520,7 @@ fn expand_set(spec: &str) -> Vec<char> {
             i += 3;
             continue;
         }
-        // The POSIX classes that actually turn up in shell one-liners.
+
         if chars[i] == '[' {
             let rest: String = chars[i..].iter().collect();
             let class = [
@@ -630,9 +553,6 @@ fn expand_set(spec: &str) -> Vec<char> {
     out
 }
 
-// --- sort / uniq ----------------------------------------------------------
-
-/// `sort [-r] [-n] [-u] [FILE]...`
 pub fn sort(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let reverse = flags.iter().any(|f| f.contains('r'));
@@ -668,7 +588,6 @@ pub fn sort(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `uniq [-c] [-d] [-u] [FILE]`
 pub fn uniq(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let count = flags.iter().any(|f| f.contains('c'));
@@ -704,9 +623,6 @@ pub fn uniq(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-// --- small path and stream tools -----------------------------------------
-
-/// `basename PATH [SUFFIX]`
 pub fn basename(_shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let Some(path) = operands.first() else {
@@ -725,7 +641,6 @@ pub fn basename(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{base}\n"))
 }
 
-/// `dirname PATH`
 pub fn dirname(_shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let Some(path) = operands.first() else {
@@ -743,7 +658,6 @@ pub fn dirname(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(format!("{out}\n"))
 }
 
-/// `tee [-a] FILE...` — copies stdin onward and into each named VFS file.
 pub fn tee(shell: &mut Shell, args: &[String]) -> CommandResult {
     let (flags, operands) = split_args(args);
     let append = flags.iter().any(|f| f.contains('a'));
@@ -780,7 +694,6 @@ pub fn tee(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(text, errs, status)
 }
 
-/// `rev [FILE]...`
 pub fn rev(shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let (text, errs, status) = input_text(shell, "rev", &operands);
@@ -795,7 +708,6 @@ pub fn rev(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `nl [FILE]...` — number non-empty lines, as GNU `nl` does by default.
 pub fn nl(shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let (text, errs, status) = input_text(shell, "nl", &operands);
@@ -815,7 +727,6 @@ pub fn nl(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `seq [FIRST [INCREMENT]] LAST`
 pub fn seq(_shell: &Shell, args: &[String]) -> CommandResult {
     let (_, operands) = split_args(args);
     let nums: Vec<i64> = operands.iter().filter_map(|a| a.parse().ok()).collect();
@@ -835,8 +746,7 @@ pub fn seq(_shell: &Shell, args: &[String]) -> CommandResult {
     }
     let mut out = String::new();
     let mut i = first;
-    // Bounded like every other generated stream: `seq 1 100000000` must not
-    // become an unbounded allocation just because the arithmetic allows it.
+
     while (step > 0 && i <= last) || (step < 0 && i >= last) {
         out.push_str(&format!("{i}\n"));
         if out.len() > MAX_COMMAND_OUTPUT_BYTES {
@@ -847,10 +757,6 @@ pub fn seq(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// `xargs [-n N] [COMMAND [ARG]...]`
-///
-/// Runs `COMMAND` with the whitespace-separated words of stdin appended, which
-/// is the shape every `find ... | xargs rm`-style one-liner takes.
 pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
     let mut per_call: Option<usize> = None;
     let mut command: Vec<String> = Vec::new();
@@ -884,8 +790,7 @@ pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
     for group in words.chunks(chunk) {
         let mut argv = command.clone();
         argv.extend(group.iter().cloned());
-        // Goes through `dispatch`, so the nesting cap bounds recursion here the
-        // same way it bounds `sudo` and `sh -c`.
+
         let result = super::dispatch(shell, &argv);
         out.push_str(&result.output);
         errs.push_str(&result.stderr);
@@ -899,23 +804,6 @@ pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
     CommandResult::streams(out, errs, status)
 }
 
-/// `awk [-F SEP] [-v VAR=VAL] PROGRAM [FILE...]`
-///
-/// A deliberately small subset: `[pattern] { print ... }` rules, plus a bare
-/// pattern (which prints the line). That covers the shape awk actually takes in
-/// an attack script — `awk '{print $2}'`, `awk -F: '$3==0 {print $1}'`,
-/// `awk '/root/'` — which is pipeline plumbing, not programming. A pipeline
-/// dies at its first `command not found`, so awk's absence hid everything
-/// downstream of it; that is what this is here to stop.
-///
-/// Anything outside the subset is a syntax error rather than a wrong answer.
-/// Silently printing nothing for a program it did not understand would make
-/// awk look like it ran and found no matches, which is worse than admitting it
-/// could not parse the program.
-///
-// ponytail: no user functions, arrays, loops, or BEGIN/END bodies beyond
-// `print`. Upgrade when captured `command` events show programs being rejected
-// here — `status: 2` on an `awk` line is the signal.
 pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
     let mut sep: Option<String> = None;
     let mut vars: Vec<(String, String)> = Vec::new();
@@ -932,9 +820,6 @@ pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
                 }
             }
             "-f" => {
-                // `awk -f prog.awk` reads the program from a file. Attackers
-                // drop the program alongside the payload, so it is worth
-                // reading out of the VFS rather than refusing.
                 let Some(path) = iter.next() else { continue };
                 match shell.vfs.resolve(shell.cwd, path) {
                     Some(id) => {
@@ -966,7 +851,6 @@ pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
         );
     };
 
-    // `-v FS=:` is the other way to set the separator, and scripts use both.
     let sep = vars
         .iter()
         .find(|(k, _)| k == "FS")
@@ -996,7 +880,6 @@ pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
                 continue;
             }
             match &rule.action {
-                // A bare pattern prints the whole line, like `awk '/root/'`.
                 None => {
                     out.push_str(line);
                     out.push('\n');
@@ -1011,9 +894,7 @@ pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
                 }
             }
         }
-        // Dispatch caps the result afterwards, but awk can emit more than it
-        // read (`{print $0 $0}`), so stop at the cap rather than inflating
-        // first and trimming after.
+
         if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
             break;
         }
@@ -1022,29 +903,25 @@ pub fn awk(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-/// One `pattern { action }` rule. `action: None` is a bare pattern.
 struct AwkRule {
     pattern: AwkPattern,
     action: Option<Vec<String>>,
 }
 
 enum AwkPattern {
-    /// No pattern: the rule runs on every line.
     Always,
-    /// `/regex/` — substring matching only; see `parse_awk`.
+
     Contains(String),
-    /// `$N == "value"` / `$N != "value"`.
+
     FieldEq {
         field: usize,
         value: String,
         negate: bool,
     },
-    /// `NR == N`.
+
     LineIs(u64),
 }
 
-/// Parse the supported subset. Returns `None` for anything else, which the
-/// caller turns into a syntax error.
 fn parse_awk(program: &str) -> Option<Vec<AwkRule>> {
     let mut rules = Vec::new();
     for chunk in split_awk_rules(program) {
@@ -1056,8 +933,7 @@ fn parse_awk(program: &str) -> Option<Vec<AwkRule>> {
             Some((p, rest)) => (p.trim(), Some(rest.trim_end().trim_end_matches('}').trim())),
             None => (chunk, None),
         };
-        // BEGIN/END need a program state this subset does not model, and
-        // guessing at them would produce output a real awk never printed.
+
         if pattern_src.starts_with("BEGIN") || pattern_src.starts_with("END") {
             return None;
         }
@@ -1074,8 +950,6 @@ fn parse_awk(program: &str) -> Option<Vec<AwkRule>> {
     Some(rules)
 }
 
-/// Split a program into rules on top-level `}`, so `'/a/{print} /b/{print}'`
-/// parses as two rules and a `}` inside a string does not split anything.
 fn split_awk_rules(program: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -1103,9 +977,7 @@ fn parse_awk_pattern(src: &str) -> Option<AwkPattern> {
     if src.is_empty() {
         return Some(AwkPattern::Always);
     }
-    // `/text/` — treated as a substring, not a regex. Anything with regex
-    // metacharacters is refused rather than silently matched as a literal,
-    // because a wrong match set is worse than an honest syntax error.
+
     if let Some(body) = src.strip_prefix('/').and_then(|s| s.strip_suffix('/')) {
         if body.contains(['*', '+', '?', '[', ']', '(', ')', '|', '\\', '{', '}']) {
             return None;
@@ -1138,8 +1010,6 @@ fn parse_awk_pattern(src: &str) -> Option<AwkPattern> {
     None
 }
 
-/// Parse a `{ print a, b }` body into the items to print. Only `print` is
-/// supported; `printf`, assignments and control flow are refused.
 fn parse_awk_print(body: &str) -> Option<Vec<String>> {
     let body = body.trim().trim_end_matches(';').trim();
     if body.is_empty() || body == "print" {
@@ -1170,9 +1040,6 @@ fn awk_matches(pattern: &AwkPattern, line: &str, fields: &[String], nr: u64) -> 
     }
 }
 
-/// Resolve one `print` item: a field reference, `NR`/`NF`, a quoted string, or
-/// a literal passed through as awk would print an unset variable's name-free
-/// empty value only for bare identifiers.
 fn awk_value(item: &str, line: &str, fields: &[String], nr: u64) -> String {
     if let Some(idx) = item.strip_prefix('$') {
         if let Ok(n) = idx.trim().parse::<usize>() {
@@ -1185,8 +1052,7 @@ fn awk_value(item: &str, line: &str, fields: &[String], nr: u64) -> String {
         s if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 => {
             s[1..s.len() - 1].to_string()
         }
-        // An unset variable is the empty string in awk, and every bare
-        // identifier here is unset — this subset has no assignment.
+
         _ => String::new(),
     }
 }
@@ -1198,44 +1064,26 @@ fn awk_field(n: usize, line: &str, fields: &[String]) -> String {
     fields.get(n - 1).cloned().unwrap_or_default()
 }
 
-/// Split a line the way awk does: on runs of whitespace by default, or on each
-/// occurrence of an explicit `-F` separator.
 fn split_fields(line: &str, sep: Option<&str>) -> Vec<String> {
     match sep {
         None => line.split_whitespace().map(str::to_string).collect(),
         Some(s) if s.is_empty() || s == " " => {
             line.split_whitespace().map(str::to_string).collect()
         }
-        // `-F '\t'` arrives as a two-character string from the shell.
+
         Some("\\t") => line.split('\t').map(str::to_string).collect(),
         Some(s) => line.split(s).map(str::to_string).collect(),
     }
 }
 
-/// Visible buffer rows before the status/footer line(s) — `vi`/`nano` fill
-/// unused rows with `~`/blank lines up to here. Like
-/// [`TopScreen`](super::system::TopScreen), this has no real awareness of the
-/// client's terminal height (`pty-req`'s rows never reach this layer); it
-/// targets a plausible common size rather than the one the client asked for.
 const EDITOR_ROWS: usize = 23;
 
-/// Which editor a [`EditorScreen`] renders as. The two use unrelated layouts
-/// and quit keys, but share everything else about being a screen-holding
-/// read-only stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorKind {
     Vi,
     Nano,
 }
 
-/// One `vi`/`nano` display: a read-only view of the file it was invoked on
-/// (or a blank buffer for a bare invocation), held until the client quits it.
-///
-/// ponytail: read-only — no keystroke inserts text, and nothing is ever
-/// written back to the VFS, so `i`nsert mode, `^O` (Write Out) and `:wq` save
-/// nothing (they still quit; see the network layer's quit handling). Upgrade
-/// to a real per-keystroke buffer if a payload dropped through an editor
-/// rather than `wget`/`cat <<EOF` turns out to matter.
 #[derive(Clone)]
 pub struct EditorScreen {
     kind: EditorKind,
@@ -1245,16 +1093,10 @@ pub struct EditorScreen {
 }
 
 impl EditorScreen {
-    /// Which editor this is. `vi` and `nano` render and quit differently, and
-    /// the network layer needs to know which without holding this whole value
-    /// (see `network::ssh::ScreenHold`).
     pub fn kind(&self) -> EditorKind {
         self.kind
     }
 
-    /// Render the whole display as of now. It never changes after this — see
-    /// this type's `ponytail` note — so, unlike `top`, nothing ever calls this
-    /// twice for one hold.
     pub fn render(&self) -> String {
         match self.kind {
             EditorKind::Vi => self.render_vi(),
@@ -1272,8 +1114,7 @@ impl EditorScreen {
         for _ in shown..EDITOR_ROWS {
             out.push_str("~\n");
         }
-        // A bare `vi` opens an unnamed buffer; real vi's status line stays
-        // blank until the buffer is named with `:w file`.
+
         if !self.path.is_empty() {
             if self.exists {
                 let bytes: usize = self.lines.iter().map(|l| l.len() + 1).sum();
@@ -1296,10 +1137,7 @@ impl EditorScreen {
         } else {
             &self.path
         };
-        // No version number: real nano always shows one, but a wrong one
-        // (unverifiable against the actual bookworm package) is a sharper
-        // fingerprint than a missing one — see `USR_BIN`'s doc comment on not
-        // inventing details this box cannot source.
+
         let mut out = format!("  GNU nano    {title}\n");
         let shown = self.lines.len().min(EDITOR_ROWS);
         for line in &self.lines[..shown] {
@@ -1317,9 +1155,6 @@ impl EditorScreen {
     }
 }
 
-/// Build the [`EditorScreen`] for `vi`/`nano FILE`, reading the target from
-/// the VFS the same way `cat` does. `None` is a bare invocation with no
-/// operand: an unnamed, empty buffer.
 fn open_editor(shell: &Shell, kind: EditorKind, arg: Option<&str>) -> EditorScreen {
     let Some(arg) = arg else {
         return EditorScreen {
@@ -1347,11 +1182,6 @@ fn open_editor(shell: &Shell, kind: EditorKind, arg: Option<&str>) -> EditorScre
     }
 }
 
-/// Shared body of [`vi`] and [`nano`]: takes the terminal only on an
-/// interactive PTY, the same gate `top` uses. There is no real full-screen
-/// editor behaviour for a pipe or a one-shot `exec` to fall back to, so those
-/// get nothing, exactly like any other listed-but-unimplemented binary (see
-/// `vfs::snapshot::USR_BIN`'s doc comment).
 fn open_screen(shell: &mut Shell, kind: EditorKind, args: &[String]) -> CommandResult {
     if !(shell.interactive && shell.stdout_is_tty) {
         return CommandResult::empty();
@@ -1365,12 +1195,10 @@ fn open_screen(shell: &mut Shell, kind: EditorKind, args: &[String]) -> CommandR
     CommandResult::empty()
 }
 
-/// `vi [FILE]` — see [`open_screen`].
 pub fn vi(shell: &mut Shell, args: &[String]) -> CommandResult {
     open_screen(shell, EditorKind::Vi, args)
 }
 
-/// `nano [FILE]` — see [`open_screen`].
 pub fn nano(shell: &mut Shell, args: &[String]) -> CommandResult {
     open_screen(shell, EditorKind::Nano, args)
 }
@@ -1391,12 +1219,10 @@ mod tests {
         assert_eq!(run(&mut shell, "echo aGVsbG8K | base64 -d"), "hello\n");
     }
 
-    /// The idiom this module exists for: a staged payload arriving encoded and
-    /// piped straight into a shell.
     #[test]
     fn the_base64_dropper_idiom_runs_end_to_end() {
         let mut shell = Shell::new("root", "debian");
-        // `echo whoami` encoded.
+
         let out = run(&mut shell, "echo d2hvYW1pCg== | base64 -d | sh");
         assert_eq!(out, "root\n", "the decoded command must actually run");
     }
@@ -1412,7 +1238,7 @@ mod tests {
     #[test]
     fn md5sum_matches_a_known_vector() {
         let mut shell = Shell::new("root", "debian");
-        // Well-known: md5 of "abc" is 900150983cd24fb0d6963f7d28e17f72.
+
         let out = run(&mut shell, "echo -n abc | md5sum");
         assert!(out.starts_with("900150983cd24fb0d6963f7d28e17f72"), "{out}");
         assert!(out.trim_end().ends_with("  -"), "{out}");
@@ -1421,7 +1247,7 @@ mod tests {
     #[test]
     fn sha1sum_matches_a_known_vector() {
         let mut shell = Shell::new("root", "debian");
-        // Well-known: sha1 of "abc" is a9993e364706816aba3e25717850c26c9cd0d89d.
+
         let out = run(&mut shell, "echo -n abc | sha1sum");
         assert!(
             out.starts_with("a9993e364706816aba3e25717850c26c9cd0d89d"),
@@ -1433,7 +1259,7 @@ mod tests {
     #[test]
     fn sha256sum_matches_a_known_vector() {
         let mut shell = Shell::new("root", "debian");
-        // Well-known: sha256 of "abc".
+
         let out = run(&mut shell, "echo -n abc | sha256sum");
         assert!(
             out.starts_with("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
@@ -1447,7 +1273,7 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "echo aaa | sed 's/a/b/'"), "baa\n");
         assert_eq!(run(&mut shell, "echo aaa | sed 's/a/b/g'"), "bbb\n");
-        // Any delimiter, which is what path substitutions use.
+
         assert_eq!(run(&mut shell, "echo /x/y | sed 's|/x|/z|'"), "/z/y\n");
     }
 
@@ -1466,7 +1292,6 @@ mod tests {
         assert_eq!(run(&mut shell, "echo abcdef | cut -c2-4"), "bcd\n");
     }
 
-    /// The reconnaissance one-liner this unblocks.
     #[test]
     fn cut_reads_passwd_fields() {
         let mut shell = Shell::new("root", "debian");
@@ -1523,7 +1348,7 @@ mod tests {
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "seq 3"), "1\n2\n3\n");
         assert_eq!(run(&mut shell, "seq 2 4"), "2\n3\n4\n");
-        // A generated stream is capped like every other command's output.
+
         let huge = run(&mut shell, "seq 1 100000000");
         assert!(
             huge.len() < super::MAX_COMMAND_OUTPUT_BYTES + 4096,
@@ -1538,8 +1363,6 @@ mod tests {
         assert_eq!(run(&mut shell, "echo a b | xargs -n1 echo"), "a\nb\n");
     }
 
-    /// Two characters of argument must not become a million characters of set,
-    /// which every input byte would then be matched against linearly.
     #[test]
     fn tr_bounds_a_hostile_range() {
         let set = super::expand_set("\u{1}-\u{10FFFE}");
@@ -1548,14 +1371,12 @@ mod tests {
             "expanded to {} chars",
             set.len()
         );
-        // The ranges a one-liner actually writes are unaffected.
+
         assert_eq!(super::expand_set("a-z").len(), 26);
         let mut shell = Shell::new("root", "debian");
         assert_eq!(run(&mut shell, "echo abc | tr a-z A-Z"), "ABC\n");
     }
 
-    /// A substitution is the one transform here that grows what it matches, and
-    /// a single line can be the whole input.
     #[test]
     fn sed_bounds_a_growing_substitution() {
         let mut shell = Shell::new("root", "debian");
@@ -1579,9 +1400,6 @@ mod tests {
     fn awk_handles_the_pipeline_shapes_attackers_use() {
         let mut shell = Shell::new("root", "debian");
 
-        // The single most common form, and the reason awk's absence mattered:
-        // a pipeline dies at its first `command not found`, so everything
-        // downstream of awk used to be invisible.
         assert_eq!(
             shell.execute("echo 'a b c' | awk '{print $2}'").stdout,
             "b\n"
@@ -1595,17 +1413,14 @@ mod tests {
             "a b\n"
         );
 
-        // Finding uid-0 accounts is textbook post-exploitation recon.
         let roots = shell.execute("awk -F: '$3 == 0 {print $1}' /etc/passwd");
         assert_eq!(roots.stdout, "root\n");
 
-        // A bare pattern prints the whole line.
         assert!(shell
             .execute("awk '/root/' /etc/passwd")
             .stdout
             .starts_with("root:x:0:0:"));
 
-        // NR and NF are the other two names worth supporting.
         assert_eq!(
             shell
                 .execute("printf 'x\\ny\\n' | awk 'NR == 2 {print $1}'")
@@ -1621,9 +1436,7 @@ mod tests {
     #[test]
     fn awk_admits_what_it_cannot_parse() {
         let mut shell = Shell::new("root", "debian");
-        // Printing nothing would make awk look like it ran and matched no
-        // lines, which is a worse lie than an honest syntax error — and
-        // `status: 2` on an awk line is the signal for what to implement next.
+
         for program in [
             "BEGIN {x = 1} {print x}",
             "{for (i = 1; i <= NF; i++) print $i}",
@@ -1649,10 +1462,6 @@ mod tests {
             );
         }
 
-        // A pipe, a redirect, and a one-shot `exec` are not a terminal: real
-        // vi/nano have no full-screen behaviour to fall back to there, so
-        // they get nothing, exactly like any other listed-but-unimplemented
-        // binary rather than an invented dump.
         assert_eq!(run(&mut shell, "vi /tmp/f | wc -l"), "0\n");
         assert!(shell.screen.is_none(), "a pipe should not hold the screen");
         run(&mut shell, "nano /tmp/f > /tmp/out");
@@ -1667,7 +1476,6 @@ mod tests {
         assert!(shell.screen.is_none(), "exec should not hold the screen");
         shell.interactive = true;
 
-        // A substitution runs in a subshell with no terminal of its own.
         assert_eq!(shell.execute("echo [$(vi /tmp/f)]").text, "[]\n");
         assert!(
             shell.screen.is_none(),
@@ -1689,14 +1497,12 @@ mod tests {
         assert!(rendered.contains("~\n"), "unused rows should show as ~");
         assert!(rendered.contains("\"/tmp/f\" 2L,"));
 
-        // A path that does not exist yet is a new buffer, like real vi.
         run(&mut shell, "vi /tmp/nope");
         let Screen::Editor(editor) = shell.screen.take().unwrap() else {
             panic!("vi should hold a Screen::Editor");
         };
         assert!(editor.render().contains("\"/tmp/nope\" [New File]"));
 
-        // A bare invocation is an unnamed, empty buffer with no status line.
         run(&mut shell, "vi");
         let Screen::Editor(editor) = shell.screen.take().unwrap() else {
             panic!("vi should hold a Screen::Editor");
