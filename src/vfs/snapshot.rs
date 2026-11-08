@@ -624,9 +624,8 @@ pub fn cpuinfo(persona: &Persona) -> String {
 
 pub fn meminfo(persona: &Persona) -> String {
     let total = persona.mem_total_kb;
-
-    let free = total * 73 / 100;
-    let available = total * 86 / 100;
+    let mem = persona.memory();
+    let (free, available) = (mem.free, mem.available);
     let buffers = total * 13 / 1000;
     let cached = total * 139 / 1000;
     let active = total * 145 / 1000;

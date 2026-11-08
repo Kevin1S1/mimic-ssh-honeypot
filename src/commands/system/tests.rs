@@ -600,3 +600,16 @@ fn the_memory_figures_agree_across_commands() {
 
     assert!(run(&mut shell, "top -b").contains(&format!("{:.1} total", total as f64 / 1024.0)));
 }
+
+#[test]
+fn top_memory_header_follows_the_persona_like_free() {
+    for seed in 0..8u64 {
+        let persona = crate::persona::Persona::from_seed(seed);
+        let mem = persona.memory();
+        let mut shell = Shell::new("root", "debian");
+        shell.persona = persona;
+        let out = run(&mut shell, "top -b -n1");
+        let expect = format!("MiB Mem : {:>8.1} total", mem.total as f64 / 1024.0);
+        assert!(out.contains(&expect), "seed={seed}: {out}");
+    }
+}

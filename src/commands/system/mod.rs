@@ -349,14 +349,10 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let mega = args.iter().any(|a| a == "-m");
     let giga = args.iter().any(|a| a == "-g");
 
-    let total = shell.persona.mem_total_kb;
-    let free_mem = total * 73 / 100;
-    let available = total * 86 / 100;
+    let mem = shell.persona.memory();
+    let (total, free_mem, available, buff, used) =
+        (mem.total, mem.free, mem.available, mem.buff_cache, mem.used);
     let shared = 992u64;
-
-    let buff = total * 13 / 1000 + total * 139 / 1000 + total * 20 / 1000;
-
-    let used = total.saturating_sub(free_mem).saturating_sub(buff);
 
     let fmt = |kb: u64| -> String {
         if human {
