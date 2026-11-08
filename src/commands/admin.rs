@@ -1,61 +1,102 @@
-//! Persistence, account, and service commands.
-//!
-//! What an automated intrusion does *after* it lands. `echo 'root:pass' |
-//! chpasswd` is the single most common post-access action in SSH botnet
-//! telemetry, `systemctl` is how persistence gets probed, and `sleep` appears in
-//! nearly every staging script. None of these touch the real OS: accounts live
-//! in the session's `/etc/passwd`, services in a fabricated unit table, and
-//! `sleep` returns immediately rather than holding a connection slot.
-
 use super::CommandResult;
-use crate::shell::Shell;
+use crate::shell::{Capture, Pending, Shell};
 
-/// Read a VFS file as text, or an empty string when it is missing.
+const PASSWD_PATH: &str = "/etc/passwd";
+const GROUP_PATH: &str = "/etc/group";
+const SHADOW_PATH: &str = "/etc/shadow";
+
+const SHADOW_AGING_FIELDS: &str = "19999:0:99999:7:::";
+const CHANGED_PASSWORD_HASH: &str = "$6$mimic$changed";
+const LOCKED_PASSWORD_HASH: &str = "!";
+
+const FIRST_ADDED_ID: u32 = 1001;
+const DEFAULT_LOGIN_SHELL: &str = "/bin/sh";
+const ACCOUNT_FILE_MODE: u32 = 0o644;
+const HOME_DIR_MODE: u32 = 0o755;
+
+const USAGE_STATUS: i32 = 2;
+const ALREADY_EXISTS_STATUS: i32 = 9;
+const USERDEL_UNKNOWN_USER_STATUS: i32 = 6;
+const USERADD_HOME_FAILED_STATUS: i32 = 12;
+const UNIT_INACTIVE_STATUS: i32 = 3;
+const UNIT_NOT_FOUND_STATUS: i32 = 4;
+const GETENT_KEY_NOT_FOUND_STATUS: i32 = 2;
+const NOHUP_CANNOT_RUN_STATUS: i32 = 125;
+
+const SLEEP_UNIT_SUFFIXES: [char; 4] = ['s', 'm', 'h', 'd'];
+
 fn read_text(shell: &Shell, path: &str) -> String {
     shell
         .vfs
         .resolve(shell.cwd, path)
-        .and_then(|id| {
-            shell
-                .vfs
-                .node(id)
-                .file_bytes()
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-        })
+        .and_then(|id| shell.vfs.node(id).file_bytes())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
 }
 
-/// Replace a VFS file's contents, creating it if needed.
 fn write_text(shell: &mut Shell, path: &str, text: &str) -> bool {
     let Some((parent, name)) = super::fs::resolve_parent(shell, path) else {
         return false;
     };
-    let (uid, gid) = (shell.uid, shell.gid);
-    match shell.vfs.child(parent, &name) {
-        Some(id) => shell.vfs.write_file(id, text.as_bytes(), false),
-        None => {
-            if shell.vfs.is_full(parent) {
-                return false;
-            }
-            shell
-                .vfs
-                .add_file(parent, &name, text.as_bytes().to_vec(), 0o644, uid, gid);
-            true
-        }
+    if let Some(id) = shell.vfs.child(parent, &name) {
+        return shell.vfs.write_file(id, text.as_bytes(), false);
     }
+    if shell.vfs.is_full(parent) {
+        return false;
+    }
+    let (uid, gid) = (shell.uid, shell.gid);
+    shell.vfs.add_file(
+        parent,
+        &name,
+        text.as_bytes().to_vec(),
+        ACCOUNT_FILE_MODE,
+        uid,
+        gid,
+    );
+    true
 }
 
-/// `sleep NUMBER[SUFFIX]...`
-///
-/// Returns immediately rather than actually waiting. A honeypot that honoured
-/// `sleep 3600` would hold a connection slot for an hour on the attacker's say-so
-/// — the sleep is exactly the resource-exhaustion primitive the session caps
-/// exist to prevent. The exit status and (absent) output are identical either
-/// way, so the only thing an attacker can observe is elapsed wall time.
-///
-/// ponytail: returns instantly, so timing a `sleep` against the clock detects
-/// it. Upgrade when sleeps can be charged against the session deadline rather
-/// than a real timer.
+fn append_line(shell: &mut Shell, path: &str, line: &str) -> bool {
+    let text = read_text(shell, path);
+    write_text(shell, path, &format!("{text}{line}\n"))
+}
+
+fn is_entry_for(line: &str, name: &str) -> bool {
+    line.strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
+fn has_entry(database: &str, name: &str) -> bool {
+    database.lines().any(|line| is_entry_for(line, name))
+}
+
+fn user_exists(shell: &Shell, name: &str) -> bool {
+    has_entry(&read_text(shell, PASSWD_PATH), name)
+}
+
+fn shadow_entry(user: &str, hash: &str) -> String {
+    format!("{user}:{hash}:{SHADOW_AGING_FIELDS}")
+}
+
+fn operands(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect()
+}
+
+fn first_operand(args: &[String]) -> Option<&String> {
+    args.iter().find(|a| !a.starts_with('-'))
+}
+
+fn permission_denied(command: &str) -> CommandResult {
+    CommandResult::err(format!("{command}: Permission denied.\n"), 1)
+}
+
+fn missing_operand(command: &str) -> CommandResult {
+    CommandResult::err(format!("{command}: missing operand\n"), USAGE_STATUS)
+}
+
 pub fn sleep(_shell: &Shell, args: &[String]) -> CommandResult {
     if args.is_empty() {
         return CommandResult::err(
@@ -63,47 +104,34 @@ pub fn sleep(_shell: &Shell, args: &[String]) -> CommandResult {
             1,
         );
     }
-    for a in args {
-        let numeric = a.trim_end_matches(['s', 'm', 'h', 'd']);
-        if numeric.parse::<f64>().is_err() {
-            return CommandResult::err(format!("sleep: invalid time interval '{a}'\n"), 1);
-        }
+    let is_interval = |a: &&String| {
+        a.trim_end_matches(SLEEP_UNIT_SUFFIXES)
+            .parse::<f64>()
+            .is_ok()
+    };
+    if let Some(invalid) = args.iter().find(|a| !is_interval(a)) {
+        return CommandResult::err(format!("sleep: invalid time interval '{invalid}'\n"), 1);
     }
     CommandResult::empty()
 }
 
-/// Replace `user`'s `/etc/shadow` entry with a crypt-shaped placeholder.
-///
-/// The plaintext never reaches the VFS: it is captured as forensic data and
-/// logged, so a later `cat /etc/shadow` shows what a real one would show rather
-/// than handing the attacker back their own secret.
 pub fn set_shadow_entry(shell: &mut Shell, user: &str) {
-    let shadow = read_text(shell, "/etc/shadow");
-    let prefix = format!("{user}:");
-    let updated: String = shadow
+    let shadow = read_text(shell, SHADOW_PATH);
+    let updated: Vec<String> = shadow
         .lines()
-        .map(|l| {
-            if l.starts_with(&prefix) {
-                format!("{user}:$6$mimic$changed:19999:0:99999:7:::")
+        .map(|line| {
+            if is_entry_for(line, user) {
+                shadow_entry(user, CHANGED_PASSWORD_HASH)
             } else {
-                l.to_string()
+                line.to_string()
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    write_text(shell, "/etc/shadow", &format!("{updated}\n"));
+        .collect();
+    write_text(shell, SHADOW_PATH, &format!("{}\n", updated.join("\n")));
 }
 
-/// `passwd [USER]`
-///
-/// Prompts for the new secret the way the real thing does, twice. The shell's
-/// [`Pending`](crate::shell::Pending) mechanism collects both answers with echo
-/// suppressed — the same path `su` uses — and the second one is where the
-/// capture happens.
 pub fn passwd(shell: &mut Shell, args: &[String]) -> CommandResult {
-    let target = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
+    let target = first_operand(args)
         .cloned()
         .unwrap_or_else(|| shell.username.clone());
     if shell.uid != 0 && target != shell.username {
@@ -112,68 +140,110 @@ pub fn passwd(shell: &mut Shell, args: &[String]) -> CommandResult {
             1,
         );
     }
-    if read_text(shell, "/etc/passwd")
-        .lines()
-        .all(|l| !l.starts_with(&format!("{target}:")))
-    {
+    if !user_exists(shell, &target) {
         return CommandResult::err(format!("passwd: user '{target}' does not exist\n"), 1);
     }
     let banner = format!("Changing password for {target}.\n");
-    shell.pending = Some(crate::shell::Pending::NewPassword {
+    shell.pending = Some(Pending::NewPassword {
         target,
         first: None,
     });
     CommandResult::ok(format!("{banner}New password: "))
 }
 
-/// `chpasswd` — reads `user:password` lines from stdin.
-///
-/// The most common thing an SSH botnet does once it has a shell: lock the owner
-/// out by resetting the password. Captured as credential data, applied only to
-/// the session's own `/etc/shadow`.
 pub fn chpasswd(shell: &mut Shell, _args: &[String]) -> CommandResult {
     let input = shell.stdin.clone().unwrap_or_default();
     if input.trim().is_empty() {
         return CommandResult::empty();
     }
     if shell.uid != 0 {
-        return CommandResult::err("chpasswd: Permission denied.\n", 1);
+        return permission_denied("chpasswd");
     }
 
-    let mut errs = String::new();
-    let mut status = 0;
-    for line in input.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((user, password)) = line.split_once(':') else {
-            errs.push_str(&format!("chpasswd: line '{line}' is badly formatted\n"));
-            status = 1;
-            continue;
-        };
-        let passwd_file = read_text(shell, "/etc/passwd");
-        if !passwd_file
-            .lines()
-            .any(|l| l.starts_with(&format!("{user}:")))
-        {
-            errs.push_str(&format!(
-                "chpasswd: line '{line}': user '{user}' does not exist\n"
-            ));
-            status = 1;
-            continue;
-        }
-        // Forensic value is the plaintext, which the shell's capture path logs.
-        shell.captures.push(crate::shell::Capture::PasswordChange {
-            target: user.to_string(),
-            password: password.to_string(),
-        });
-        set_shadow_entry(shell, user);
-    }
+    let errs: String = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| change_password(shell, line).err())
+        .collect();
+    let status = i32::from(!errs.is_empty());
     CommandResult::streams(String::new(), errs, status)
 }
 
-/// `useradd [-m] [-s SHELL] [-u UID] USER`
+fn change_password(shell: &mut Shell, line: &str) -> Result<(), String> {
+    let Some((user, password)) = line.split_once(':') else {
+        return Err(format!("chpasswd: line '{line}' is badly formatted\n"));
+    };
+    if !user_exists(shell, user) {
+        return Err(format!(
+            "chpasswd: line '{line}': user '{user}' does not exist\n"
+        ));
+    }
+    shell.captures.push(Capture::PasswordChange {
+        target: user.to_string(),
+        password: password.to_string(),
+    });
+    set_shadow_entry(shell, user);
+    Ok(())
+}
+
+struct NewAccount {
+    name: String,
+    uid: u32,
+    login_shell: String,
+    create_home: bool,
+}
+
+impl NewAccount {
+    fn parse(args: &[String]) -> Option<Self> {
+        let mut login_shell = DEFAULT_LOGIN_SHELL.to_string();
+        let mut uid = FIRST_ADDED_ID;
+        let mut create_home = false;
+        let mut name = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-m" | "--create-home" => create_home = true,
+                "-s" | "--shell" => {
+                    if let Some(value) = iter.next() {
+                        login_shell = value.clone();
+                    }
+                }
+                "-u" | "--uid" => {
+                    if let Some(value) = iter.next().and_then(|v| v.parse().ok()) {
+                        uid = value;
+                    }
+                }
+                "-g" | "-G" | "-d" | "-c" | "-p" => {
+                    iter.next();
+                }
+                other if other.starts_with('-') => {}
+                other => name = Some(other.to_string()),
+            }
+        }
+        Some(Self {
+            name: name?,
+            uid,
+            login_shell,
+            create_home,
+        })
+    }
+
+    fn home(&self) -> String {
+        format!("/home/{}", self.name)
+    }
+
+    fn passwd_entry(&self) -> String {
+        let Self {
+            name,
+            uid,
+            login_shell,
+            ..
+        } = self;
+        format!("{name}:x:{uid}:{uid}::{}:{login_shell}", self.home())
+    }
+}
+
 pub fn useradd(shell: &mut Shell, args: &[String]) -> CommandResult {
     if shell.uid != 0 {
         return CommandResult::err(
@@ -181,273 +251,262 @@ pub fn useradd(shell: &mut Shell, args: &[String]) -> CommandResult {
             1,
         );
     }
-    let mut login_shell = "/bin/sh".to_string();
-    let mut uid = 1001u32;
-    let mut make_home = false;
-    let mut name: Option<String> = None;
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        match a.as_str() {
-            "-m" | "--create-home" => make_home = true,
-            "-s" | "--shell" => {
-                if let Some(v) = iter.next() {
-                    login_shell = v.clone();
-                }
-            }
-            "-u" | "--uid" => {
-                if let Some(v) = iter.next().and_then(|v| v.parse().ok()) {
-                    uid = v;
-                }
-            }
-            "-g" | "-G" | "-d" | "-c" | "-p" => {
-                iter.next();
-            }
-            other if other.starts_with('-') => {}
-            other => name = Some(other.to_string()),
-        }
-    }
-    let Some(name) = name else {
-        return CommandResult::err("useradd: missing operand\n", 2);
+    let Some(account) = NewAccount::parse(args) else {
+        return missing_operand("useradd");
     };
-
-    let passwd_file = read_text(shell, "/etc/passwd");
-    if passwd_file
-        .lines()
-        .any(|l| l.starts_with(&format!("{name}:")))
-    {
-        return CommandResult::err(format!("useradd: user '{name}' already exists\n"), 9);
+    let NewAccount { name, uid, .. } = &account;
+    if user_exists(shell, name) {
+        return CommandResult::err(
+            format!("useradd: user '{name}' already exists\n"),
+            ALREADY_EXISTS_STATUS,
+        );
     }
 
-    let home = format!("/home/{name}");
-    let entry = format!("{name}:x:{uid}:{uid}::{home}:{login_shell}\n");
-    if !write_text(shell, "/etc/passwd", &format!("{passwd_file}{entry}")) {
+    if !append_line(shell, PASSWD_PATH, &account.passwd_entry()) {
         return CommandResult::err("useradd: cannot open /etc/passwd\n", 1);
     }
-    let group_file = read_text(shell, "/etc/group");
-    write_text(
+    append_line(shell, GROUP_PATH, &format!("{name}:x:{uid}:"));
+    append_line(
         shell,
-        "/etc/group",
-        &format!("{group_file}{name}:x:{uid}:\n"),
+        SHADOW_PATH,
+        &shadow_entry(name, LOCKED_PASSWORD_HASH),
     );
-    let shadow = read_text(shell, "/etc/shadow");
-    write_text(
-        shell,
-        "/etc/shadow",
-        &format!("{shadow}{name}:!:19999:0:99999:7:::\n"),
-    );
-    if make_home && shell.vfs.mkdir_p(&home, 0o755, uid, uid).is_none() {
-        return CommandResult::err(format!("useradd: cannot create directory {home}\n"), 12);
+
+    let home = account.home();
+    if account.create_home
+        && shell
+            .vfs
+            .mkdir_p(&home, HOME_DIR_MODE, *uid, *uid)
+            .is_none()
+    {
+        return CommandResult::err(
+            format!("useradd: cannot create directory {home}\n"),
+            USERADD_HOME_FAILED_STATUS,
+        );
     }
     CommandResult::empty()
 }
 
-/// `userdel [-r] USER`
 pub fn userdel(shell: &mut Shell, args: &[String]) -> CommandResult {
     if shell.uid != 0 {
-        return CommandResult::err("userdel: Permission denied.\n", 1);
+        return permission_denied("userdel");
     }
-    let Some(name) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
-        return CommandResult::err("userdel: missing operand\n", 2);
+    let Some(name) = first_operand(args) else {
+        return missing_operand("userdel");
     };
-    let passwd_file = read_text(shell, "/etc/passwd");
-    let prefix = format!("{name}:");
-    if !passwd_file.lines().any(|l| l.starts_with(&prefix)) {
-        return CommandResult::err(format!("userdel: user '{name}' does not exist\n"), 6);
+    let passwd_file = read_text(shell, PASSWD_PATH);
+    if !has_entry(&passwd_file, name) {
+        return CommandResult::err(
+            format!("userdel: user '{name}' does not exist\n"),
+            USERDEL_UNKNOWN_USER_STATUS,
+        );
     }
     let kept: Vec<&str> = passwd_file
         .lines()
-        .filter(|l| !l.starts_with(&prefix))
+        .filter(|line| !is_entry_for(line, name))
         .collect();
-    write_text(shell, "/etc/passwd", &format!("{}\n", kept.join("\n")));
+    write_text(shell, PASSWD_PATH, &format!("{}\n", kept.join("\n")));
     CommandResult::empty()
 }
 
-/// `groupadd GROUP`
 pub fn groupadd(shell: &mut Shell, args: &[String]) -> CommandResult {
     if shell.uid != 0 {
-        return CommandResult::err("groupadd: Permission denied.\n", 1);
+        return permission_denied("groupadd");
     }
-    let Some(name) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
-        return CommandResult::err("groupadd: missing operand\n", 2);
+    let Some(name) = first_operand(args) else {
+        return missing_operand("groupadd");
     };
-    let group_file = read_text(shell, "/etc/group");
-    if group_file
-        .lines()
-        .any(|l| l.starts_with(&format!("{name}:")))
-    {
-        return CommandResult::err(format!("groupadd: group '{name}' already exists\n"), 9);
+    if has_entry(&read_text(shell, GROUP_PATH), name) {
+        return CommandResult::err(
+            format!("groupadd: group '{name}' already exists\n"),
+            ALREADY_EXISTS_STATUS,
+        );
     }
-    write_text(
-        shell,
-        "/etc/group",
-        &format!("{group_file}{name}:x:1001:\n"),
-    );
+    append_line(shell, GROUP_PATH, &format!("{name}:x:{FIRST_ADDED_ID}:"));
     CommandResult::empty()
 }
 
-/// The service units this box claims to run. Chosen to match what the rest of
-/// the emulation already implies: an sshd is obviously running, and the others
-/// are the Debian 12 default set for a minimal cloud image.
-const UNITS: &[(&str, &str, &str)] = &[
-    ("ssh.service", "OpenBSD Secure Shell server", "running"),
-    (
-        "cron.service",
-        "Regular background program processing daemon",
-        "running",
-    ),
-    ("dbus.service", "D-Bus System Message Bus", "running"),
-    ("systemd-journald.service", "Journal Service", "running"),
-    ("systemd-logind.service", "User Login Management", "running"),
-    (
-        "systemd-networkd.service",
-        "Network Configuration",
-        "running",
-    ),
-    (
-        "systemd-resolved.service",
-        "Network Name Resolution",
-        "running",
-    ),
-    (
-        "systemd-timesyncd.service",
-        "Network Time Synchronization",
-        "running",
-    ),
-    ("rsyslog.service", "System Logging Service", "running"),
-    ("getty@tty1.service", "Getty on tty1", "running"),
+struct Unit {
+    name: &'static str,
+    description: &'static str,
+}
+
+const UNITS: &[Unit] = &[
+    Unit {
+        name: "ssh.service",
+        description: "OpenBSD Secure Shell server",
+    },
+    Unit {
+        name: "cron.service",
+        description: "Regular background program processing daemon",
+    },
+    Unit {
+        name: "dbus.service",
+        description: "D-Bus System Message Bus",
+    },
+    Unit {
+        name: "systemd-journald.service",
+        description: "Journal Service",
+    },
+    Unit {
+        name: "systemd-logind.service",
+        description: "User Login Management",
+    },
+    Unit {
+        name: "systemd-networkd.service",
+        description: "Network Configuration",
+    },
+    Unit {
+        name: "systemd-resolved.service",
+        description: "Network Name Resolution",
+    },
+    Unit {
+        name: "systemd-timesyncd.service",
+        description: "Network Time Synchronization",
+    },
+    Unit {
+        name: "rsyslog.service",
+        description: "System Logging Service",
+    },
+    Unit {
+        name: "getty@tty1.service",
+        description: "Getty on tty1",
+    },
 ];
 
-/// `systemctl [SUBCOMMAND] [UNIT]`
-///
-/// Persistence probing goes through here: `systemctl enable`, then a unit file
-/// dropped into `/etc/systemd/system`. Mutating verbs report success — a
-/// refusal would end the interaction early and hide what the attacker meant to
-/// install — while the state they claim to change is not tracked.
-///
-/// ponytail: `enable`/`start` report success without changing `is-active`, so
-/// a follow-up `systemctl status` on an attacker's own unit contradicts the
-/// enable that preceded it. Upgrade when the unit table becomes session state.
+const UNIT_SUB_STATE: &str = "running";
+
+const STATE_CHANGING_VERBS: &[&str] = &[
+    "start",
+    "stop",
+    "restart",
+    "reload",
+    "enable",
+    "disable",
+    "daemon-reload",
+    "mask",
+    "unmask",
+];
+
+fn full_unit_name(unit: &str) -> String {
+    if unit.contains('.') {
+        unit.to_string()
+    } else {
+        format!("{unit}.service")
+    }
+}
+
+fn find_unit(unit: &str) -> Option<&'static Unit> {
+    let name = full_unit_name(unit);
+    UNITS.iter().find(|u| u.name == name)
+}
+
 pub fn systemctl(shell: &Shell, args: &[String]) -> CommandResult {
-    let operands: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .collect();
+    let operands = operands(args);
     let verb = operands.first().copied().unwrap_or("list-units");
     let unit = operands.get(1).copied();
 
-    let full = |u: &str| -> String {
-        if u.contains('.') {
-            u.to_string()
-        } else {
-            format!("{u}.service")
-        }
-    };
-    let known = |u: &str| UNITS.iter().find(|(n, _, _)| *n == full(u));
-
     match verb {
-        "list-units" | "list-unit-files" => {
-            let mut out =
-                String::from("  UNIT                        LOAD   ACTIVE SUB     DESCRIPTION\n");
-            for (name, desc, sub) in UNITS {
-                out.push_str(&format!("  {name:<27} loaded active {sub:<7} {desc}\n"));
-            }
-            out.push_str(&format!("\n{} loaded units listed.\n", UNITS.len()));
-            CommandResult::ok(out)
-        }
+        "list-units" | "list-unit-files" => list_units(),
         "status" => match unit {
             None => CommandResult::ok(format!(
-                "● {}\n    State: running\n     Jobs: 0 queued\n   Failed: 0 units\n",
+                "â— {}\n    State: running\n     Jobs: 0 queued\n   Failed: 0 units\n",
                 shell.hostname
             )),
-            Some(u) => match known(u) {
-                Some((name, desc, _)) => CommandResult::ok(format!(
-                    "● {name} - {desc}\n     \
-                     Loaded: loaded (/lib/systemd/system/{name}; enabled; preset: enabled)\n     \
-                     Active: active (running) since {}; {} ago\n   \
-                     Main PID: 1 (systemd)\n      \
-                     Tasks: 1 (limit: 2273)\n     \
-                     Memory: 5.4M\n        \
-                     CPU: 142ms\n     \
-                     CGroup: /system.slice/{name}\n",
-                    crate::clock::format(crate::clock::boot_time(), "%a %Y-%m-%d %H:%M:%S %Z"),
-                    crate::clock::uptime_phrase(crate::clock::uptime_secs()),
-                )),
-                None => CommandResult::err(
-                    format!(
-                        "Unit {}.service could not be found.\n",
-                        u.trim_end_matches(".service")
-                    ),
-                    4,
-                ),
-            },
+            Some(unit) => unit_status(unit),
         },
-        "is-active" => match unit.and_then(known) {
+        "is-active" => match unit.and_then(find_unit) {
             Some(_) => CommandResult::ok("active\n"),
-            None => CommandResult::streams("inactive\n", "", 3),
+            None => CommandResult::streams("inactive\n", "", UNIT_INACTIVE_STATUS),
         },
-        "is-enabled" => match unit.and_then(known) {
+        "is-enabled" => match unit.and_then(find_unit) {
             Some(_) => CommandResult::ok("enabled\n"),
             None => CommandResult::streams("disabled\n", "", 1),
         },
-        // Mutating verbs. Root-only, like the real thing.
-        "start" | "stop" | "restart" | "reload" | "enable" | "disable" | "daemon-reload"
-        | "mask" | "unmask" => {
-            if shell.uid != 0 {
-                return CommandResult::err(
-                    format!(
-                        "Failed to {verb} {}: Interactive authentication required.\n",
-                        unit.unwrap_or("unit")
-                    ),
-                    1,
-                );
-            }
-            match (verb, unit) {
-                ("enable", Some(u)) => CommandResult::ok(format!(
-                    "Created symlink /etc/systemd/system/multi-user.target.wants/{0} → /lib/systemd/system/{0}.\n",
-                    full(u)
-                )),
-                ("disable", Some(u)) => CommandResult::ok(format!(
-                    "Removed \"/etc/systemd/system/multi-user.target.wants/{}\".\n",
-                    full(u)
-                )),
-                _ => CommandResult::empty(),
-            }
-        }
+        verb if STATE_CHANGING_VERBS.contains(&verb) => change_unit_state(shell, verb, unit),
         other => CommandResult::err(format!("Unknown command verb {other}.\n"), 1),
     }
 }
 
-/// `service NAME ACTION` — the SysV wrapper, which scripts still reach for.
-pub fn service(shell: &Shell, args: &[String]) -> CommandResult {
-    let operands: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .collect();
-    if operands.len() < 2 {
-        if operands.first() == Some(&"--status-all") || operands.is_empty() {
-            let mut out = String::new();
-            for (name, _, _) in UNITS {
-                out.push_str(&format!(" [ + ]  {}\n", name.trim_end_matches(".service")));
-            }
-            return CommandResult::ok(out);
-        }
-        return CommandResult::err("Usage: service < option > | --status-all | [ service_name [ command | --full-restart ] ]\n", 1);
+fn list_units() -> CommandResult {
+    let mut out = String::from("  UNIT                        LOAD   ACTIVE SUB     DESCRIPTION\n");
+    for Unit { name, description } in UNITS {
+        out.push_str(&format!(
+            "  {name:<27} loaded active {UNIT_SUB_STATE:<7} {description}\n"
+        ));
     }
-    let (name, action) = (operands[0], operands[1]);
-    // `service x y` is a thin shim over systemctl on Debian 12.
-    systemctl(shell, &[action.to_string(), name.to_string()])
+    out.push_str(&format!("\n{} loaded units listed.\n", UNITS.len()));
+    CommandResult::ok(out)
 }
 
-/// `chattr [+-=]ATTR FILE...`
-///
-/// The immutable bit is a favourite persistence trick — `chattr +i` on a
-/// dropped binary or on `/etc/passwd` to stop cleanup. Accepted and reported as
-/// success; the attribute itself is not modelled.
-///
-/// ponytail: attributes are not stored, so `lsattr` never shows what `chattr`
-/// set. Upgrade when node metadata grows an attribute field.
+fn unit_status(unit: &str) -> CommandResult {
+    let Some(Unit { name, description }) = find_unit(unit) else {
+        return CommandResult::err(
+            format!(
+                "Unit {}.service could not be found.\n",
+                unit.trim_end_matches(".service")
+            ),
+            UNIT_NOT_FOUND_STATUS,
+        );
+    };
+    CommandResult::ok(format!(
+        "â— {name} - {description}\n     \
+         Loaded: loaded (/lib/systemd/system/{name}; enabled; preset: enabled)\n     \
+         Active: active (running) since {}; {} ago\n   \
+         Main PID: 1 (systemd)\n      \
+         Tasks: 1 (limit: 2273)\n     \
+         Memory: 5.4M\n        \
+         CPU: 142ms\n     \
+         CGroup: /system.slice/{name}\n",
+        crate::clock::format(crate::clock::boot_time(), "%a %Y-%m-%d %H:%M:%S %Z"),
+        crate::clock::uptime_phrase(crate::clock::uptime_secs()),
+    ))
+}
+
+fn change_unit_state(shell: &Shell, verb: &str, unit: Option<&str>) -> CommandResult {
+    if shell.uid != 0 {
+        return CommandResult::err(
+            format!(
+                "Failed to {verb} {}: Interactive authentication required.\n",
+                unit.unwrap_or("unit")
+            ),
+            1,
+        );
+    }
+    match (verb, unit) {
+        ("enable", Some(unit)) => CommandResult::ok(format!(
+            "Created symlink /etc/systemd/system/multi-user.target.wants/{0} â†’ /lib/systemd/system/{0}.\n",
+            full_unit_name(unit)
+        )),
+        ("disable", Some(unit)) => CommandResult::ok(format!(
+            "Removed \"/etc/systemd/system/multi-user.target.wants/{}\".\n",
+            full_unit_name(unit)
+        )),
+        _ => CommandResult::empty(),
+    }
+}
+
+pub fn service(shell: &Shell, args: &[String]) -> CommandResult {
+    match operands(args).as_slice() {
+        [] => {
+            let out: String = UNITS
+                .iter()
+                .map(|u| format!(" [ + ]  {}\n", u.name.trim_end_matches(".service")))
+                .collect();
+            CommandResult::ok(out)
+        }
+        [name, action, ..] => systemctl(shell, &[action.to_string(), name.to_string()]),
+        [_] => CommandResult::err(
+            "Usage: service < option > | --status-all | [ service_name [ command | --full-restart ] ]\n",
+            1,
+        ),
+    }
+}
+
+fn stat_error(command: &str, path: &str) -> String {
+    format!("{command}: No such file or directory while trying to stat {path}\n")
+}
+
 pub fn chattr(shell: &Shell, args: &[String]) -> CommandResult {
     let (flags, files): (Vec<&String>, Vec<&String>) =
         args.iter().partition(|a| a.starts_with(['+', '-', '=']));
@@ -457,22 +516,17 @@ pub fn chattr(shell: &Shell, args: &[String]) -> CommandResult {
             1,
         );
     }
-    let mut errs = String::new();
-    let mut status = 0;
-    for f in files {
-        if shell.vfs.resolve(shell.cwd, f).is_none() {
-            errs.push_str(&format!(
-                "chattr: No such file or directory while trying to stat {f}\n"
-            ));
-            status = 1;
-        }
-    }
+    let errs: String = files
+        .into_iter()
+        .filter(|f| shell.vfs.resolve(shell.cwd, f).is_none())
+        .map(|f| stat_error("chattr", f))
+        .collect();
+    let status = i32::from(!errs.is_empty());
     CommandResult::streams(String::new(), errs, status)
 }
 
-/// `lsattr [FILE]...`
 pub fn lsattr(shell: &Shell, args: &[String]) -> CommandResult {
-    let files: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let files = operands(args);
     let targets: Vec<String> = if files.is_empty() {
         shell
             .vfs
@@ -482,25 +536,21 @@ pub fn lsattr(shell: &Shell, args: &[String]) -> CommandResult {
             .map(|(name, _)| format!("./{name}"))
             .collect()
     } else {
-        files.into_iter().cloned().collect()
+        files.into_iter().map(str::to_string).collect()
     };
     let mut out = String::new();
     let mut errs = String::new();
-    let mut status = 0;
-    for f in targets {
-        if shell.vfs.resolve(shell.cwd, &f).is_some() {
-            out.push_str(&format!("--------------e------- {f}\n"));
+    for target in targets {
+        if shell.vfs.resolve(shell.cwd, &target).is_some() {
+            out.push_str(&format!("--------------e------- {target}\n"));
         } else {
-            errs.push_str(&format!(
-                "lsattr: No such file or directory while trying to stat {f}\n"
-            ));
-            status = 1;
+            errs.push_str(&stat_error("lsattr", &target));
         }
     }
+    let status = i32::from(!errs.is_empty());
     CommandResult::streams(out, errs, status)
 }
 
-/// `nohup COMMAND [ARG]...`
 pub fn nohup(shell: &mut Shell, args: &[String]) -> CommandResult {
     let argv: Vec<String> = args
         .iter()
@@ -508,10 +558,9 @@ pub fn nohup(shell: &mut Shell, args: &[String]) -> CommandResult {
         .cloned()
         .collect();
     if argv.is_empty() {
-        return CommandResult::err("nohup: missing operand\n", 125);
+        return CommandResult::err("nohup: missing operand\n", NOHUP_CANNOT_RUN_STATUS);
     }
     let mut result = super::dispatch(shell, &argv);
-    // Real nohup announces the redirect on stderr before the command runs.
     result.stderr.insert_str(
         0,
         "nohup: ignoring input and appending output to 'nohup.out'\n",
@@ -519,107 +568,94 @@ pub fn nohup(shell: &mut Shell, args: &[String]) -> CommandResult {
     result
 }
 
-/// `sync` — flush the (nonexistent) buffer cache.
-///
-/// Present because `/etc/passwd` gives the `sync` account `/bin/sync` as its
-/// login shell: a box that names a binary in a file an attacker reads and then
-/// cannot run it has contradicted itself.
 pub fn sync(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::empty()
 }
 
-/// `nologin` — the shell `/etc/passwd` gives every system account.
 pub fn nologin(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::err("This account is currently not available.\n", 1)
 }
 
-/// `getent DATABASE [KEY]...`
+const GETENT_DATABASES: &[(&str, &str)] = &[
+    ("passwd", PASSWD_PATH),
+    ("group", GROUP_PATH),
+    ("shadow", SHADOW_PATH),
+    ("hosts", "/etc/hosts"),
+];
+
+fn matches_key(line: &str, key: &str) -> bool {
+    is_entry_for(line, key) || line.split_whitespace().any(|field| field == key)
+}
+
 pub fn getent(shell: &Shell, args: &[String]) -> CommandResult {
-    let operands: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .collect();
-    let Some(db) = operands.first() else {
+    let operands = operands(args);
+    let Some((database, keys)) = operands.split_first() else {
         return CommandResult::err("Usage: getent [OPTION...] database [key ...]\n", 1);
     };
-    let file = match *db {
-        "passwd" => "/etc/passwd",
-        "group" => "/etc/group",
-        "shadow" => "/etc/shadow",
-        "hosts" => "/etc/hosts",
-        other => {
-            return CommandResult::err(format!("Unknown database: {other}\n"), 2);
-        }
+    let Some((_, path)) = GETENT_DATABASES.iter().find(|(name, _)| name == database) else {
+        return CommandResult::err(format!("Unknown database: {database}\n"), USAGE_STATUS);
     };
-    let text = read_text(shell, file);
-    let keys = &operands[1..];
+    let text = read_text(shell, path);
     if keys.is_empty() {
         return CommandResult::ok(text);
     }
     let mut out = String::new();
     for key in keys {
-        for line in text.lines() {
-            if line.starts_with(&format!("{key}:")) || line.split_whitespace().any(|f| f == *key) {
-                out.push_str(line);
-                out.push('\n');
-            }
+        for line in text.lines().filter(|line| matches_key(line, key)) {
+            out.push_str(line);
+            out.push('\n');
         }
     }
-    let status = i32::from(out.is_empty()) * 2;
+    let status = if out.is_empty() {
+        GETENT_KEY_NOT_FOUND_STATUS
+    } else {
+        0
+    };
     CommandResult::streams(out, String::new(), status)
 }
 
-/// `killall NAME...` and `pidof NAME` / `pgrep NAME`, over the same fabricated
-/// process table `ps` renders.
 pub fn killall(shell: &Shell, args: &[String]) -> CommandResult {
-    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let names = operands(args);
     if names.is_empty() {
         return CommandResult::err("Usage: killall [OPTION]... [--] NAME...\n", 1);
     }
-    let mut errs = String::new();
-    let mut status = 0;
-    for n in names {
-        if super::system::process_pid(shell, n).is_none() {
-            errs.push_str(&format!("{n}: no process found\n"));
-            status = 1;
-        }
-    }
+    let errs: String = names
+        .into_iter()
+        .filter(|name| super::system::process_pid(shell, name).is_none())
+        .map(|name| format!("{name}: no process found\n"))
+        .collect();
+    let status = i32::from(!errs.is_empty());
     CommandResult::streams(String::new(), errs, status)
 }
 
-/// `pidof NAME`
 pub fn pidof(shell: &Shell, args: &[String]) -> CommandResult {
-    let mut out = String::new();
-    for n in args.iter().filter(|a| !a.starts_with('-')) {
-        if let Some(pid) = super::system::process_pid(shell, n) {
-            out.push_str(&format!("{pid} "));
-        }
-    }
-    if out.is_empty() {
+    let pids: Vec<String> = operands(args)
+        .into_iter()
+        .filter_map(|name| super::system::process_pid(shell, name))
+        .map(|pid| pid.to_string())
+        .collect();
+    if pids.is_empty() {
         return CommandResult::streams(String::new(), String::new(), 1);
     }
-    CommandResult::ok(format!("{}\n", out.trim_end()))
+    CommandResult::ok(format!("{}\n", pids.join(" ")))
 }
 
-/// `pgrep [-l] PATTERN`
 pub fn pgrep(shell: &Shell, args: &[String]) -> CommandResult {
     let long = args.iter().any(|a| a == "-l" || a == "-a");
-    let Some(pattern) = args.iter().find(|a| !a.starts_with('-')) else {
-        return CommandResult::err("pgrep: no matching criteria specified\n", 2);
+    let Some(pattern) = first_operand(args) else {
+        return CommandResult::err("pgrep: no matching criteria specified\n", USAGE_STATUS);
     };
-    let mut out = String::new();
-    for (pid, name) in super::system::process_table(shell) {
-        // Real `pgrep` matches the executable name, not the whole command line,
-        // so it agrees with `pidof` about what `sshd: /usr/sbin/sshd …` is.
-        if super::system::process_name(&name).contains(pattern.as_str()) {
+    let out: String = super::system::process_table(shell)
+        .into_iter()
+        .filter(|(_, cmd)| super::system::process_name(cmd).contains(pattern.as_str()))
+        .map(|(pid, cmd)| {
             if long {
-                out.push_str(&format!("{pid} {name}\n"));
+                format!("{pid} {cmd}\n")
             } else {
-                out.push_str(&format!("{pid}\n"));
+                format!("{pid}\n")
             }
-        }
-    }
+        })
+        .collect();
     let status = i32::from(out.is_empty());
     CommandResult::streams(out, String::new(), status)
 }
@@ -642,7 +678,6 @@ mod tests {
         assert!(run(&mut shell, "sleep abc").contains("invalid time interval"));
     }
 
-    /// The single most common post-access action in SSH botnet telemetry.
     #[test]
     fn chpasswd_locks_out_the_owner_and_captures_the_plaintext() {
         let mut shell = Shell::new("root", "debian");
@@ -655,7 +690,7 @@ mod tests {
             ),
             "the plaintext must be captured as forensic data"
         );
-        // The emulated shadow file changed, but never holds the plaintext.
+
         let shadow = run(&mut shell, "cat /etc/shadow");
         assert!(shadow.contains("root:$6$mimic$changed"), "{shadow}");
         assert!(
@@ -686,10 +721,10 @@ mod tests {
             passwd.contains("backdoor:x:1001:1001::/home/backdoor:/bin/bash"),
             "{passwd}"
         );
-        // The account is reachable the way a real one would be.
+
         assert!(run(&mut shell, "getent passwd backdoor").contains("backdoor"));
         assert!(run(&mut shell, "ls /home").contains("backdoor"));
-        // And adding it twice fails the way useradd does.
+
         let again = shell.execute("useradd backdoor");
         assert_eq!(again.status, 9);
     }
@@ -708,7 +743,7 @@ mod tests {
         assert!(run(&mut shell, "systemctl is-active ssh").starts_with("active"));
         assert!(run(&mut shell, "systemctl status ssh").contains("OpenBSD Secure Shell server"));
         assert!(run(&mut shell, "systemctl list-units").contains("cron.service"));
-        // An unknown unit fails the way systemd's does.
+
         let missing = shell.execute("systemctl status nosuchthing");
         assert_eq!(missing.status, 4);
         assert!(
@@ -753,8 +788,6 @@ mod tests {
         assert_eq!(missing.status, 1);
     }
 
-    /// `/etc/passwd` names both of these as login shells, so a box that cannot
-    /// run them contradicts a file every attacker reads.
     #[test]
     fn the_shells_etc_passwd_names_all_exist() {
         let mut shell = Shell::new("root", "debian");
@@ -769,15 +802,13 @@ mod tests {
     #[test]
     fn pidof_and_pgrep_agree_with_the_process_table() {
         let mut shell = Shell::new("root", "debian");
-        // sshd is in the fabricated table, so all three must find it.
+
         assert!(!run(&mut shell, "pidof sshd").trim().is_empty());
         assert!(!run(&mut shell, "pgrep sshd").trim().is_empty());
         let missing = shell.execute("pidof nosuchdaemon");
         assert_eq!(missing.status, 1);
     }
 
-    /// `passwd` prompts twice, like the real thing, and the plaintext is
-    /// captured on the second answer rather than written to the VFS.
     #[test]
     fn passwd_prompts_twice_and_captures_the_secret() {
         let mut shell = Shell::new("root", "debian");

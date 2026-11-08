@@ -1,19 +1,6 @@
-//! Tab-completion for the emulated shell.
-//!
-//! Real bash completes command names (first word) and filesystem paths
-//! (arguments) on Tab. A honeypot that does nothing on Tab — or worse, inserts
-//! a literal tab — is an easy tell. This module computes completions purely
-//! from the in-memory command registry and [`Vfs`], with no real I/O.
-
 use crate::shell::Shell;
 use crate::vfs::Vfs;
 
-/// Every command name `commands::dispatch` has a match arm for. Rust cannot
-/// enumerate match arms, so this is a hand-maintained mirror, used only by
-/// [`crate::vfs::snapshot`]'s registry test — tab completion instead derives
-/// candidates from the VFS listing directly (see `complete_command`), so a
-/// listed-but-not-runnable name still completes the way real bash completes
-/// any PATH executable whether it works or not.
 pub const COMMANDS: &[&str] = &[
     "addgroup",
     "adduser",
@@ -136,24 +123,18 @@ pub const COMMANDS: &[&str] = &[
     "xargs",
 ];
 
-/// The outcome of a completion request.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Completion {
-    /// No candidates; do nothing (a real terminal would beep).
     None,
-    /// A unique (or longest-common-prefix) replacement for the current word.
-    /// `add_space` is set only when the completion is fully unambiguous and the
-    /// result is not a directory.
+
     Single {
         replacement: String,
         add_space: bool,
     },
-    /// Several candidates; display this listing and redraw the line.
+
     Listing(Vec<String>),
 }
 
-/// Compute completions for `word`. `is_command` selects command-name vs. path
-/// completion.
 pub fn complete(shell: &Shell, word: &str, is_command: bool) -> Completion {
     if is_command && !word.contains('/') {
         complete_command(shell, word)
@@ -162,11 +143,6 @@ pub fn complete(shell: &Shell, word: &str, is_command: bool) -> Completion {
     }
 }
 
-/// Candidates are every name listed under `/usr/bin`/`/usr/sbin` in the VFS,
-/// plus the shell builtins — real bash tab-completes any name on `$PATH` or
-/// any builtin whether or not it actually does anything useful, so a name
-/// that is listed but not wired into `commands::dispatch` (see
-/// [`crate::vfs::snapshot`]'s `USR_BIN`) still has to complete.
 fn complete_command(shell: &Shell, word: &str) -> Completion {
     let mut names: Vec<String> = Vec::new();
     for dir in ["/usr/bin", "/usr/sbin"] {
@@ -211,8 +187,6 @@ fn complete_command(shell: &Shell, word: &str) -> Completion {
 }
 
 fn complete_path(shell: &Shell, word: &str) -> Completion {
-    // Split the word into the directory portion (kept verbatim in the
-    // replacement) and the final base being completed.
     let (dir_part, base) = match word.rfind('/') {
         Some(i) => (&word[..=i], &word[i + 1..]),
         None => ("", word),
@@ -229,8 +203,6 @@ fn complete_path(shell: &Shell, word: &str) -> Completion {
         None => return Completion::None,
     };
 
-    // Candidate (name, is_dir) pairs whose name starts with `base`. Hidden
-    // entries are only offered when the user has typed a leading dot.
     let mut cands: Vec<(String, bool)> = entries
         .into_iter()
         .filter(|(name, _)| name.starts_with(base))
@@ -264,7 +236,6 @@ fn complete_path(shell: &Shell, word: &str) -> Completion {
                     add_space: false,
                 }
             } else {
-                // Display directory entries with a trailing slash, as bash does.
                 let listing = cands
                     .into_iter()
                     .map(|(n, is_dir)| if is_dir { format!("{n}/") } else { n })
@@ -275,8 +246,6 @@ fn complete_path(shell: &Shell, word: &str) -> Completion {
     }
 }
 
-/// Resolve a directory portion (e.g. `/etc/`, `sub/`, or `""`) relative to
-/// `cwd`, returning the directory node if it exists and is a directory.
 fn resolve_dir(vfs: &Vfs, cwd: crate::vfs::NodeId, dir_part: &str) -> Option<crate::vfs::NodeId> {
     let id = if dir_part.is_empty() {
         cwd
@@ -290,10 +259,8 @@ fn resolve_dir(vfs: &Vfs, cwd: crate::vfs::NodeId, dir_part: &str) -> Option<cra
     }
 }
 
-/// Whether `id`, after following a symlink, refers to a directory.
 fn follow_is_dir(vfs: &Vfs, id: crate::vfs::NodeId) -> bool {
     if vfs.node(id).meta.is_symlink() {
-        // Re-resolve through the parent so symlinked dirs complete with a slash.
         let path = vfs.path_of(id);
         if let Some(target) = vfs.resolve(vfs.root(), &path) {
             return vfs.node(target).meta.is_dir();
@@ -303,7 +270,6 @@ fn follow_is_dir(vfs: &Vfs, id: crate::vfs::NodeId) -> bool {
     vfs.node(id).meta.is_dir()
 }
 
-/// Longest common prefix of a set of strings.
 fn longest_common_prefix(items: &[&str]) -> String {
     let first = match items.first() {
         Some(s) => *s,
@@ -319,8 +285,7 @@ fn longest_common_prefix(items: &[&str]) -> String {
             break;
         }
     }
-    // Bytes can match part-way through a character (`é` and `ê` share a lead
-    // byte); slicing there would panic, so back off to a boundary.
+
     while end > 0 && !first.is_char_boundary(end) {
         end -= 1;
     }
@@ -334,9 +299,7 @@ mod tests {
     #[test]
     fn command_unique_completion() {
         let shell = Shell::new("root", "debian");
-        // "whoam" -> only "whoami" ("who" itself is now also a listed binary,
-        // so it no longer uniquely completes — that's real bash's behaviour
-        // too once both names exist).
+
         assert_eq!(
             complete(&shell, "whoam", true),
             Completion::Single {
@@ -349,8 +312,7 @@ mod tests {
     #[test]
     fn command_common_prefix() {
         let shell = Shell::new("root", "debian");
-        // "us" -> useradd, userdel, users : common prefix "user" ("ap" is no
-        // longer unambiguous now that "apropos" is also listed density).
+
         match complete(&shell, "us", true) {
             Completion::Single {
                 replacement,
@@ -366,7 +328,7 @@ mod tests {
     #[test]
     fn command_listing_when_ambiguous() {
         let shell = Shell::new("root", "debian");
-        // "c" -> several commands, no longer common prefix
+
         match complete(&shell, "c", true) {
             Completion::Listing(items) => {
                 assert!(items.contains(&"cat".to_string()));
@@ -379,7 +341,7 @@ mod tests {
     #[test]
     fn path_completion_unique_dir_gets_slash() {
         let shell = Shell::new("root", "debian");
-        // "/ho" -> "/home" which is a directory
+
         assert_eq!(
             complete(&shell, "/ho", false),
             Completion::Single {
@@ -392,7 +354,7 @@ mod tests {
     #[test]
     fn path_completion_file_gets_space() {
         let shell = Shell::new("root", "debian");
-        // "/etc/os-rel" -> "/etc/os-release" (a file)
+
         match complete(&shell, "/etc/os-rel", false) {
             Completion::Single {
                 replacement,
@@ -408,7 +370,7 @@ mod tests {
     #[test]
     fn hidden_entries_need_leading_dot() {
         let shell = Shell::new("root", "debian");
-        // Bare "" in /root should not list ".bashrc"; "." should.
+
         if let Completion::Listing(items) = complete_path(&shell, "/root/") {
             assert!(!items.iter().any(|i| i.starts_with(".bashrc")));
         }
@@ -418,8 +380,7 @@ mod tests {
     fn path_completion_over_names_sharing_a_lead_byte() {
         let mut shell = Shell::new("root", "debian");
         shell.execute("mkdir /tmp/éa /tmp/êb");
-        // Both names begin with the same UTF-8 lead byte, so the common prefix
-        // has to stop at a character boundary rather than half of one.
+
         match complete(&shell, "/tmp/", false) {
             Completion::Listing(items) => {
                 assert!(items.iter().any(|i| i.starts_with("éa")));
@@ -434,7 +395,7 @@ mod tests {
         assert_eq!(longest_common_prefix(&["apt", "apt-get"]), "apt");
         assert_eq!(longest_common_prefix(&["cat", "cd"]), "c");
         assert_eq!(longest_common_prefix(&["ls", "rm"]), "");
-        // Names sharing only part of a character must not slice mid-character.
+
         assert_eq!(longest_common_prefix(&["éa", "êb"]), "");
         assert_eq!(longest_common_prefix(&["éa", "éb"]), "é");
     }

@@ -1,16 +1,8 @@
-//! SFTP subsystem (version 3) emulation for upload capture and filesystem interaction.
-//!
-//! This implements a state machine for the SFTP v3 wire protocol (RFC draft
-//! `draft-ietf-secsh-filexfer-02`). It handles file uploads (which are captured,
-//! hashed, and quarantined), file downloads from the in-memory VFS, directory
-//! listings, metadata queries, and filesystem mutations (`mkdir`, `rm`, `rename`).
-
 use crate::shell::Shell;
 use crate::vfs::{Metadata, NodeKind, Vfs, S_IFDIR, S_IFREG};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-// SFTP packet types (SFTP v3)
 const SSH_FXP_INIT: u8 = 1;
 const SSH_FXP_VERSION: u8 = 2;
 const SSH_FXP_OPEN: u8 = 3;
@@ -39,7 +31,6 @@ const SSH_FXP_ATTRS: u8 = 105;
 #[allow(dead_code)]
 const SSH_FXP_EXTENDED: u8 = 200;
 
-// SFTP status codes
 const SSH_FX_OK: u32 = 0;
 const SSH_FX_EOF: u32 = 1;
 const SSH_FX_NO_SUCH_FILE: u32 = 2;
@@ -47,42 +38,34 @@ const SSH_FX_FAILURE: u32 = 4;
 const SSH_FX_BAD_MESSAGE: u32 = 5;
 const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 
-// SFTP open flags
 const SSH_FXF_READ: u32 = 0x00000001;
 const SSH_FXF_WRITE: u32 = 0x00000002;
 
-// Safety caps
 const MAX_SFTP_PACKET_LEN: usize = 256 * 1024;
 const MAX_SFTP_HANDLES: usize = 64;
-/// Ceiling on bytes held across all of one session's open SFTP handles,
-/// expressed as a multiple of `max_upload_bytes`. See
-/// [`SftpSession::buffer_cap`].
+
 const SFTP_SESSION_BUFFER_MULTIPLIER: u64 = 2;
-/// Ceiling on the response bytes one [`SftpSession::feed`] call may accumulate
-/// before it stops processing and returns. Matches the shell's own output cap:
-/// unprocessed input stays in `self.buf` for the next call, so nothing is lost.
+
 const MAX_SFTP_FEED_RESPONSE: usize = 1024 * 1024;
 const MAX_READ_CHUNK: usize = 32 * 1024;
 const MAX_DIR_ENTRIES_PER_READ: usize = 64;
 
 type SftpNameEntry<'a> = (&'a str, &'a str, Option<(&'a Metadata, u64)>);
 
-/// A file upload completed over SFTP, ready for quarantine storage and logging.
 pub struct SftpCompletedUpload {
-    /// Attacker-supplied file name (e.g. `bot.elf`).
     pub name: String,
-    /// Absolute destination path in the emulated VFS (e.g. `/tmp/bot.elf`).
+
     pub dest_path: String,
-    /// Unix permission bits (e.g. 0o755).
+
     #[allow(dead_code)]
     pub mode: u32,
-    /// The (possibly truncated) file contents.
+
     pub data: Vec<u8>,
-    /// Total byte length received off the wire.
+
     pub size: u64,
-    /// SHA-256 of the entire payload as received over the wire.
+
     pub payload_sha256: String,
-    /// Whether the stored data was truncated at `max_upload_bytes`.
+
     pub truncated: bool,
 }
 
@@ -106,15 +89,11 @@ enum SftpHandle {
     },
 }
 
-/// The SFTP subsystem state machine.
 pub struct SftpSession {
     buf: Vec<u8>,
     handles: BTreeMap<Vec<u8>, SftpHandle>,
     next_handle: u32,
-    /// Bytes currently held across every open handle's buffer. Bounds one
-    /// session's SFTP memory the way `quarantine_bytes` bounds its disk: without
-    /// it, 64 handles each grown to `max_upload_bytes` by a single sparse write
-    /// multiply the per-file cap by [`MAX_SFTP_HANDLES`].
+
     buffered_bytes: usize,
 }
 
@@ -125,7 +104,6 @@ impl Default for SftpSession {
 }
 
 impl SftpSession {
-    /// Create a new SFTP session handler.
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -135,23 +113,16 @@ impl SftpSession {
         }
     }
 
-    /// Per-session ceiling on bytes held across all open handles, as a multiple
-    /// of `max_upload_bytes`. A legitimate client transfers files one handle at
-    /// a time, so a small multiple leaves real usage untouched while capping the
-    /// 64× amplification a hostile client can otherwise reach.
     fn buffer_cap(max_upload_bytes: u64) -> usize {
         max_upload_bytes
             .saturating_mul(SFTP_SESSION_BUFFER_MULTIPLIER)
             .min(usize::MAX as u64) as usize
     }
 
-    /// Whether `extra` more bytes can be buffered without exceeding the cap.
     fn can_buffer(&self, extra: usize, max_upload_bytes: u64) -> bool {
         self.buffered_bytes.saturating_add(extra) <= Self::buffer_cap(max_upload_bytes)
     }
 
-    /// Feed incoming channel data bytes into the SFTP state machine.
-    /// Returns the bytes to send back to the client and any completed file uploads.
     pub fn feed(
         &mut self,
         data: &[u8],
@@ -187,9 +158,6 @@ impl SftpSession {
             self.handle_packet(&pkt, shell, max_upload_bytes, &mut out, &mut completed);
             read_pos = pkt_end;
 
-            // Individual responses are bounded, but a pipelined burst of small
-            // requests can each amplify into one. Stop once the batch reaches
-            // the cap; what is left in `self.buf` is processed on the next call.
             if out.len() >= MAX_SFTP_FEED_RESPONSE {
                 break;
             }
@@ -202,7 +170,6 @@ impl SftpSession {
         (out, completed)
     }
 
-    /// Finalize any remaining in-flight write handles when the channel closes.
     pub fn into_pending_uploads(self, shell: &mut Shell) -> Vec<SftpCompletedUpload> {
         let mut completed = Vec::new();
         for (_, handle) in self.handles {
@@ -218,11 +185,7 @@ impl SftpSession {
             {
                 if size > 0 || !data.is_empty() {
                     let (dir_path, _) = Vfs::split_path(&dest_path);
-                    // Mirroring into the VFS is best-effort: it has its own
-                    // caps, and the capture below does not depend on it. What
-                    // it must never do is fall back to an ancestor directory,
-                    // which would put the file somewhere other than the
-                    // `dest_path` the `upload` event records.
+
                     if let Some(parent) = shell.vfs.mkdir_p(dir_path, 0o755, shell.uid, shell.gid) {
                         shell
                             .vfs
@@ -343,18 +306,16 @@ impl SftpSession {
                             return;
                         }
                         let mut entries = Vec::new();
-                        // "."
+
                         let dir_meta = node.meta.clone();
                         let dot_long = format_dir_entry(".", &dir_meta, 4096, None);
                         entries.push((".".to_string(), dot_long, dir_meta, 4096));
 
-                        // ".."
                         let parent_id = node.parent.unwrap_or(dir_id);
                         let parent_meta = shell.vfs.node(parent_id).meta.clone();
                         let dotdot_long = format_dir_entry("..", &parent_meta, 4096, None);
                         entries.push(("..".to_string(), dotdot_long, parent_meta, 4096));
 
-                        // Children
                         if let Some(child_list) = shell.vfs.entries(dir_id) {
                             for (c_name, c_id) in child_list {
                                 let c_node = shell.vfs.node(c_id);
@@ -444,10 +405,6 @@ impl SftpSession {
                     if let Some(node_id) = shell.vfs.resolve(shell.cwd, &abs) {
                         let node = shell.vfs.node(node_id);
                         if let Some(data) = node.file_bytes() {
-                            // Opening a read handle copies the whole file, so it
-                            // is charged against the same budget writes are:
-                            // 64 handles on one large file is the same
-                            // amplification from the other direction.
                             if !self.can_buffer(data.len(), max_upload_bytes) {
                                 put_status(out, id, SSH_FX_FAILURE, "Too many open handles");
                                 return;
@@ -502,8 +459,6 @@ impl SftpSession {
                     return;
                 };
 
-                // Checked before the mutable borrow below so the session-wide
-                // budget is visible; `grow_to` charges what it actually adds.
                 let budget_left =
                     Self::buffer_cap(max_upload_bytes).saturating_sub(self.buffered_bytes);
                 let mut grew = 0usize;
@@ -519,10 +474,6 @@ impl SftpSession {
                     hasher.update(chunk);
                     *size += chunk.len() as u64;
 
-                    // Grow only as far as the per-file cap, the session budget,
-                    // and `usize` all allow. A write past any of them is
-                    // consumed and hashed (so the wire protocol and the payload
-                    // hash stay correct) but not stored.
                     let mut grow_to = |data: &mut Vec<u8>, end: usize| -> bool {
                         if end <= data.len() {
                             return true;
@@ -571,9 +522,6 @@ impl SftpSession {
                     return;
                 };
                 if let Some(h) = self.handles.remove(handle) {
-                    // Closing a handle returns its bytes to the session budget,
-                    // so a client transferring many files in sequence is never
-                    // charged for more than what it holds at once.
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(match &h {
                         SftpHandle::WriteFile { data, .. } | SftpHandle::ReadFile { data, .. } => {
                             data.len()
@@ -591,7 +539,7 @@ impl SftpSession {
                     } = h
                     {
                         let (dir_path, _) = Vfs::split_path(&dest_path);
-                        // Best-effort mirror; see `into_pending_uploads`.
+
                         if let Some(parent) =
                             shell.vfs.mkdir_p(dir_path, 0o755, shell.uid, shell.gid)
                         {
@@ -897,7 +845,6 @@ fn format_dir_entry(
     format!("{mode} {nlink:>2} {owner:<8} {group:<8} {size:>8} {date} {name}{suffix}")
 }
 
-// Framing helpers
 fn send_packet(out: &mut Vec<u8>, pkt_type: u8, payload_fn: impl FnOnce(&mut Vec<u8>)) {
     let start = out.len();
     out.extend_from_slice(&[0, 0, 0, 0, pkt_type]);
@@ -984,7 +931,6 @@ fn put_name_pkt(out: &mut Vec<u8>, id: u32, entries: &[SftpNameEntry]) {
     });
 }
 
-// Decoding helpers
 fn get_u32(cursor: &mut &[u8]) -> Option<u32> {
     if cursor.len() < 4 {
         return None;
@@ -1029,7 +975,7 @@ struct ParsedAttrs {
 fn get_attrs(cursor: &mut &[u8]) -> Option<ParsedAttrs> {
     let flags = get_u32(cursor)?;
     if flags & 0x00000001 != 0 {
-        get_u64(cursor)?; // size
+        get_u64(cursor)?;
     }
     let uid_gid = if flags & 0x00000002 != 0 {
         Some((get_u32(cursor)?, get_u32(cursor)?))
@@ -1112,7 +1058,6 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // Stat existing file
         let stat_pkt = make_pkt(SSH_FXP_STAT, |p| {
             put_u32(p, 100);
             put_str(p, "/etc/hostname");
@@ -1123,7 +1068,6 @@ mod tests {
         let id = get_u32(&mut cur).unwrap();
         assert_eq!(id, 100);
 
-        // Lstat missing file
         let lstat_pkt = make_pkt(SSH_FXP_LSTAT, |p| {
             put_u32(p, 101);
             put_str(p, "/nonexistent");
@@ -1142,12 +1086,11 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // 1. Open for write
         let open_pkt = make_pkt(SSH_FXP_OPEN, |p| {
             put_u32(p, 1);
             put_str(p, "/tmp/malware.elf");
             put_u32(p, SSH_FXF_WRITE);
-            put_u32(p, 0); // no attrs
+            put_u32(p, 0);
         });
         let (out1, _) = session.feed(&open_pkt, &mut shell, 1024 * 1024);
         assert_eq!(out1[4], SSH_FXP_HANDLE);
@@ -1155,7 +1098,6 @@ mod tests {
         let _id = get_u32(&mut cur).unwrap();
         let handle = get_bytes(&mut cur).unwrap().to_vec();
 
-        // 2. Write chunk
         let write_pkt = make_pkt(SSH_FXP_WRITE, |p| {
             put_u32(p, 2);
             put_bytes(p, &handle);
@@ -1169,7 +1111,6 @@ mod tests {
         let code = get_u32(&mut cur).unwrap();
         assert_eq!(code, SSH_FX_OK);
 
-        // 3. Close
         let close_pkt = make_pkt(SSH_FXP_CLOSE, |p| {
             put_u32(p, 3);
             put_bytes(p, &handle);
@@ -1185,7 +1126,6 @@ mod tests {
         assert_eq!(upload.size, 21);
         assert!(!upload.truncated);
 
-        // Verify VFS presence
         let node_id = shell.vfs.resolve(shell.cwd, "/tmp/malware.elf").unwrap();
         let node = shell.vfs.node(node_id);
         if let NodeKind::File { contents } = &node.kind {
@@ -1216,7 +1156,7 @@ mod tests {
             put_u32(p, 2);
             put_bytes(p, &handle);
             put_u64(p, 0);
-            put_bytes(p, b"0123456789abcdefghij"); // 20 bytes
+            put_bytes(p, b"0123456789abcdefghij");
         });
         session.feed(&write_pkt, &mut shell, max_upload);
 
@@ -1256,7 +1196,6 @@ mod tests {
         });
         session.feed(&write_pkt, &mut shell, 1024);
 
-        // Session drops without SSH_FXP_CLOSE
         let pending = session.into_pending_uploads(&mut shell);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "dropped.bin");
@@ -1268,7 +1207,6 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // 1. Open /etc/hostname for read
         let open_pkt = make_pkt(SSH_FXP_OPEN, |p| {
             put_u32(p, 10);
             put_str(p, "/etc/hostname");
@@ -1281,7 +1219,6 @@ mod tests {
         let _id = get_u32(&mut cur).unwrap();
         let handle = get_bytes(&mut cur).unwrap().to_vec();
 
-        // 2. Read
         let read_pkt = make_pkt(SSH_FXP_READ, |p| {
             put_u32(p, 11);
             put_bytes(p, &handle);
@@ -1295,7 +1232,6 @@ mod tests {
         let data = get_bytes(&mut cur).unwrap();
         assert_eq!(data, b"debian\n");
 
-        // 3. Read at EOF
         let read_eof = make_pkt(SSH_FXP_READ, |p| {
             put_u32(p, 12);
             put_bytes(p, &handle);
@@ -1334,9 +1270,8 @@ mod tests {
         let mut cur = &out2[5..];
         let _id = get_u32(&mut cur).unwrap();
         let count = get_u32(&mut cur).unwrap();
-        assert!(count >= 2); // includes . and ..
+        assert!(count >= 2);
 
-        // Subsequent readdir returns EOF
         let readdir_eof = make_pkt(SSH_FXP_READDIR, |p| {
             put_u32(p, 22);
             put_bytes(p, &handle);
@@ -1354,7 +1289,6 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // 1. mkdir /tmp/testdir
         let mkdir_pkt = make_pkt(SSH_FXP_MKDIR, |p| {
             put_u32(p, 1);
             put_str(p, "/tmp/testdir");
@@ -1363,7 +1297,6 @@ mod tests {
         let (out, _) = session.feed(&mkdir_pkt, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_STATUS);
 
-        // 2. symlink /tmp/testlink -> /tmp/testdir
         let symlink_pkt = make_pkt(SSH_FXP_SYMLINK, |p| {
             put_u32(p, 2);
             put_str(p, "/tmp/testlink");
@@ -1372,7 +1305,6 @@ mod tests {
         let (out, _) = session.feed(&symlink_pkt, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_STATUS);
 
-        // 3. readlink /tmp/testlink
         let readlink_pkt = make_pkt(SSH_FXP_READLINK, |p| {
             put_u32(p, 3);
             put_str(p, "/tmp/testlink");
@@ -1380,7 +1312,6 @@ mod tests {
         let (out, _) = session.feed(&readlink_pkt, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_NAME);
 
-        // 4. rename /tmp/testlink -> /tmp/renamedlink
         let rename_pkt = make_pkt(SSH_FXP_RENAME, |p| {
             put_u32(p, 4);
             put_str(p, "/tmp/testlink");
@@ -1389,7 +1320,6 @@ mod tests {
         let (out, _) = session.feed(&rename_pkt, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_STATUS);
 
-        // 5. remove /tmp/renamedlink
         let remove_pkt = make_pkt(SSH_FXP_REMOVE, |p| {
             put_u32(p, 5);
             put_str(p, "/tmp/renamedlink");
@@ -1397,7 +1327,6 @@ mod tests {
         let (out, _) = session.feed(&remove_pkt, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_STATUS);
 
-        // 6. rmdir /tmp/testdir
         let rmdir_pkt = make_pkt(SSH_FXP_RMDIR, |p| {
             put_u32(p, 6);
             put_str(p, "/tmp/testdir");
@@ -1411,14 +1340,12 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // normalize_path strips control characters and converts backslashes
         assert_eq!(normalize_path("/root", r"a\b\c"), "/root/a/b/c");
         assert_eq!(
             normalize_path("/root", "/tmp/bot\x00\x1b.elf"),
             "/tmp/bot.elf"
         );
 
-        // Opening "/" for write is rejected
         let open_root_pkt = make_pkt(SSH_FXP_OPEN, |p| {
             put_u32(p, 10);
             put_str(p, "/");
@@ -1432,7 +1359,6 @@ mod tests {
         let code = get_u32(&mut cur).unwrap();
         assert_eq!(code, SSH_FX_FAILURE);
 
-        // mkdir "/" is rejected
         let mkdir_root_pkt = make_pkt(SSH_FXP_MKDIR, |p| {
             put_u32(p, 11);
             put_str(p, "/");
@@ -1445,7 +1371,6 @@ mod tests {
         let code = get_u32(&mut cur).unwrap();
         assert_eq!(code, SSH_FX_FAILURE);
 
-        // symlink "/" is rejected
         let symlink_root_pkt = make_pkt(SSH_FXP_SYMLINK, |p| {
             put_u32(p, 12);
             put_str(p, "/");
@@ -1464,7 +1389,6 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // Open existing file for read
         let open_pkt = make_pkt(SSH_FXP_OPEN, |p| {
             put_u32(p, 1);
             put_str(p, "/etc/hostname");
@@ -1476,7 +1400,6 @@ mod tests {
         let _id = get_u32(&mut cur).unwrap();
         let handle = get_bytes(&mut cur).unwrap().to_vec();
 
-        // Read at offset u64::MAX returns EOF without wrapping
         let read_pkt = make_pkt(SSH_FXP_READ, |p| {
             put_u32(p, 2);
             put_bytes(p, &handle);
@@ -1496,10 +1419,8 @@ mod tests {
         let mut session = SftpSession::new();
         let mut shell = test_shell();
 
-        // Packet with SSH_FXP_STAT but no path string bytes at all
         let malformed_stat = make_pkt(SSH_FXP_STAT, |p| {
             put_u32(p, 42);
-            // omitted path
         });
         let (out, _) = session.feed(&malformed_stat, &mut shell, 1024);
         assert_eq!(out[4], SSH_FXP_STATUS);

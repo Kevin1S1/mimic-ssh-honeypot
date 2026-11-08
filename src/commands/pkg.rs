@@ -1,18 +1,6 @@
-//! Package-manager stubs: `apt`, `apt-get`, `dpkg`.
-//!
-//! These emulate the surface behaviour an attacker probes — update indexes,
-//! "install" packages, list installed ones — without any real package work.
-//! The package database is a static, read-only, in-memory table; no real
-//! process is ever spawned and no real path is ever touched.
-
 use super::CommandResult;
 use crate::shell::Shell;
 
-/// A handful of packages a base Debian 12 install ships, for `dpkg -l` and
-/// `apt list --installed`. Alphabetical by package name. The second group is
-/// the major contributors behind the `/usr/bin`/`/usr/sbin` density in
-/// `vfs::snapshot::USR_BIN`/`USR_SBIN` — `dpkg -l` has to agree that the
-/// packages behind those listed binaries are installed.
 const INSTALLED: &[(&str, &str, &str)] = &[
     ("adduser", "3.131", "add and remove users and groups"),
     (
@@ -122,27 +110,53 @@ const INSTALLED: &[(&str, &str, &str)] = &[
     ("xz-utils", "5.4.1-0.2", "XZ-format compression utilities"),
 ];
 
-/// `apt` / `apt-get`
+const APT_ERROR_STATUS: i32 = 100;
+
+const DPKG_DESCRIPTION_WIDTH: usize = 50;
+
+const PRIVILEGED_APT_COMMANDS: &[&str] = &[
+    "update",
+    "upgrade",
+    "install",
+    "remove",
+    "purge",
+    "dist-upgrade",
+    "autoremove",
+];
+
+const READING_PACKAGE_STATE: &str = "Reading package lists... Done\n\
+                                     Building dependency tree... Done\n\
+                                     Reading state information... Done\n";
+
+const NOTHING_CHANGED: &str = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+
+fn find_package(name: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    INSTALLED.iter().find(|(package, _, _)| *package == name)
+}
+
+fn is_installed(name: &str) -> bool {
+    find_package(name).is_some()
+}
+
+fn args_after<'a>(args: &'a [String], word: &'a str) -> impl Iterator<Item = &'a String> {
+    args.iter().skip_while(move |a| a.as_str() != word).skip(1)
+}
+
+fn no_change_summary() -> String {
+    format!("{READING_PACKAGE_STATE}{NOTHING_CHANGED}")
+}
+
 pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
     let sub = args
         .iter()
         .find(|a| !a.starts_with('-'))
         .map(String::as_str);
-    let need_root = matches!(
-        sub,
-        Some("update")
-            | Some("upgrade")
-            | Some("install")
-            | Some("remove")
-            | Some("purge")
-            | Some("dist-upgrade")
-            | Some("autoremove")
-    );
-    if need_root && shell.uid != 0 {
+    let needs_root = sub.is_some_and(|s| PRIVILEGED_APT_COMMANDS.contains(&s));
+    if needs_root && shell.uid != 0 {
         return CommandResult::err(
             "E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)\n\
              E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), are you root?\n",
-            100,
+            APT_ERROR_STATUS,
         );
     }
 
@@ -153,83 +167,13 @@ pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
              Hit:3 http://security.debian.org/debian-security bookworm-security InRelease\n\
              Reading package lists... Done\n",
         ),
-        Some("upgrade") | Some("dist-upgrade") => CommandResult::ok(
-            "Reading package lists... Done\n\
-             Building dependency tree... Done\n\
-             Reading state information... Done\n\
-             Calculating upgrade... Done\n\
-             0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
-        ),
-        Some("install") => {
-            let pkgs: Vec<&str> = args
-                .iter()
-                .skip_while(|a| a.as_str() != "install")
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .map(String::as_str)
-                .collect();
-            if pkgs.is_empty() {
-                return CommandResult::ok(
-                    "Reading package lists... Done\n\
-                     Building dependency tree... Done\n\
-                     Reading state information... Done\n\
-                     0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
-                );
-            }
-            let mut out = String::new();
-            out.push_str("Reading package lists... Done\n");
-            out.push_str("Building dependency tree... Done\n");
-            out.push_str("Reading state information... Done\n");
-            for pkg in &pkgs {
-                if let Some((_, ver, _)) = INSTALLED.iter().find(|(n, _, _)| n == pkg) {
-                    out.push_str(&format!("{pkg} is already the newest version ({ver}).\n"));
-                }
-            }
-            let unknown: Vec<&&str> = pkgs
-                .iter()
-                .filter(|p| !INSTALLED.iter().any(|(n, _, _)| n == *p))
-                .collect();
-            if !unknown.is_empty() {
-                // apt's progress chatter is stdout; every `E:` line is stderr.
-                let mut errs = String::new();
-                for pkg in &unknown {
-                    errs.push_str(&format!("E: Unable to locate package {pkg}\n"));
-                }
-                return CommandResult::streams(out, errs, 100);
-            }
-            out.push_str("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n");
-            CommandResult::ok(out)
-        }
-        Some("remove") | Some("purge") | Some("autoremove") => CommandResult::ok(
-            "Reading package lists... Done\n\
-             Building dependency tree... Done\n\
-             Reading state information... Done\n\
-             0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
-        ),
-        Some("list") => {
-            let mut out = String::from("Listing... Done\n");
-            for (name, ver, _) in INSTALLED {
-                out.push_str(&format!("{name}/now {ver} amd64 [installed,local]\n"));
-            }
-            CommandResult::ok(out)
-        }
-        Some("show") => {
-            let pkg = args
-                .iter()
-                .skip_while(|a| a.as_str() != "show")
-                .nth(1)
-                .map(String::as_str);
-            match pkg.and_then(|p| INSTALLED.iter().find(|(n, _, _)| *n == p)) {
-                Some((name, ver, desc)) => CommandResult::ok(format!(
-                    "Package: {name}\nVersion: {ver}\nPriority: optional\nSection: misc\n\
-                     Maintainer: Debian\nArchitecture: amd64\nDescription: {desc}\n\n"
-                )),
-                None => CommandResult::err(
-                    format!("N: Unable to locate package {}\n", pkg.unwrap_or("")),
-                    100,
-                ),
-            }
-        }
+        Some("upgrade" | "dist-upgrade") => CommandResult::ok(format!(
+            "{READING_PACKAGE_STATE}Calculating upgrade... Done\n{NOTHING_CHANGED}"
+        )),
+        Some("install") => apt_install(args),
+        Some("remove" | "purge" | "autoremove") => CommandResult::ok(no_change_summary()),
+        Some("list") => apt_list(),
+        Some("show") => apt_show(args_after(args, "show").next().map(String::as_str)),
         _ => CommandResult::ok(
             "apt 2.6.1 (amd64)\n\
              Usage: apt [options] command\n\n\
@@ -239,47 +183,64 @@ pub fn apt(shell: &Shell, args: &[String]) -> CommandResult {
     }
 }
 
-/// `dpkg`
-pub fn dpkg(_shell: &Shell, args: &[String]) -> CommandResult {
-    let list = args.iter().any(|a| a == "-l" || a == "--list");
-    let show = args.iter().position(|a| a == "-s" || a == "--status");
+fn apt_install(args: &[String]) -> CommandResult {
+    let packages: Vec<&str> = args_after(args, "install")
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    if packages.is_empty() {
+        return CommandResult::ok(no_change_summary());
+    }
 
-    if let Some(pos) = show {
-        let pkg = args.get(pos + 1).map(String::as_str);
-        return match pkg.and_then(|p| INSTALLED.iter().find(|(n, _, _)| *n == p)) {
-            Some((name, ver, desc)) => CommandResult::ok(format!(
-                "Package: {name}\nStatus: install ok installed\nPriority: optional\n\
-                 Section: misc\nInstalled-Size: 1024\nMaintainer: Debian\n\
-                 Architecture: amd64\nVersion: {ver}\nDescription: {desc}\n"
-            )),
-            None => CommandResult::err(
-                format!(
-                    "dpkg-query: package '{}' is not installed and no information is available\n",
-                    pkg.unwrap_or("")
-                ),
-                1,
+    let mut out = String::from(READING_PACKAGE_STATE);
+    for (name, version, _) in packages.iter().filter_map(|p| find_package(p)) {
+        out.push_str(&format!(
+            "{name} is already the newest version ({version}).\n"
+        ));
+    }
+    let errs: String = packages
+        .iter()
+        .filter(|p| !is_installed(p))
+        .map(|p| format!("E: Unable to locate package {p}\n"))
+        .collect();
+    if !errs.is_empty() {
+        return CommandResult::streams(out, errs, APT_ERROR_STATUS);
+    }
+    out.push_str(NOTHING_CHANGED);
+    CommandResult::ok(out)
+}
+
+fn apt_list() -> CommandResult {
+    let mut out = String::from("Listing... Done\n");
+    for (name, version, _) in INSTALLED {
+        out.push_str(&format!("{name}/now {version} amd64 [installed,local]\n"));
+    }
+    CommandResult::ok(out)
+}
+
+fn apt_show(package: Option<&str>) -> CommandResult {
+    match package.and_then(find_package) {
+        Some((name, version, description)) => CommandResult::ok(format!(
+            "Package: {name}\nVersion: {version}\nPriority: optional\nSection: misc\n\
+             Maintainer: Debian\nArchitecture: amd64\nDescription: {description}\n\n"
+        )),
+        None => CommandResult::err(
+            format!(
+                "N: Unable to locate package {}\n",
+                package.unwrap_or_default()
             ),
-        };
+            APT_ERROR_STATUS,
+        ),
     }
+}
 
-    if list {
-        let mut out = String::new();
-        out.push_str("Desired=Unknown/Install/Remove/Purge/Hold\n");
-        out.push_str(
-            "| Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/trig-aWait/Trig-pend\n",
-        );
-        out.push_str("|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)\n");
-        out.push_str("||/ Name                    Version            Architecture Description\n");
-        out.push_str("+++-=======================-==================-============-=================================>\n");
-        for (name, ver, desc) in INSTALLED {
-            out.push_str(&format!(
-                "ii  {name:<23} {ver:<18} amd64        {}\n",
-                trunc(desc, 50)
-            ));
-        }
-        return CommandResult::ok(out);
+pub fn dpkg(_shell: &Shell, args: &[String]) -> CommandResult {
+    if let Some(pos) = args.iter().position(|a| a == "-s" || a == "--status") {
+        return dpkg_status(args.get(pos + 1).map(String::as_str));
     }
-
+    if args.iter().any(|a| a == "-l" || a == "--list") {
+        return dpkg_list();
+    }
     CommandResult::ok(
         "Debian 'dpkg' package management program version 1.21.22 (amd64).\n\
          This is free software; see the GNU General Public License version 2 or\n\
@@ -287,9 +248,38 @@ pub fn dpkg(_shell: &Shell, args: &[String]) -> CommandResult {
     )
 }
 
-/// Truncate a string to at most `max` chars (the `dpkg -l` description column).
-fn trunc(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
+fn dpkg_status(package: Option<&str>) -> CommandResult {
+    match package.and_then(find_package) {
+        Some((name, version, description)) => CommandResult::ok(format!(
+            "Package: {name}\nStatus: install ok installed\nPriority: optional\n\
+             Section: misc\nInstalled-Size: 1024\nMaintainer: Debian\n\
+             Architecture: amd64\nVersion: {version}\nDescription: {description}\n"
+        )),
+        None => CommandResult::err(
+            format!(
+                "dpkg-query: package '{}' is not installed and no information is available\n",
+                package.unwrap_or_default()
+            ),
+            1,
+        ),
+    }
+}
+
+fn dpkg_list() -> CommandResult {
+    let mut out = String::from(
+        "Desired=Unknown/Install/Remove/Purge/Hold\n\
+         | Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/trig-aWait/Trig-pend\n\
+         |/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)\n\
+         ||/ Name                    Version            Architecture Description\n\
+         +++-=======================-==================-============-=================================>\n",
+    );
+    for (name, version, description) in INSTALLED {
+        let description: String = description.chars().take(DPKG_DESCRIPTION_WIDTH).collect();
+        out.push_str(&format!(
+            "ii  {name:<23} {version:<18} amd64        {description}\n"
+        ));
+    }
+    CommandResult::ok(out)
 }
 
 #[cfg(test)]
