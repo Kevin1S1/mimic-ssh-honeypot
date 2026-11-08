@@ -840,12 +840,7 @@ impl Shell {
                 }
                 continue;
             }
-            let should_run = match segment.run_if {
-                parser::Separator::Always => true,
-                parser::Separator::AndIf => status == 0,
-                parser::Separator::OrIf => status != 0,
-            };
-            if !should_run {
+            if !segment.run_if.admits(status) {
                 continue;
             }
 
