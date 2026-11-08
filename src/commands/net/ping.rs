@@ -15,6 +15,13 @@ pub fn ping(_shell: &Shell, args: &[String]) -> CommandResult {
             "-c" => {
                 if let Some(v) = iter.next() {
                     count = v.parse().unwrap_or(DEFAULT_COUNT).min(MAX_COUNT);
+                    if count == 0 {
+                        return CommandResult::err(
+                            "ping: bad number of packets to transmit.
+",
+                            2,
+                        );
+                    }
                 }
             }
             "-i" | "-W" | "-s" | "-t" => {
@@ -59,4 +66,18 @@ fn transcript(host: &str, count: u32) -> String {
         "rtt min/avg/max/mdev = {min:.3}/{avg:.3}/{max:.3}/0.412 ms\n"
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_count_is_a_usage_error() {
+        let shell = Shell::new("root", "debian");
+        let args: Vec<String> = ["-c", "0", "example.com"].map(String::from).to_vec();
+        let result = ping(&shell, &args);
+        assert_eq!(result.status, 2);
+        assert!(result.stderr.contains("bad number of packets"));
+    }
 }
