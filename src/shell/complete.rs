@@ -173,17 +173,13 @@ fn complete_command(shell: &Shell, word: &str) -> Completion {
             replacement: names[0].to_string(),
             add_space: true,
         },
-        _ => {
-            let lcp = longest_common_prefix(&names);
-            if lcp.len() > word.len() {
-                Completion::Single {
-                    replacement: lcp,
-                    add_space: false,
-                }
-            } else {
-                Completion::Listing(names.into_iter().map(str::to_string).collect())
-            }
-        }
+        _ => match common_extension(&names, word) {
+            Some(replacement) => Completion::Single {
+                replacement,
+                add_space: false,
+            },
+            None => Completion::Listing(names.into_iter().map(str::to_string).collect()),
+        },
     }
 }
 
@@ -193,15 +189,12 @@ fn complete_path(shell: &Shell, word: &str) -> Completion {
         None => ("", word),
     };
 
-    let dir_id = resolve_dir(&shell.vfs, shell.cwd, dir_part);
-    let dir_id = match dir_id {
-        Some(id) => id,
-        None => return Completion::None,
+    let Some(dir_id) = resolve_dir(&shell.vfs, shell.cwd, dir_part) else {
+        return Completion::None;
     };
 
-    let entries = match shell.vfs.entries(dir_id) {
-        Some(e) => e,
-        None => return Completion::None,
+    let Some(entries) = shell.vfs.entries(dir_id) else {
+        return Completion::None;
     };
 
     let mut cands: Vec<(String, bool)> = entries
@@ -230,18 +223,18 @@ fn complete_path(shell: &Shell, word: &str) -> Completion {
         }
         _ => {
             let names: Vec<&str> = cands.iter().map(|(n, _)| n.as_str()).collect();
-            let lcp = longest_common_prefix(&names);
-            if lcp.len() > base.len() {
-                Completion::Single {
+            match common_extension(&names, base) {
+                Some(lcp) => Completion::Single {
                     replacement: format!("{dir_part}{lcp}"),
                     add_space: false,
+                },
+                None => {
+                    let listing = cands
+                        .into_iter()
+                        .map(|(n, is_dir)| if is_dir { format!("{n}/") } else { n })
+                        .collect();
+                    Completion::Listing(listing)
                 }
-            } else {
-                let listing = cands
-                    .into_iter()
-                    .map(|(n, is_dir)| if is_dir { format!("{n}/") } else { n })
-                    .collect();
-                Completion::Listing(listing)
             }
         }
     }
@@ -271,10 +264,14 @@ fn follow_is_dir(vfs: &Vfs, id: crate::vfs::NodeId) -> bool {
     vfs.node(id).meta.is_dir()
 }
 
+fn common_extension(names: &[&str], typed: &str) -> Option<String> {
+    let lcp = longest_common_prefix(names);
+    (lcp.len() > typed.len()).then_some(lcp)
+}
+
 fn longest_common_prefix(items: &[&str]) -> String {
-    let first = match items.first() {
-        Some(s) => *s,
-        None => return String::new(),
+    let Some(&first) = items.first() else {
+        return String::new();
     };
     let mut end = first.len();
     for s in &items[1..] {
