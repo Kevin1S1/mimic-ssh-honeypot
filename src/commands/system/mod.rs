@@ -186,48 +186,16 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
     };
     let mut operands = args[1..].iter();
     let mut out = String::new();
-    let chars: Vec<char> = format.chars().collect();
-    let mut i = 0;
+    let mut chars = format.chars();
 
-    while i < chars.len() {
-        match chars[i] {
-            '\\' if i + 1 < chars.len() => {
-                match chars[i + 1] {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
-                    '0' => out.push('\0'),
-                    '\\' => out.push('\\'),
-
-                    other => {
-                        out.push('\\');
-                        out.push(other);
-                    }
-                }
-                i += 2;
-            }
-            '%' if i + 1 < chars.len() => {
-                match chars[i + 1] {
-                    '%' => out.push('%'),
-                    's' => out.push_str(operands.next().map(String::as_str).unwrap_or("")),
-                    'd' | 'i' => {
-                        let v: i64 = operands
-                            .next()
-                            .and_then(|a| a.trim().parse().ok())
-                            .unwrap_or(0);
-                        out.push_str(&v.to_string());
-                    }
-                    other => {
-                        out.push('%');
-                        out.push(other);
-                    }
-                }
-                i += 2;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' | '%' => match chars.next() {
+                Some(code) if c == '\\' => push_printf_escape(&mut out, code),
+                Some(spec) => push_printf_conversion(&mut out, spec, &mut operands),
+                None => out.push(c),
+            },
+            c => out.push(c),
         }
         if out.len() > super::MAX_COMMAND_OUTPUT_BYTES {
             break;
@@ -236,28 +204,50 @@ pub fn printf(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
-    let mut no_newline = false;
-    let mut interpret = false;
-    let mut idx = 0;
+fn push_printf_escape(out: &mut String, code: char) {
+    let decoded = match code {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => '\0',
+        '\\' => '\\',
+        other => {
+            out.push('\\');
+            other
+        }
+    };
+    out.push(decoded);
+}
 
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg.starts_with('-') && arg.len() > 1 && arg[1..].chars().all(|c| c == 'n' || c == 'e') {
-            for ch in arg[1..].chars() {
-                match ch {
-                    'n' => no_newline = true,
-                    'e' => interpret = true,
-                    _ => {}
-                }
-            }
-            idx += 1;
-        } else {
-            break;
+fn push_printf_conversion(
+    out: &mut String,
+    spec: char,
+    operands: &mut std::slice::Iter<'_, String>,
+) {
+    match spec {
+        '%' => out.push('%'),
+        's' => out.push_str(operands.next().map(String::as_str).unwrap_or("")),
+        'd' | 'i' => {
+            let value: i64 = operands
+                .next()
+                .and_then(|a| a.trim().parse().ok())
+                .unwrap_or(0);
+            out.push_str(&value.to_string());
+        }
+        other => {
+            out.push('%');
+            out.push(other);
         }
     }
+}
 
-    let mut text = args[idx..].join(" ");
+pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
+    let flag_count = args.iter().take_while(|arg| is_echo_flag(arg)).count();
+    let (flags, words) = args.split_at(flag_count);
+    let no_newline = flags.iter().any(|flag| flag.contains('n'));
+    let interpret = flags.iter().any(|flag| flag.contains('e'));
+
+    let mut text = words.join(" ");
     let mut stopped = false;
     if interpret {
         (text, stopped) = interpret_escapes(&text);
@@ -266,6 +256,11 @@ pub fn echo(_shell: &Shell, args: &[String]) -> CommandResult {
         text.push('\n');
     }
     CommandResult::ok(text)
+}
+
+fn is_echo_flag(arg: &str) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|letters| !letters.is_empty() && letters.chars().all(|c| c == 'n' || c == 'e'))
 }
 
 fn interpret_escapes(s: &str) -> (String, bool) {
