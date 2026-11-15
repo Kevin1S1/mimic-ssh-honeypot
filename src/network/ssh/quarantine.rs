@@ -2,6 +2,8 @@ use super::MimicHandler;
 use crate::logging::event;
 use crate::network::digest::sha256_hex;
 use crate::network::{scp, sftp};
+use crate::shell::Shell;
+use crate::vfs::Vfs;
 use std::sync::atomic::Ordering;
 
 pub(super) const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
@@ -109,33 +111,10 @@ impl MimicHandler {
         recursive: bool,
         file: &scp::CompletedFile,
     ) -> String {
-        let (uid, gid) = (self.shell().uid, self.shell().gid);
-        let cwd = self.shell().cwd;
-
-        let (dir_path, name): (String, String) = {
-            let shell = self.shell();
-            let target_abs = abs_path(&shell.vfs.path_of(cwd), target);
-            let mut base = target_abs.clone();
-            if !file.rel_dir.is_empty() {
-                base = format!("{}/{}", base.trim_end_matches('/'), file.rel_dir);
-            }
-
-            let target_is_dir = shell
-                .vfs
-                .resolve(cwd, &base)
-                .map(|id| shell.vfs.node(id).meta.is_dir())
-                .unwrap_or(false);
-
-            if target_is_dir || target.ends_with('/') || recursive || !file.rel_dir.is_empty() {
-                (base, file.name.clone())
-            } else {
-                let (d, n) = crate::vfs::Vfs::split_path(base.trim_end_matches('/'));
-                (d.to_string(), n.to_string())
-            }
-        };
-
-        let intended = format!("{}/{name}", dir_path.trim_end_matches('/'));
         let shell = self.shell();
+        let (uid, gid) = (shell.uid, shell.gid);
+        let (dir_path, name) = scp_destination(shell, target, recursive, file);
+        let intended = format!("{}/{name}", dir_path.trim_end_matches('/'));
         let Some(parent) = shell.vfs.mkdir_p(&dir_path, 0o755, uid, gid) else {
             return intended;
         };
@@ -152,6 +131,30 @@ impl MimicHandler {
         }
         shell.vfs.path_of(id)
     }
+}
+
+fn scp_destination(
+    shell: &Shell,
+    target: &str,
+    recursive: bool,
+    file: &scp::CompletedFile,
+) -> (String, String) {
+    let cwd = shell.cwd;
+    let mut base = abs_path(&shell.vfs.path_of(cwd), target);
+    if !file.rel_dir.is_empty() {
+        base = format!("{}/{}", base.trim_end_matches('/'), file.rel_dir);
+    }
+
+    let target_is_dir = shell
+        .vfs
+        .resolve(cwd, &base)
+        .is_some_and(|id| shell.vfs.node(id).meta.is_dir());
+
+    if target_is_dir || target.ends_with('/') || recursive || !file.rel_dir.is_empty() {
+        return (base, file.name.clone());
+    }
+    let (dir, name) = Vfs::split_path(base.trim_end_matches('/'));
+    (dir.to_string(), name.to_string())
 }
 
 pub(super) struct QuarantinedPayload {
@@ -174,40 +177,41 @@ pub(super) fn write_quarantine(
     sha256: &str,
     data: &[u8],
 ) -> std::io::Result<(String, u64)> {
-    use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(sha256);
 
     let newly_written = if path.exists() {
         0
     } else {
-        let staging = dir.join(format!("{sha256}.partial"));
-
-        match create_restricted(&staging) {
-            Ok(mut file) => {
-                let result = file.write_all(data).and_then(|()| file.sync_all());
-                drop(file);
-                if let Err(e) = result {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(e);
-                }
-                match std::fs::rename(&staging, &path) {
-                    Ok(()) => data.len() as u64,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&staging);
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => 0,
-            Err(e) => return Err(e),
-        }
+        stage_and_commit(dir, sha256, &path, data)?
     };
     let stored = path.to_string_lossy().into_owned();
 
     #[cfg(windows)]
     let stored = stored.replace('\\', "/");
     Ok((stored, newly_written))
+}
+
+fn stage_and_commit(
+    dir: &std::path::Path,
+    sha256: &str,
+    path: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<u64> {
+    use std::io::Write;
+    let staging = dir.join(format!("{sha256}.partial"));
+    let mut file = match create_restricted(&staging) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let written = file.write_all(data).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&staging, path)) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    Ok(data.len() as u64)
 }
 
 #[cfg(unix)]
