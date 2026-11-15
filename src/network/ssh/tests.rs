@@ -5,22 +5,19 @@ use crate::config::AuthConfig;
 use crate::network::limiter::ConnectionRegistry;
 use crate::network::scp::CompletedFile;
 use crate::network::sftp;
+use std::sync::atomic::AtomicU64;
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 
-fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> MimicHandler {
-    let config = Arc::new(Config {
-        quarantine_dir,
-        max_upload_bytes,
-        ..Config::default()
-    });
+fn handler_with(config: Config, global_quarantine_bytes: Arc<AtomicU64>) -> MimicHandler {
+    let max_upload_bytes = config.max_upload_bytes;
     let registry = ConnectionRegistry::new(10, 10);
     let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
     let guard = registry.try_acquire(peer.ip()).expect("slot available");
     let shared = SharedState {
-        config,
+        config: Arc::new(config),
         persona: Arc::new(crate::persona::Persona::sample()),
-        global_quarantine_bytes: Arc::new(AtomicU64::new(0)),
+        global_quarantine_bytes,
     };
     let local = "127.0.0.1:2222".parse().unwrap();
     let mut handler = MimicHandler::new(&shared, 1, peer, local, guard);
@@ -28,6 +25,15 @@ fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> Mi
     handler.username = "root".to_string();
     handler.scp = Some(ScpSink::new("/tmp".to_string(), false, max_upload_bytes));
     handler
+}
+
+fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> MimicHandler {
+    let config = Config {
+        quarantine_dir,
+        max_upload_bytes,
+        ..Config::default()
+    };
+    handler_with(config, Arc::new(AtomicU64::new(0)))
 }
 
 #[test]
@@ -66,9 +72,9 @@ fn quarantine_disk_writes_are_capped_per_session() {
         "quarantine disk usage {total_on_disk} exceeded session cap {cap}"
     );
     assert!(
-        handler.quarantine_bytes <= cap,
+        handler.quarantine_store.session_bytes() <= cap,
         "tracked quarantine_bytes {} exceeded cap {cap}",
-        handler.quarantine_bytes
+        handler.quarantine_store.session_bytes()
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -110,9 +116,9 @@ fn sftp_quarantine_disk_writes_are_capped_per_session() {
         "quarantine disk usage {total_on_disk} exceeded session cap {cap}"
     );
     assert!(
-        handler.quarantine_bytes <= cap,
+        handler.quarantine_store.session_bytes() <= cap,
         "tracked quarantine_bytes {} exceeded cap {cap}",
-        handler.quarantine_bytes
+        handler.quarantine_store.session_bytes()
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -130,23 +136,14 @@ fn quarantine_disk_writes_are_capped_globally() {
     let global_cap = 2000u64;
     let shared_global = Arc::new(AtomicU64::new(0));
 
-    let mut handler1 = test_handler(dir.clone(), max_upload_bytes);
-    handler1.config = Arc::new(Config {
+    let config = || Config {
         quarantine_dir: dir.clone(),
         max_upload_bytes,
         quarantine_max_total_bytes: Some(global_cap),
         ..Config::default()
-    });
-    handler1.global_quarantine_bytes = Arc::clone(&shared_global);
-
-    let mut handler2 = test_handler(dir.clone(), max_upload_bytes);
-    handler2.config = Arc::new(Config {
-        quarantine_dir: dir.clone(),
-        max_upload_bytes,
-        quarantine_max_total_bytes: Some(global_cap),
-        ..Config::default()
-    });
-    handler2.global_quarantine_bytes = Arc::clone(&shared_global);
+    };
+    let mut handler1 = handler_with(config(), Arc::clone(&shared_global));
+    let mut handler2 = handler_with(config(), Arc::clone(&shared_global));
 
     handler1.store_upload(CompletedFile {
         name: "h1_file".to_string(),

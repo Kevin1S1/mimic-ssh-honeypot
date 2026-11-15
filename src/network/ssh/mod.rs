@@ -7,6 +7,7 @@ mod terminal;
 
 pub use server::serve;
 
+use quarantine::QuarantineStore;
 use screen::ScreenHold;
 use server::SharedState;
 use terminal::{
@@ -28,7 +29,7 @@ use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet};
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,9 +72,7 @@ struct MimicHandler {
 
     sftp: Option<SftpSession>,
 
-    quarantine_bytes: u64,
-
-    global_quarantine_bytes: Arc<AtomicU64>,
+    quarantine_store: QuarantineStore,
 
     password_buf: Option<Vec<u8>>,
 
@@ -120,8 +119,10 @@ impl MimicHandler {
             active_channel: None,
             scp: None,
             sftp: None,
-            quarantine_bytes: 0,
-            global_quarantine_bytes: Arc::clone(&shared.global_quarantine_bytes),
+            quarantine_store: QuarantineStore::new(
+                &shared.config,
+                Arc::clone(&shared.global_quarantine_bytes),
+            ),
             password_buf: None,
             line_buf: Vec::new(),
             screen: None,

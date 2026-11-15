@@ -1,14 +1,72 @@
 use super::MimicHandler;
+use crate::config::Config;
 use crate::logging::event;
 use crate::network::digest::sha256_hex;
 use crate::network::{scp, sftp};
 use crate::shell::Shell;
 use crate::vfs::Vfs;
-use std::sync::atomic::Ordering;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub(super) const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
 
 pub(super) const QUARANTINE_GLOBAL_MULTIPLIER: u64 = 64;
+
+pub(super) struct QuarantineStore {
+    dir: PathBuf,
+    session_cap: u64,
+    global_cap: u64,
+    session_bytes: u64,
+    global_bytes: Arc<AtomicU64>,
+}
+
+pub(super) enum QuarantineRefusal {
+    SessionCap,
+    GlobalCap,
+    Io(std::io::Error),
+}
+
+impl QuarantineStore {
+    pub(super) fn new(config: &Config, global_bytes: Arc<AtomicU64>) -> Self {
+        let session_cap = config
+            .max_upload_bytes
+            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER);
+        let global_cap = config.quarantine_max_total_bytes.unwrap_or_else(|| {
+            config
+                .max_upload_bytes
+                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
+        });
+        Self {
+            dir: config.quarantine_dir.clone(),
+            session_cap,
+            global_cap,
+            session_bytes: 0,
+            global_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn session_bytes(&self) -> u64 {
+        self.session_bytes
+    }
+
+    pub(super) fn write(&mut self, sha256: &str, data: &[u8]) -> Result<String, QuarantineRefusal> {
+        let len = data.len() as u64;
+        if self.session_bytes.saturating_add(len) > self.session_cap {
+            return Err(QuarantineRefusal::SessionCap);
+        }
+        let current_global = self.global_bytes.load(Ordering::Relaxed);
+        if current_global.saturating_add(len) > self.global_cap {
+            return Err(QuarantineRefusal::GlobalCap);
+        }
+        let (path, written) =
+            write_quarantine(&self.dir, sha256, data).map_err(QuarantineRefusal::Io)?;
+        self.session_bytes += written;
+        self.global_bytes.fetch_add(written, Ordering::Relaxed);
+        Ok(path)
+    }
+}
 
 pub(super) fn measure_dir_size(dir: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -59,48 +117,25 @@ impl MimicHandler {
         );
     }
 
-    pub(super) fn quarantine_session_cap(&self) -> u64 {
-        self.config
-            .max_upload_bytes
-            .saturating_mul(QUARANTINE_SESSION_MULTIPLIER)
-    }
-
-    pub(super) fn quarantine_global_cap(&self) -> u64 {
-        self.config.quarantine_max_total_bytes.unwrap_or_else(|| {
-            self.config
-                .max_upload_bytes
-                .saturating_mul(QUARANTINE_GLOBAL_MULTIPLIER)
-        })
-    }
-
     pub(super) fn quarantine(&mut self, data: &[u8]) -> QuarantinedPayload {
         let sha256 = sha256_hex(data);
-        let path = self.write_within_caps(&sha256, data).unwrap_or_default();
+        let path = match self.quarantine_store.write(&sha256, data) {
+            Ok(path) => path,
+            Err(refusal) => {
+                self.log_quarantine_refusal(refusal);
+                String::new()
+            }
+        };
         QuarantinedPayload { sha256, path }
     }
 
-    pub(super) fn write_within_caps(&mut self, sha256: &str, data: &[u8]) -> Option<String> {
+    fn log_quarantine_refusal(&self, refusal: QuarantineRefusal) {
         let (session_id, peer) = (self.session_id, self.peer);
-        let len = data.len() as u64;
-        if self.quarantine_bytes.saturating_add(len) > self.quarantine_session_cap() {
-            event::quarantine_session_cap(session_id, peer);
-            return None;
-        }
-        let current_global = self.global_quarantine_bytes.load(Ordering::Relaxed);
-        if current_global.saturating_add(len) > self.quarantine_global_cap() {
-            event::quarantine_global_cap(session_id, peer);
-            return None;
-        }
-        match write_quarantine(&self.config.quarantine_dir, sha256, data) {
-            Ok((path, written)) => {
-                self.quarantine_bytes += written;
-                self.global_quarantine_bytes
-                    .fetch_add(written, Ordering::Relaxed);
-                Some(path)
-            }
-            Err(err) => {
+        match refusal {
+            QuarantineRefusal::SessionCap => event::quarantine_session_cap(session_id, peer),
+            QuarantineRefusal::GlobalCap => event::quarantine_global_cap(session_id, peer),
+            QuarantineRefusal::Io(err) => {
                 event::quarantine_error(session_id, peer, &err.to_string());
-                None
             }
         }
     }
