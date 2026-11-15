@@ -11,6 +11,12 @@ use tracing_subscriber::EnvFilter;
 const LOG_PREFIX: &str = "mimic";
 const LOG_SUFFIX: &str = "jsonl";
 
+const DEFAULT_LOG_FILTER: &str = "info,mimic=info";
+const SECS_PER_DAY: u64 = 86_400;
+
+#[cfg(unix)]
+const LOG_DIR_MODE: u32 = 0o700;
+
 const RETENTION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 pub(crate) fn build_subscriber<W>(filter: EnvFilter, writer: W) -> impl Subscriber
@@ -30,7 +36,7 @@ where
 #[cfg(unix)]
 fn restrict_log_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(LOG_DIR_MODE))
 }
 
 #[cfg(not(unix))]
@@ -42,7 +48,7 @@ pub fn init(config: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mimic=info"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
     let Some(dir) = config.dir.as_deref() else {
         build_subscriber(filter, std::io::stdout).init();
@@ -73,7 +79,7 @@ pub fn init(config: &LoggingConfig) -> Result<Option<WorkerGuard>> {
 
 fn prune_expired(dir: &std::path::Path, retention_days: usize) -> usize {
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
-        (retention_days as u64).saturating_mul(86_400),
+        (retention_days as u64).saturating_mul(SECS_PER_DAY),
     )) else {
         return 0;
     };
