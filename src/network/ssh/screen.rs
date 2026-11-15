@@ -18,6 +18,16 @@ pub(super) struct ScreenHold {
     redraw: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl ScreenHold {
+    fn new(kind: ScreenKind, redraw: Option<tokio::task::JoinHandle<()>>) -> Self {
+        Self {
+            kind,
+            colon: None,
+            redraw,
+        }
+    }
+}
+
 impl Drop for ScreenHold {
     fn drop(&mut self) {
         if let Some(redraw) = &self.redraw {
@@ -88,11 +98,7 @@ impl MimicHandler {
                         }
                     }
                 });
-                self.screen = Some(ScreenHold {
-                    kind: ScreenKind::Top,
-                    colon: None,
-                    redraw: Some(redraw),
-                });
+                self.screen = Some(ScreenHold::new(ScreenKind::Top, Some(redraw)));
             }
             Screen::Editor(editor) => {
                 let kind = match editor.kind() {
@@ -101,18 +107,10 @@ impl MimicHandler {
                 };
                 let first = format!("{SCREEN_HOME}{}", editor.render());
                 session.data(channel, self.out(&first))?;
-                self.screen = Some(ScreenHold {
-                    kind,
-                    colon: None,
-                    redraw: None,
-                });
+                self.screen = Some(ScreenHold::new(kind, None));
             }
             Screen::Listen => {
-                self.screen = Some(ScreenHold {
-                    kind: ScreenKind::Listen,
-                    colon: None,
-                    redraw: None,
-                });
+                self.screen = Some(ScreenHold::new(ScreenKind::Listen, None));
             }
         }
         Ok(())
