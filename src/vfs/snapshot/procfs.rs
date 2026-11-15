@@ -50,17 +50,15 @@ pub fn cpuinfo(persona: &Persona) -> String {
 }
 
 pub fn meminfo(persona: &Persona) -> String {
-    let total = persona.mem_total_kb;
     let mem = persona.memory();
-    let (free, available) = (mem.free, mem.available);
-    let buffers = total * 13 / 1000;
-    let cached = total * 139 / 1000;
+    let (total, free, available) = (mem.total, mem.free, mem.available);
+    let (buffers, cached, sreclaim, shmem) =
+        (mem.buffers, mem.cached, mem.sreclaimable, mem.shared);
     let active = total * 145 / 1000;
     let inactive = total * 72 / 1000;
     let anon = total * 64 / 1000;
     let mapped = total * 36 / 1000;
     let slab = total * 28 / 1000;
-    let sreclaim = total * 20 / 1000;
     let sunreclaim = slab - sreclaim;
     format!(
         "MemTotal:        {total} kB\n\
@@ -77,7 +75,7 @@ pub fn meminfo(persona: &Persona) -> String {
          Writeback:             0 kB\n\
          AnonPages:        {anon} kB\n\
          Mapped:            {mapped} kB\n\
-         Shmem:               992 kB\n\
+         Shmem:               {shmem} kB\n\
          Slab:              {slab} kB\n\
          SReclaimable:      {sreclaim} kB\n\
          SUnreclaim:        {sunreclaim} kB\n"

@@ -354,9 +354,6 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     let giga = args.iter().any(|a| a == "-g");
 
     let mem = shell.persona.memory();
-    let (total, free_mem, available, buff, used) =
-        (mem.total, mem.free, mem.available, mem.buff_cache, mem.used);
-    let shared = 992u64;
 
     let fmt = |kb: u64| -> String {
         if human {
@@ -376,12 +373,12 @@ pub fn free(shell: &Shell, args: &[String]) -> CommandResult {
     );
     out.push_str(&format!(
         "Mem:    {:>12} {:>11} {:>11} {:>11} {:>11} {:>11}\n",
-        fmt(total),
-        fmt(used),
-        fmt(free_mem),
-        fmt(shared),
-        fmt(buff),
-        fmt(available)
+        fmt(mem.total),
+        fmt(mem.used),
+        fmt(mem.free),
+        fmt(mem.shared),
+        fmt(mem.buff_cache),
+        fmt(mem.available)
     ));
     out.push_str(&format!(
         "Swap:   {:>12} {:>11} {:>11}\n",

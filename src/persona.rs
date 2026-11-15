@@ -191,25 +191,35 @@ impl Persona {
         let total = self.mem_total_kb;
         let buffers = total * BUFFERS_PER_MILLE / 1000;
         let cached = total * CACHED_PER_MILLE / 1000;
-        let sreclaim = total * SRECLAIMABLE_PER_MILLE / 1000;
+        let sreclaimable = total * SRECLAIMABLE_PER_MILLE / 1000;
         let free = total * FREE_PERCENT / 100;
-        let buff_cache = buffers + cached + sreclaim;
+        let buff_cache = buffers + cached + sreclaimable;
         MemStats {
             total,
             free,
             available: total * AVAILABLE_PERCENT / 100,
+            buffers,
+            cached,
+            sreclaimable,
             buff_cache,
+            shared: SHMEM_KB,
             used: total.saturating_sub(free).saturating_sub(buff_cache),
         }
     }
 }
+
+const SHMEM_KB: u64 = 992;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemStats {
     pub total: u64,
     pub free: u64,
     pub available: u64,
+    pub buffers: u64,
+    pub cached: u64,
+    pub sreclaimable: u64,
     pub buff_cache: u64,
+    pub shared: u64,
     pub used: u64,
 }
 
