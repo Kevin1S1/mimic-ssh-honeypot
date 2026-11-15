@@ -6,7 +6,7 @@ const USAGE_FAILURE: i32 = 2;
 const MAX_HOSTNAME_LEN: usize = 253;
 const NETWORK_HINTS: [&str; 3] = ["socket", "connect", "Socket"];
 
-const PYTHON_VERSION: &str = "Python 3.11.2";
+const PYTHON_VERSION: &str = concat!("Python ", python_version!());
 
 const PERL_VERSION: &str = "\nThis is perl 5, version 36, subversion 0 (v5.36.0) built for \
     x86_64-linux-gnu-thread-multi\n\n\

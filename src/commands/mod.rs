@@ -1,4 +1,10 @@
 pub mod admin;
+macro_rules! python_version {
+    () => {
+        "3.11.2"
+    };
+}
+
 mod file_read;
 pub mod fs;
 pub mod net;
