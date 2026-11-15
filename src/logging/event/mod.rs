@@ -1,7 +1,15 @@
+use std::borrow::Cow;
+use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
+const DEFAULT_SENSOR_NAME: &str = "mimic";
+const UNSET_BOOT_ID: &str = "0000000000000000";
+const MAX_BYTE_ESCAPE: u32 = 0xff;
+const ESCAPE_HEADROOM: usize = 8;
+
 static SENSOR_NAME: OnceLock<String> = OnceLock::new();
+static BOOT_ID: OnceLock<String> = OnceLock::new();
 
 pub fn init(name: &str) {
     SENSOR_NAME
@@ -14,42 +22,41 @@ pub fn init(name: &str) {
 }
 
 fn sensor_name() -> &'static str {
-    SENSOR_NAME.get().map_or("mimic", |s| s.as_str())
+    SENSOR_NAME
+        .get()
+        .map_or(DEFAULT_SENSOR_NAME, |s| s.as_str())
 }
 
-static BOOT_ID: OnceLock<String> = OnceLock::new();
-
 fn boot_id() -> &'static str {
-    BOOT_ID.get().map_or("0000000000000000", |s| s.as_str())
+    BOOT_ID.get().map_or(UNSET_BOOT_ID, |s| s.as_str())
 }
 
 fn peer_parts(peer: SocketAddr) -> (String, u16) {
     (peer.ip().to_string(), peer.port())
 }
 
-pub fn sanitise_field(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s
-        .chars()
-        .any(|c| (c.is_control() && c != '\t' && c != '\n' && c != '\r') || c == '\x7f')
-    {
-        return std::borrow::Cow::Borrowed(s);
+fn needs_escape(c: char) -> bool {
+    (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || c == '\x7f'
+}
+
+pub fn sanitise_field(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(needs_escape) {
+        return Cow::Borrowed(s);
     }
-    let mut out = String::with_capacity(s.len() + 8);
+    let mut out = String::with_capacity(s.len() + ESCAPE_HEADROOM);
     for c in s.chars() {
-        if (c.is_control() && c != '\t' && c != '\n' && c != '\r') || c == '\x7f' {
-            let u = c as u32;
-            if u <= 0xff {
-                use std::fmt::Write;
-                let _ = write!(out, "\\x{u:02x}");
-            } else {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{{{u:x}}}");
-            }
-        } else {
+        if !needs_escape(c) {
             out.push(c);
+            continue;
+        }
+        let u = c as u32;
+        if u <= MAX_BYTE_ESCAPE {
+            let _ = write!(out, "\\x{u:02x}");
+        } else {
+            let _ = write!(out, "\\u{{{u:x}}}");
         }
     }
-    std::borrow::Cow::Owned(out)
+    Cow::Owned(out)
 }
 
 const EVENT_KIND: &str = "event";
