@@ -1,4 +1,4 @@
-use super::{cap, vfs_file, with_input};
+use super::{cap, flag_value, vfs_file, with_input};
 use crate::commands::{CommandResult, MAX_COMMAND_OUTPUT_BYTES};
 use crate::shell::Shell;
 
@@ -63,24 +63,23 @@ fn parse_args<'a>(shell: &Shell, args: &'a [String]) -> Result<AwkInvocation<'a>
     let mut iter = args.iter();
 
     while let Some(a) = iter.next() {
-        match a.as_str() {
-            "-F" => separator = iter.next().cloned(),
-            "-v" => {
-                if let Some(assignment) = iter.next() {
-                    note_separator_assignment(&mut separator_variable, assignment);
-                }
+        let a = a.as_str();
+        if let Some(value) = flag_value(a, "-F", &mut iter) {
+            separator = value.map(str::to_string);
+        } else if let Some(value) = flag_value(a, "-v", &mut iter) {
+            if let Some(assignment) = value {
+                note_separator_assignment(&mut separator_variable, assignment);
             }
-            "-f" => {
-                let Some(path) = iter.next() else { continue };
+        } else if a == "-f" {
+            if let Some(path) = iter.next() {
                 program = Some(read_program_file(shell, path)?);
             }
-            s if s.starts_with("-F") && s.len() > 2 => separator = Some(s[2..].to_string()),
-            s if s.starts_with("-v") && s.len() > 2 => {
-                note_separator_assignment(&mut separator_variable, &s[2..]);
+        } else if !(a.starts_with('-') && a.len() > 1) {
+            if program.is_none() {
+                program = Some(a.to_string());
+            } else {
+                files.push(a);
             }
-            s if s.starts_with('-') && s.len() > 1 => {}
-            other if program.is_none() => program = Some(other.to_string()),
-            other => files.push(other),
         }
     }
 

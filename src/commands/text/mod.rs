@@ -33,6 +33,20 @@ fn vfs_file<'a>(shell: &'a Shell, tool: &str, path: &str) -> Result<Cow<'a, [u8]
     })
 }
 
+fn flag_value<'a>(
+    arg: &'a str,
+    flag: &str,
+    rest: &mut std::slice::Iter<'a, String>,
+) -> Option<Option<&'a str>> {
+    if arg == flag {
+        Some(rest.next().map(String::as_str))
+    } else if arg.len() > flag.len() && arg.starts_with(flag) {
+        Some(Some(&arg[flag.len()..]))
+    } else {
+        None
+    }
+}
+
 fn stdin_text(shell: &Shell) -> String {
     shell.stdin.clone().unwrap_or_default()
 }

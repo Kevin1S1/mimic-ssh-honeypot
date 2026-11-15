@@ -1,4 +1,4 @@
-use super::{failure_status, has_flag_letter, missing_operand, split_args, stdin_text};
+use super::{failure_status, flag_value, has_flag_letter, missing_operand, split_args, stdin_text};
 use crate::commands::{fs::resolve_parent, CommandResult, MAX_COMMAND_OUTPUT_BYTES};
 use crate::shell::Shell;
 
@@ -104,15 +104,13 @@ fn parse_xargs_args(args: &[String]) -> (Option<usize>, Vec<String>) {
     let mut command: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
-        match a.as_str() {
-            "-n" => per_call = iter.next().and_then(|v| v.parse().ok()),
-            s if s.starts_with("-n") && s.len() > 2 => per_call = s[2..].parse().ok(),
-            "-r" | "--no-run-if-empty" | "-0" | "--null" => {}
-            _ => {
-                command.push(a.clone());
-                command.extend(iter.cloned());
-                break;
-            }
+        let a = a.as_str();
+        if let Some(value) = flag_value(a, "-n", &mut iter) {
+            per_call = value.and_then(|v| v.parse().ok());
+        } else if !matches!(a, "-r" | "--no-run-if-empty" | "-0" | "--null") {
+            command.push(a.to_string());
+            command.extend(iter.cloned());
+            break;
         }
     }
     if command.is_empty() {
