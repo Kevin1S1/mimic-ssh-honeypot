@@ -1,5 +1,13 @@
 use std::collections::BTreeMap;
 
+const MAX_ENV_VARS: usize = 256;
+const MAX_ENV_VALUE_LEN: usize = 4096;
+const DEFAULT_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games";
+const DEFAULT_SHELL: &str = "/bin/bash";
+const DEFAULT_TERM: &str = "xterm-256color";
+const DEFAULT_LANG: &str = "en_US.UTF-8";
+
 #[derive(Debug, Clone)]
 pub struct Env {
     vars: BTreeMap<String, String>,
@@ -12,13 +20,10 @@ impl Env {
         vars.insert("LOGNAME".into(), user.into());
         vars.insert("HOME".into(), home.into());
         vars.insert("PWD".into(), home.into());
-        vars.insert("SHELL".into(), "/bin/bash".into());
-        vars.insert(
-            "PATH".into(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games".into(),
-        );
-        vars.insert("TERM".into(), "xterm-256color".into());
-        vars.insert("LANG".into(), "en_US.UTF-8".into());
+        vars.insert("SHELL".into(), DEFAULT_SHELL.into());
+        vars.insert("PATH".into(), DEFAULT_PATH.into());
+        vars.insert("TERM".into(), DEFAULT_TERM.into());
+        vars.insert("LANG".into(), DEFAULT_LANG.into());
         vars.insert("MAIL".into(), format!("/var/mail/{user}"));
         vars.insert("HOSTNAME".into(), hostname.into());
         vars.insert("SHLVL".into(), "1".into());
@@ -31,8 +36,6 @@ impl Env {
     }
 
     pub fn set(&mut self, key: &str, value: &str) {
-        const MAX_ENV_VARS: usize = 256;
-        const MAX_ENV_VALUE_LEN: usize = 4096;
         if !self.vars.contains_key(key) && self.vars.len() >= MAX_ENV_VARS {
             return;
         }
