@@ -1,7 +1,7 @@
 use super::parser::{Redirect, Stream, Target};
-use super::{Shell, REGULAR_FILE_MODE};
+use super::Shell;
 use crate::commands::{self, CommandResult};
-use crate::vfs::NodeId;
+use crate::vfs::{NodeId, DEFAULT_FILE_MODE};
 
 const DEV_NULL: &str = "/dev/null";
 
@@ -133,7 +133,7 @@ impl Shell {
         let (uid, gid) = (self.uid, self.gid);
         let id = self
             .vfs
-            .add_file(parent, name, Vec::new(), REGULAR_FILE_MODE, uid, gid);
+            .add_file(parent, name, Vec::new(), DEFAULT_FILE_MODE, uid, gid);
         if id == parent {
             return Err(bash_error(path, NO_SPACE_LEFT));
         }
