@@ -470,22 +470,14 @@ pub fn tokenize(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut has_token = false;
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quotes = Quotes::default();
     let mut chars = line.chars().peekable();
 
     while let Some(c) = chars.next() {
         match c {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                has_token = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                has_token = true;
-            }
-            '\\' if !in_single => match chars.peek() {
-                Some(&next) if !in_double || matches!(next, '$' | '`' | '"' | '\\') => {
+            '\'' | '"' if quotes.toggle(c) => has_token = true,
+            '\\' if !quotes.single => match chars.peek() {
+                Some(&next) if !quotes.double || matches!(next, '$' | '`' | '"' | '\\') => {
                     cur.push(next);
                     chars.next();
                     has_token = true;
@@ -497,7 +489,7 @@ pub fn tokenize(line: &str) -> Vec<String> {
 
                 None => {}
             },
-            c if c.is_whitespace() && !in_single && !in_double => {
+            c if c.is_whitespace() && !quotes.is_quoted() => {
                 if has_token {
                     tokens.push(std::mem::take(&mut cur));
                     has_token = false;

@@ -1,4 +1,5 @@
-﻿use crate::commands::CommandResult;
+﻿use crate::commands::file_read::{read_vfs_file, Access, ReadFailure};
+use crate::commands::CommandResult;
 use crate::shell::Shell;
 
 pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
@@ -11,22 +12,13 @@ pub fn cat(shell: &Shell, args: &[String]) -> CommandResult {
     let mut status = 0;
 
     for arg in args {
-        let Some(id) = shell.vfs.resolve(shell.cwd, arg) else {
-            errs.push_str(&format!("cat: {arg}: No such file or directory\n"));
-            status = 1;
-            continue;
-        };
-        let node = shell.vfs.node(id);
-        if !node.meta.readable_by(shell.uid, shell.gid) {
-            errs.push_str(&format!("cat: {arg}: Permission denied\n"));
-            status = 1;
-            continue;
-        }
-        if let Some(bytes) = node.file_bytes() {
-            out.push_str(&String::from_utf8_lossy(&bytes));
-        } else if node.meta.is_dir() {
-            errs.push_str(&format!("cat: {arg}: Is a directory\n"));
-            status = 1;
+        match read_vfs_file(shell, arg, Access::Checked) {
+            Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+            Err(ReadFailure::NotRegular) => {}
+            Err(failure) => {
+                errs.push_str(&format!("cat: {arg}: {}\n", failure.reason()));
+                status = 1;
+            }
         }
     }
 
@@ -103,25 +95,24 @@ fn head_tail(shell: &Shell, args: &[String], from_end: bool) -> CommandResult {
     let mut errs = String::new();
     let mut status = 0;
     for (i, path) in files.iter().enumerate() {
-        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
-            errs.push_str(&format!(
-                "{cmd}: cannot open '{path}' for reading: No such file or directory\n"
-            ));
-            status = 1;
-            continue;
-        };
-        let node = shell.vfs.node(id);
-        if !node.meta.readable_by(shell.uid, shell.gid) {
-            errs.push_str(&format!(
-                "{cmd}: cannot open '{path}' for reading: Permission denied\n"
-            ));
-            status = 1;
-            continue;
-        }
-        let Some(bytes) = node.file_bytes() else {
-            errs.push_str(&format!("{cmd}: error reading '{path}': Is a directory\n"));
-            status = 1;
-            continue;
+        let bytes = match read_vfs_file(shell, path, Access::Checked) {
+            Ok(bytes) => bytes,
+            Err(failure @ (ReadFailure::Missing | ReadFailure::Denied)) => {
+                errs.push_str(&format!(
+                    "{cmd}: cannot open '{path}' for reading: {}\n",
+                    failure.reason()
+                ));
+                status = 1;
+                continue;
+            }
+            Err(failure) => {
+                errs.push_str(&format!(
+                    "{cmd}: error reading '{path}': {}\n",
+                    failure.reason()
+                ));
+                status = 1;
+                continue;
+            }
         };
         if show_headers {
             if i > 0 {
@@ -222,21 +213,13 @@ pub fn wc(shell: &Shell, args: &[String]) -> CommandResult {
     let mut counted = 0;
 
     for path in &files {
-        let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
-            errs.push_str(&format!("wc: {path}: No such file or directory\n"));
-            status = 1;
-            continue;
-        };
-        let node = shell.vfs.node(id);
-        if !node.meta.readable_by(shell.uid, shell.gid) {
-            errs.push_str(&format!("wc: {path}: Permission denied\n"));
-            status = 1;
-            continue;
-        }
-        let Some(bytes) = node.file_bytes() else {
-            errs.push_str(&format!("wc: {path}: Is a directory\n"));
-            status = 1;
-            continue;
+        let bytes = match read_vfs_file(shell, path, Access::Checked) {
+            Ok(bytes) => bytes,
+            Err(failure) => {
+                errs.push_str(&format!("wc: {path}: {}\n", failure.reason()));
+                status = 1;
+                continue;
+            }
         };
         let text = String::from_utf8_lossy(&bytes);
         let lines = text.bytes().filter(|&b| b == b'\n').count();

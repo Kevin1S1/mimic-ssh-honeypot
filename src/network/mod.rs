@@ -1,3 +1,4 @@
+mod digest;
 mod hostkey;
 mod limiter;
 mod scp;

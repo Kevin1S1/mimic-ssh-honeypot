@@ -88,7 +88,7 @@ const INSTALLED: &[(&str, &str, &str)] = &[
     ("procps", "2:3.3.17-7", "/proc file system utilities"),
     (
         "python3",
-        "3.11.2-1+b1",
+        concat!(python_version!(), "-1+b1"),
         "interactive high-level object-oriented language (default python3 version)",
     ),
     (

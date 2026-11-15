@@ -72,7 +72,7 @@ fn listen(shell: &mut Shell, options: &NcOptions) -> CommandResult {
         return CommandResult::err("nc: cannot use -p and -l\n", 1);
     }
 
-    if shell.interactive && shell.stdout_is_tty {
+    if shell.is_interactive_tty() {
         shell.screen = Some(Screen::Listen);
     }
     CommandResult::empty()

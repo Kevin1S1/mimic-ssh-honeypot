@@ -1,6 +1,11 @@
 use super::env::Env;
 
 const MAX_DEPTH: u32 = 32;
+const TWO_CHAR_OPS: &[&str] = &["==", "!=", "<=", ">="];
+const ONE_CHAR_OPS: &[&str] = &["+", "-", "*", "/", "%", "(", ")", "<", ">"];
+const COMPARISON_OPS: &[&str] = &["==", "!=", "<=", ">=", "<", ">"];
+const ADDITIVE_OPS: &[&str] = &["+", "-"];
+const MULTIPLICATIVE_OPS: &[&str] = &["*", "/", "%"];
 
 pub fn eval(env: &Env, expr: &str) -> Option<i64> {
     let tokens = tokenize(expr)?;
@@ -62,30 +67,15 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
         }
 
         let pair: String = chars[i..chars.len().min(i + 2)].iter().collect();
-        let two = match pair.as_str() {
-            "==" => Some("=="),
-            "!=" => Some("!="),
-            "<=" => Some("<="),
-            ">=" => Some(">="),
-            _ => None,
-        };
-        if let Some(op) = two {
+        if let Some(&op) = TWO_CHAR_OPS.iter().find(|&&op| op == pair) {
             tokens.push(Token::Op(op));
             i += 2;
             continue;
         }
-        let one = match c {
-            '+' => "+",
-            '-' => "-",
-            '*' => "*",
-            '/' => "/",
-            '%' => "%",
-            '(' => "(",
-            ')' => ")",
-            '<' => "<",
-            '>' => ">",
-            _ => return None,
-        };
+        let one = ONE_CHAR_OPS
+            .iter()
+            .find(|op| op.chars().eq(std::iter::once(c)))
+            .copied()?;
         tokens.push(Token::Op(one));
         i += 1;
     }
@@ -121,7 +111,7 @@ impl Parser<'_> {
 
     fn comparison(&mut self) -> Option<i64> {
         let mut left = self.additive()?;
-        while let Some(op) = self.eat_any(&["==", "!=", "<=", ">=", "<", ">"]) {
+        while let Some(op) = self.eat_any(COMPARISON_OPS) {
             let right = self.additive()?;
             let truth = match op {
                 "==" => left == right,
@@ -138,7 +128,7 @@ impl Parser<'_> {
 
     fn additive(&mut self) -> Option<i64> {
         let mut left = self.multiplicative()?;
-        while let Some(op) = self.eat_any(&["+", "-"]) {
+        while let Some(op) = self.eat_any(ADDITIVE_OPS) {
             let right = self.multiplicative()?;
             left = if op == "+" {
                 left.wrapping_add(right)
@@ -151,7 +141,7 @@ impl Parser<'_> {
 
     fn multiplicative(&mut self) -> Option<i64> {
         let mut left = self.unary()?;
-        while let Some(op) = self.eat_any(&["*", "/", "%"]) {
+        while let Some(op) = self.eat_any(MULTIPLICATIVE_OPS) {
             let right = self.unary()?;
             left = match op {
                 "*" => left.wrapping_mul(right),

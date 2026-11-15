@@ -5,9 +5,9 @@ mod screen;
 mod server;
 mod terminal;
 
-pub(super) use quarantine::hex;
 pub use server::serve;
 
+use quarantine::QuarantineStore;
 use screen::ScreenHold;
 use server::SharedState;
 use terminal::{
@@ -29,7 +29,7 @@ use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet};
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +40,28 @@ const LOGOUT: &str = "logout\n";
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
 const HISTORY_CAPACITY: usize = 1000;
+
+const PTY_DEVICE: &str = "/dev/pts/0";
+
+const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
+const KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)";
+const MACHINE: &str = "x86_64";
+const DEBIAN_NOTICE: &str = "\
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+";
+
+const JITTER_BASE_MICROS: u64 = 900;
+const JITTER_MICROS_PER_OUTPUT_BYTE: u64 = 1;
+const JITTER_MAX_WORK_MICROS: u64 = 240_000;
+const JITTER_NOISE_PERCENT: std::ops::RangeInclusive<u64> = 40..=170;
+const JITTER_MIN_MICROS: u64 = 400;
+const JITTER_MAX_MICROS: u64 = 450_000;
+const PERCENT: u64 = 100;
 
 fn new_line_editor() -> LineEditor {
     LineEditor::new(MAX_COMMAND_LEN, HISTORY_CAPACITY)
@@ -70,9 +92,7 @@ struct MimicHandler {
 
     sftp: Option<SftpSession>,
 
-    quarantine_bytes: u64,
-
-    global_quarantine_bytes: Arc<AtomicU64>,
+    quarantine_store: QuarantineStore,
 
     password_buf: Option<Vec<u8>>,
 
@@ -119,8 +139,10 @@ impl MimicHandler {
             active_channel: None,
             scp: None,
             sftp: None,
-            quarantine_bytes: 0,
-            global_quarantine_bytes: Arc::clone(&shared.global_quarantine_bytes),
+            quarantine_store: QuarantineStore::new(
+                &shared.config,
+                Arc::clone(&shared.global_quarantine_bytes),
+            ),
             password_buf: None,
             line_buf: Vec::new(),
             screen: None,
@@ -187,11 +209,7 @@ impl MimicHandler {
     }
 
     fn out(&self, text: &str) -> Vec<u8> {
-        if self.pty {
-            text.replace('\n', "\r\n").into_bytes()
-        } else {
-            text.as_bytes().to_vec()
-        }
+        encode_output(text, self.pty)
     }
 
     fn write_output(
@@ -341,35 +359,36 @@ impl MimicHandler {
                 &self.config.hostname,
                 (*self.persona).clone(),
             );
-
-            let (peer_ip, peer_port) = (self.peer.ip(), self.peer.port());
-            shell.env.set(
-                "SSH_CLIENT",
-                &format!("{peer_ip} {peer_port} {}", self.local.port()),
-            );
-            shell.env.set(
-                "SSH_CONNECTION",
-                &format!(
-                    "{peer_ip} {peer_port} {} {}",
-                    self.local.ip(),
-                    self.local.port()
-                ),
-            );
-            if self.pty {
-                shell.env.set("SSH_TTY", "/dev/pts/0");
-            }
-
-            if let Some(pty) = self.pty_term.as_ref() {
-                shell.env.set("TERM", &pty.term);
-                pty.export_size(&mut shell);
-            }
-
-            for (key, value) in &self.accepted_env {
-                shell.env.set(key, value);
+            for (key, value) in self.connection_env() {
+                shell.env.set(&key, &value);
             }
             self.shell = Some(shell);
         }
         self.shell.as_mut().expect("shell just initialised")
+    }
+
+    fn connection_env(&self) -> Vec<(String, String)> {
+        let (peer_ip, peer_port) = (self.peer.ip(), self.peer.port());
+        let (local_ip, local_port) = (self.local.ip(), self.local.port());
+        let mut env = vec![
+            (
+                "SSH_CLIENT".to_string(),
+                format!("{peer_ip} {peer_port} {local_port}"),
+            ),
+            (
+                "SSH_CONNECTION".to_string(),
+                format!("{peer_ip} {peer_port} {local_ip} {local_port}"),
+            ),
+        ];
+        if self.pty {
+            env.push(("SSH_TTY".to_string(), PTY_DEVICE.to_string()));
+        }
+        if let Some(pty) = self.pty_term.as_ref() {
+            env.push(("TERM".to_string(), pty.term.clone()));
+            env.extend(pty.size_env().map(|(key, value)| (key.to_string(), value)));
+        }
+        env.extend(self.accepted_env.iter().cloned());
+        env
     }
 
     fn complete_current_word(&mut self) -> Vec<u8> {
@@ -393,14 +412,7 @@ impl MimicHandler {
 
     fn motd(&self) -> String {
         format!(
-            "Linux {host} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64\n\
-             \n\
-             The programs included with the Debian GNU/Linux system are free software;\n\
-             the exact distribution terms for each program are described in the\n\
-             individual files in /usr/share/doc/*/copyright.\n\
-             \n\
-             Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\n\
-             permitted by applicable law.\n",
+            "Linux {host} {KERNEL_RELEASE} {KERNEL_VERSION} {MACHINE}\n\n{DEBIAN_NOTICE}",
             host = self.config.hostname,
         )
     }
@@ -436,6 +448,14 @@ impl MimicHandler {
                 }
             }
         }
+    }
+}
+
+fn encode_output(text: &str, pty: bool) -> Vec<u8> {
+    if pty {
+        text.replace('\n', "\r\n").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
@@ -733,13 +753,15 @@ fn reject_but_offer_password() -> Auth {
 }
 
 async fn jitter_for(output_bytes: usize) {
-    let base = 900u64;
-
-    let work = (output_bytes as u64).saturating_mul(1).min(240_000);
-
-    let noise = rand::random_range(40..=170) * rand::random_range(40..=170) / 100;
-    let micros = (base + work).saturating_mul(noise) / 100;
-    tokio::time::sleep(Duration::from_micros(micros.clamp(400, 450_000))).await;
+    let work = (output_bytes as u64)
+        .saturating_mul(JITTER_MICROS_PER_OUTPUT_BYTE)
+        .min(JITTER_MAX_WORK_MICROS);
+    let noise_percent = rand::random_range(JITTER_NOISE_PERCENT)
+        * rand::random_range(JITTER_NOISE_PERCENT)
+        / PERCENT;
+    let micros = (JITTER_BASE_MICROS + work).saturating_mul(noise_percent) / PERCENT;
+    let micros = micros.clamp(JITTER_MIN_MICROS, JITTER_MAX_MICROS);
+    tokio::time::sleep(Duration::from_micros(micros)).await;
 }
 
 #[cfg(test)]

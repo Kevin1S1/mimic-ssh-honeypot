@@ -1,3 +1,4 @@
+use super::digest::finish_sha256_hex;
 use sha2::{Digest, Sha256};
 
 const ACK: u8 = 0;
@@ -126,7 +127,7 @@ impl Incoming {
             mode: self.mode,
             data: self.data,
             size: self.size,
-            payload_sha256: super::ssh::hex(&self.hasher.finalize()),
+            payload_sha256: finish_sha256_hex(self.hasher),
             truncated: self.truncated,
         }
     }
@@ -267,6 +268,7 @@ fn sanitize_file_name(raw_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::digest::sha256_hex;
 
     #[test]
     fn parses_sink_and_source() {
@@ -324,19 +326,8 @@ mod tests {
         assert!(files[0].truncated);
         assert_eq!(files[0].size, 10);
 
-        let mut whole = Sha256::new();
-        whole.update(body);
-        assert_eq!(
-            files[0].payload_sha256,
-            super::super::ssh::hex(&whole.finalize())
-        );
-
-        let mut prefix = Sha256::new();
-        prefix.update(&body[..4]);
-        assert_ne!(
-            files[0].payload_sha256,
-            super::super::ssh::hex(&prefix.finalize())
-        );
+        assert_eq!(files[0].payload_sha256, sha256_hex(body));
+        assert_ne!(files[0].payload_sha256, sha256_hex(&body[..4]));
     }
 
     #[test]

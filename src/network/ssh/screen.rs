@@ -1,5 +1,5 @@
 use super::terminal::{BACKSPACE, CTRL_C, CTRL_X, DELETE, ESC};
-use super::MimicHandler;
+use super::{encode_output, MimicHandler};
 use crate::shell::Screen;
 use russh::keys::ssh_encoding::bytes::Bytes;
 use russh::server::Session;
@@ -16,6 +16,16 @@ pub(super) struct ScreenHold {
     colon: Option<String>,
 
     redraw: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ScreenHold {
+    fn new(kind: ScreenKind, redraw: Option<tokio::task::JoinHandle<()>>) -> Self {
+        Self {
+            kind,
+            colon: None,
+            redraw,
+        }
+    }
 }
 
 impl Drop for ScreenHold {
@@ -78,21 +88,13 @@ impl MimicHandler {
                     loop {
                         ticker.tick().await;
                         let frame = format!("{SCREEN_HOME}{}", top.render());
-                        let bytes = if pty {
-                            frame.replace('\n', "\r\n").into_bytes()
-                        } else {
-                            frame.into_bytes()
-                        };
+                        let bytes = encode_output(&frame, pty);
                         if handle.data(channel, Bytes::from(bytes)).await.is_err() {
                             return;
                         }
                     }
                 });
-                self.screen = Some(ScreenHold {
-                    kind: ScreenKind::Top,
-                    colon: None,
-                    redraw: Some(redraw),
-                });
+                self.screen = Some(ScreenHold::new(ScreenKind::Top, Some(redraw)));
             }
             Screen::Editor(editor) => {
                 let kind = match editor.kind() {
@@ -101,18 +103,10 @@ impl MimicHandler {
                 };
                 let first = format!("{SCREEN_HOME}{}", editor.render());
                 session.data(channel, self.out(&first))?;
-                self.screen = Some(ScreenHold {
-                    kind,
-                    colon: None,
-                    redraw: None,
-                });
+                self.screen = Some(ScreenHold::new(kind, None));
             }
             Screen::Listen => {
-                self.screen = Some(ScreenHold {
-                    kind: ScreenKind::Listen,
-                    colon: None,
-                    redraw: None,
-                });
+                self.screen = Some(ScreenHold::new(ScreenKind::Listen, None));
             }
         }
         Ok(())

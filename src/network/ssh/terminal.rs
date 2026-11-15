@@ -17,9 +17,17 @@ pub(super) const DEFAULT_ROWS: u32 = 24;
 pub(super) const MAX_TERMINAL_DIMENSION: u32 = 10_000;
 
 impl PtyRequest {
+    pub(super) fn size_env(&self) -> [(&'static str, String); 2] {
+        [
+            ("COLUMNS", self.cols.to_string()),
+            ("LINES", self.rows.to_string()),
+        ]
+    }
+
     pub(super) fn export_size(&self, shell: &mut Shell) {
-        shell.env.set("COLUMNS", &self.cols.to_string());
-        shell.env.set("LINES", &self.rows.to_string());
+        for (key, value) in self.size_env() {
+            shell.env.set(key, &value);
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use super::{resolve_parent, strip_trailing_slashes};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
 use crate::vfs::nodes::{Metadata, NodeKind, S_IFDIR, S_IFLNK};
-use crate::vfs::NodeId;
+use crate::vfs::{NodeId, DEFAULT_FILE_MODE};
 
 fn apply_tar_flags(
     chars: &str,
@@ -444,7 +444,9 @@ pub fn tar(shell: &mut Shell, args: &[String]) -> CommandResult {
 
         let (uid, gid) = (shell.uid, shell.gid);
         let written = bytes.len();
-        let id = shell.vfs.add_file(parent, &name, bytes, 0o644, uid, gid);
+        let id = shell
+            .vfs
+            .add_file(parent, &name, bytes, DEFAULT_FILE_MODE, uid, gid);
 
         let stored_ok = matches!(
             &shell.vfs.node(id).kind,

@@ -1,4 +1,4 @@
-use super::{newline_terminated, with_input};
+use super::{flag_value, newline_terminated, with_input};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
 
@@ -14,15 +14,15 @@ pub fn cut(shell: &Shell, args: &[String]) -> CommandResult {
     let mut iter = args.iter();
 
     while let Some(a) = iter.next() {
-        match a.as_str() {
-            "-d" => delim = first_char_or_default(iter.next().map(String::as_str)),
-            "-f" => fields = iter.next().cloned(),
-            "-c" => chars = iter.next().cloned(),
-            s if s.starts_with("-d") && s.len() > 2 => delim = first_char_or_default(Some(&s[2..])),
-            s if s.starts_with("-f") && s.len() > 2 => fields = Some(s[2..].to_string()),
-            s if s.starts_with("-c") && s.len() > 2 => chars = Some(s[2..].to_string()),
-            s if s.starts_with('-') && s.len() > 1 => {}
-            other => files.push(other),
+        let a = a.as_str();
+        if let Some(value) = flag_value(a, "-d", &mut iter) {
+            delim = first_char_or_default(value);
+        } else if let Some(value) = flag_value(a, "-f", &mut iter) {
+            fields = value.map(str::to_string);
+        } else if let Some(value) = flag_value(a, "-c", &mut iter) {
+            chars = value.map(str::to_string);
+        } else if !(a.starts_with('-') && a.len() > 1) {
+            files.push(a);
         }
     }
 

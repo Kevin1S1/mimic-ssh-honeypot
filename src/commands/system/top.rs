@@ -87,7 +87,7 @@ pub fn top(shell: &mut Shell, args: &[String]) -> CommandResult {
         &session_table(shell, &invocation("top", args)),
         shell.persona.memory(),
     );
-    if !is_one_shot(args) && shell.interactive && shell.stdout_is_tty {
+    if !is_one_shot(args) && shell.is_interactive_tty() {
         shell.screen = Some(Screen::Top(screen));
         return CommandResult::empty();
     }

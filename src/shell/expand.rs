@@ -2,7 +2,7 @@ use std::iter::Peekable;
 use std::str::CharIndices;
 
 use super::env::Env;
-use super::{arith, floor_char_boundary, parser, push_capped, Output, Pending, Screen, Shell};
+use super::{arith, parser, push_capped, Output, Pending, Screen, Shell};
 use crate::commands;
 use crate::vfs::NodeId;
 
@@ -175,7 +175,7 @@ impl Shell {
     }
 
     fn spend_substitution_budget(&mut self, mut value: String) -> String {
-        value.truncate(floor_char_boundary(&value, self.subst_budget));
+        value.truncate(commands::floor_char_boundary(&value, self.subst_budget));
         self.subst_budget -= value.len();
         value
     }
