@@ -11,6 +11,7 @@ mod top;
 pub use interpreter::{scp, shell_cmd};
 pub use privilege::{su, sudo};
 
+use process::SESSION_TTY;
 pub use process::{kill, pkill, process_name, process_pid, process_table, ps};
 pub use top::{top, TopScreen};
 
@@ -457,36 +458,43 @@ fn binary_path(name: &str) -> Option<String> {
     }
 }
 
+const USER_COLUMN_WIDTH: usize = 8;
+
+const W_COLUMNS: &str = "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n";
+
+const LAST_TIME_FORMAT: &str = "%a %b %e %H:%M";
+
+const CLOCK_TIME_FORMAT: &str = "%H:%M";
+
 pub fn w(shell: &Shell, _args: &[String]) -> CommandResult {
     let header = format!(" {}\n", clock::uptime_banner());
-    let cols = "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n";
     let row = format!(
-        "{user:<8} pts/0    {from:<16} {login}    0.00s  0.02s  0.00s w\n",
-        user = truncate(&shell.username, 8),
+        "{user:<8} {SESSION_TTY:<8} {from:<16} {login}    0.00s  0.02s  0.00s w\n",
+        user = truncate(&shell.username, USER_COLUMN_WIDTH),
         from = clock::PREV_LOGIN_FROM,
-        login = clock::format(shell.login, "%H:%M"),
+        login = clock::format(shell.login, CLOCK_TIME_FORMAT),
     );
-    CommandResult::ok(format!("{header}{cols}{row}"))
+    CommandResult::ok(format!("{header}{W_COLUMNS}{row}"))
 }
 
 pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
     let (prev, prev_end) = clock::prev_login();
     let boot = clock::boot_time();
-    let user = truncate(&shell.username, 8);
+    let user = truncate(&shell.username, USER_COLUMN_WIDTH);
     let from = clock::PREV_LOGIN_FROM;
     let span = prev_end - prev;
     let out = format!(
-        "{user:<8} pts/0        {from:<16} {this}   still logged in\n\
-         {user:<8} pts/0        {from:<16} {prev} - {prev_end} ({hours:02}:{mins:02})\n\
-         reboot   system boot  6.1.0-21-amd64   {boot}   still running\n\
+        "{user:<8} {SESSION_TTY:<12} {from:<16} {this}   still logged in\n\
+         {user:<8} {SESSION_TTY:<12} {from:<16} {prev} - {prev_end} ({hours:02}:{mins:02})\n\
+         reboot   system boot  {KERNEL_RELEASE:<16} {boot}   still running\n\
          \n\
          wtmp begins {wtmp}\n",
-        this = clock::format(shell.login, "%a %b %e %H:%M"),
-        prev = clock::format(prev, "%a %b %e %H:%M"),
-        prev_end = clock::format(prev_end, "%H:%M"),
+        this = clock::format(shell.login, LAST_TIME_FORMAT),
+        prev = clock::format(prev, LAST_TIME_FORMAT),
+        prev_end = clock::format(prev_end, CLOCK_TIME_FORMAT),
         hours = span / 3600,
         mins = (span % 3600) / 60,
-        boot = clock::format(boot, "%a %b %e %H:%M"),
+        boot = clock::format(boot, LAST_TIME_FORMAT),
         wtmp = clock::format(boot, "%a %b %e %H:%M:%S %Y"),
     );
     CommandResult::ok(out)
@@ -590,7 +598,7 @@ pub fn arch(_shell: &Shell, _args: &[String]) -> CommandResult {
 }
 
 pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
-    CommandResult::ok("/dev/pts/0\n")
+    CommandResult::ok(format!("/dev/{SESSION_TTY}\n"))
 }
 
 const LSB_FIELDS: &[(char, &str, &str)] = &[
