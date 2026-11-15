@@ -1,7 +1,7 @@
 use super::MimicHandler;
 use crate::logging::event;
+use crate::network::digest::sha256_hex;
 use crate::network::{scp, sftp};
-use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 
 pub(super) const QUARANTINE_SESSION_MULTIPLIER: u64 = 32;
@@ -152,18 +152,6 @@ impl MimicHandler {
         }
         shell.vfs.path_of(id)
     }
-}
-
-pub(in crate::network) fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-pub(super) fn sha256_hex(data: &[u8]) -> String {
-    hex(&Sha256::digest(data))
 }
 
 pub(super) struct QuarantinedPayload {

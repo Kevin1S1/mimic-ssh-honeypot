@@ -1,3 +1,4 @@
+use super::digest::finish_sha256_hex;
 use crate::shell::Shell;
 use crate::vfs::{Metadata, NodeKind, Vfs, DEFAULT_FILE_MODE, S_IFDIR, S_IFREG};
 use sha2::{Digest, Sha256};
@@ -191,7 +192,7 @@ impl SftpSession {
                             .vfs
                             .add_file(parent, &name, data.clone(), mode, shell.uid, shell.gid);
                     }
-                    let payload_sha256 = super::ssh::hex(&hasher.finalize());
+                    let payload_sha256 = finish_sha256_hex(hasher);
                     completed.push(SftpCompletedUpload {
                         name,
                         dest_path,
@@ -556,7 +557,7 @@ impl SftpSession {
                                 shell.gid,
                             );
                         }
-                        let payload_sha256 = super::ssh::hex(&hasher.finalize());
+                        let payload_sha256 = finish_sha256_hex(hasher);
                         completed.push(SftpCompletedUpload {
                             name,
                             dest_path,

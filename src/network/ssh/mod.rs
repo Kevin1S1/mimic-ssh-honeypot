@@ -5,7 +5,6 @@ mod screen;
 mod server;
 mod terminal;
 
-pub(super) use quarantine::hex;
 pub use server::serve;
 
 use screen::ScreenHold;
