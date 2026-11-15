@@ -86,6 +86,29 @@ const CPUS: &[CpuModel] = &[
     },
 ];
 
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+const SPLITMIX_MUL_1: u64 = 0xBF58_476D_1CE4_E5B9;
+const SPLITMIX_MUL_2: u64 = 0x94D0_49BB_1331_11EB;
+
+const SAMPLE_SEED: u64 = 0x5EED_1234_5678_9ABC;
+
+const ID_HEX_LEN: usize = 32;
+const MAC_TAIL_HEX_LEN: usize = 10;
+const MAC_FIRST_OCTET_CHOICES: u64 = 64;
+const MAC_LOCALLY_ADMINISTERED: u8 = 0b10;
+
+const OCTET_VALUES: u64 = 256;
+const FIRST_HOST_OCTET: u64 = 4;
+const HOST_OCTET_CHOICES: u64 = 250;
+const PRIVATE_172_FIRST: u64 = 16;
+const PRIVATE_172_SPAN: u64 = 16;
+
+const BUFFERS_PER_MILLE: u64 = 13;
+const CACHED_PER_MILLE: u64 = 139;
+const SRECLAIMABLE_PER_MILLE: u64 = 20;
+const FREE_PERCENT: u64 = 73;
+const AVAILABLE_PERCENT: u64 = 86;
+
 const MEM_SIZES_KB: &[u64] = &[1009428, 2041208, 4025464, 8148304, 16373612];
 
 const DISK_SIZES_KB: &[u64] = &[8065444, 16197524, 20263528, 32441516, 40593708, 64891496];
@@ -94,10 +117,10 @@ struct SplitMix64(u64);
 
 impl SplitMix64 {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.0 = self.0.wrapping_add(SPLITMIX_GAMMA);
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX_MUL_1);
+        z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX_MUL_2);
         z ^ (z >> 31)
     }
 
@@ -119,50 +142,14 @@ impl Persona {
     pub fn from_seed(seed: u64) -> Self {
         let mut rng = SplitMix64(seed);
 
-        let machine_id = rng.hex(32);
-        let boot_hex = rng.hex(32);
-        let boot_id = format!(
-            "{}-{}-{}-{}-{}",
-            &boot_hex[0..8],
-            &boot_hex[8..12],
-            &boot_hex[12..16],
-            &boot_hex[16..20],
-            &boot_hex[20..32]
-        );
-
+        let machine_id = rng.hex(ID_HEX_LEN);
+        let boot_id = uuid_from_hex(&rng.hex(ID_HEX_LEN));
         let cpu = CPUS[rng.below(CPUS.len() as u64) as usize];
-
-        let cpu_cores = match rng.below(10) {
-            0..=4 => 1,
-            5..=8 => 2,
-            _ => 4,
-        };
+        let cpu_cores = random_core_count(&mut rng);
         let mem_total_kb = MEM_SIZES_KB[rng.below(MEM_SIZES_KB.len() as u64) as usize];
         let disk_total_kb = DISK_SIZES_KB[rng.below(DISK_SIZES_KB.len() as u64) as usize];
-
-        let mac_tail = rng.hex(10);
-        let first: u8 = (rng.below(64) as u8) << 2 | 0b10;
-        let mac = format!(
-            "{:02x}:{}:{}:{}:{}:{}",
-            first,
-            &mac_tail[0..2],
-            &mac_tail[2..4],
-            &mac_tail[4..6],
-            &mac_tail[6..8],
-            &mac_tail[8..10]
-        );
-
-        let (subnet, host) = match rng.below(3) {
-            0 => (
-                format!("10.{}.{}", rng.below(256), rng.below(256)),
-                rng.below(250) + 4,
-            ),
-            1 => (
-                format!("172.{}.{}", rng.below(16) + 16, rng.below(256)),
-                rng.below(250) + 4,
-            ),
-            _ => (format!("192.168.{}", rng.below(256)), rng.below(250) + 4),
-        };
+        let mac = random_mac(&mut rng);
+        let (subnet, host) = random_subnet_and_host(&mut rng);
         let ipv4 = format!("{subnet}.{host}");
 
         Self {
@@ -185,7 +172,7 @@ impl Persona {
     }
 
     pub fn sample() -> Self {
-        Self::from_seed(0x5EED_1234_5678_9ABC)
+        Self::from_seed(SAMPLE_SEED)
     }
 
     pub fn bogomips(&self) -> String {
@@ -202,15 +189,15 @@ impl Persona {
 
     pub fn memory(&self) -> MemStats {
         let total = self.mem_total_kb;
-        let buffers = total * 13 / 1000;
-        let cached = total * 139 / 1000;
-        let sreclaim = total * 20 / 1000;
-        let free = total * 73 / 100;
+        let buffers = total * BUFFERS_PER_MILLE / 1000;
+        let cached = total * CACHED_PER_MILLE / 1000;
+        let sreclaim = total * SRECLAIMABLE_PER_MILLE / 1000;
+        let free = total * FREE_PERCENT / 100;
         let buff_cache = buffers + cached + sreclaim;
         MemStats {
             total,
             free,
-            available: total * 86 / 100,
+            available: total * AVAILABLE_PERCENT / 100,
             buff_cache,
             used: total.saturating_sub(free).saturating_sub(buff_cache),
         }
@@ -224,6 +211,64 @@ pub struct MemStats {
     pub available: u64,
     pub buff_cache: u64,
     pub used: u64,
+}
+
+fn uuid_from_hex(hex: &str) -> String {
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn random_core_count(rng: &mut SplitMix64) -> u32 {
+    match rng.below(10) {
+        0..=4 => 1,
+        5..=8 => 2,
+        _ => 4,
+    }
+}
+
+fn random_mac(rng: &mut SplitMix64) -> String {
+    let tail = rng.hex(MAC_TAIL_HEX_LEN);
+    let first: u8 = (rng.below(MAC_FIRST_OCTET_CHOICES) as u8) << 2 | MAC_LOCALLY_ADMINISTERED;
+    format!(
+        "{:02x}:{}:{}:{}:{}:{}",
+        first,
+        &tail[0..2],
+        &tail[2..4],
+        &tail[4..6],
+        &tail[6..8],
+        &tail[8..10]
+    )
+}
+
+fn random_subnet_and_host(rng: &mut SplitMix64) -> (String, u64) {
+    match rng.below(3) {
+        0 => (
+            format!("10.{}.{}", rng.below(OCTET_VALUES), rng.below(OCTET_VALUES)),
+            random_host_octet(rng),
+        ),
+        1 => (
+            format!(
+                "172.{}.{}",
+                rng.below(PRIVATE_172_SPAN) + PRIVATE_172_FIRST,
+                rng.below(OCTET_VALUES)
+            ),
+            random_host_octet(rng),
+        ),
+        _ => (
+            format!("192.168.{}", rng.below(OCTET_VALUES)),
+            random_host_octet(rng),
+        ),
+    }
+}
+
+fn random_host_octet(rng: &mut SplitMix64) -> u64 {
+    rng.below(HOST_OCTET_CHOICES) + FIRST_HOST_OCTET
 }
 
 impl Default for Persona {
