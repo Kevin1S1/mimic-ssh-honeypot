@@ -317,10 +317,11 @@ fn take_code(
 }
 
 pub fn env(shell: &Shell, _args: &[String]) -> CommandResult {
-    let mut out = String::new();
-    for (key, value) in shell.env.iter() {
-        out.push_str(&format!("{key}={value}\n"));
-    }
+    let out: String = shell
+        .env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect();
     CommandResult::ok(out)
 }
 
@@ -433,15 +434,11 @@ pub fn which(_shell: &Shell, args: &[String]) -> CommandResult {
     let mut out = String::new();
     let mut status = 0;
     for name in args {
-        if BUILTINS.contains(&name.as_str()) {
-            status = 1;
-        } else if let Some(path) = binary_path(name) {
-            out.push_str(&format!("{path}\n"));
-        } else {
-            status = 1;
+        match binary_path(name) {
+            Some(path) => out.push_str(&format!("{path}\n")),
+            None => status = 1,
         }
     }
-
     CommandResult::streams(out, "", status)
 }
 
