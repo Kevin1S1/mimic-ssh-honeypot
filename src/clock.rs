@@ -1,8 +1,20 @@
 use std::sync::OnceLock;
 
+const SECS_PER_MINUTE: i64 = 60;
+const SECS_PER_HOUR: i64 = 3_600;
+const SECS_PER_DAY: i64 = 86_400;
+
+const DAYS_PER_WEEK: i64 = 7;
+const EPOCH_WEEKDAY: i64 = 4;
+
+const CIVIL_EPOCH_SHIFT_DAYS: i64 = 719_468;
+const DAYS_PER_ERA: i64 = 146_097;
+const YEARS_PER_ERA: i64 = 400;
+const DAYS_BEFORE_MONTH: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
 const BOOT_OFFSET_SECS: i64 = 184_860;
 
-const INSTALL_OFFSET_SECS: i64 = 95 * 86_400;
+const INSTALL_OFFSET_SECS: i64 = 95 * SECS_PER_DAY;
 
 const PREV_LOGIN_OFFSET_SECS: i64 = 3_720;
 
@@ -30,7 +42,7 @@ pub fn install_time() -> i64 {
     static INSTALL: OnceLock<i64> = OnceLock::new();
     *INSTALL.get_or_init(|| {
         let ts = boot_time() - INSTALL_OFFSET_SECS;
-        ts - ts.rem_euclid(86_400)
+        ts - ts.rem_euclid(SECS_PER_DAY)
     })
 }
 
@@ -40,9 +52,9 @@ pub fn prev_login() -> (i64, i64) {
 }
 
 pub fn uptime_phrase(secs: i64) -> String {
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3_600;
-    let mins = (secs % 3_600) / 60;
+    let days = secs / SECS_PER_DAY;
+    let hours = (secs % SECS_PER_DAY) / SECS_PER_HOUR;
+    let mins = (secs % SECS_PER_HOUR) / SECS_PER_MINUTE;
     let unit = if days == 1 { "day" } else { "days" };
     format!("{days} {unit}, {hours:2}:{mins:02}")
 }
@@ -76,31 +88,15 @@ pub struct Tm {
 }
 
 pub fn gmtime(secs: i64) -> Tm {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let hour = (rem / 3600) as u32;
-    let min = ((rem % 3600) / 60) as u32;
-    let sec = (rem % 60) as u32;
+    let days = secs.div_euclid(SECS_PER_DAY);
+    let rem = secs.rem_euclid(SECS_PER_DAY);
+    let hour = (rem / SECS_PER_HOUR) as u32;
+    let min = ((rem % SECS_PER_HOUR) / SECS_PER_MINUTE) as u32;
+    let sec = (rem % SECS_PER_MINUTE) as u32;
 
-    let wday = ((days.rem_euclid(7) + 4) % 7) as u32;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = if month <= 2 { y + 1 } else { y };
-
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    const CUM: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let mut yday = CUM[(month - 1) as usize] + (day - 1);
-    if leap && month > 2 {
-        yday += 1;
-    }
+    let wday = ((days.rem_euclid(DAYS_PER_WEEK) + EPOCH_WEEKDAY) % DAYS_PER_WEEK) as u32;
+    let (year, month, day) = civil_from_days(days);
+    let yday = day_of_year(year, month, day);
 
     Tm {
         year,
@@ -112,6 +108,32 @@ pub fn gmtime(secs: i64) -> Tm {
         wday,
         yday,
     }
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + CIVIL_EPOCH_SHIFT_DAYS;
+    let era = if z >= 0 { z } else { z - (DAYS_PER_ERA - 1) } / DAYS_PER_ERA;
+    let doe = z - era * DAYS_PER_ERA;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / (DAYS_PER_ERA - 1)) / 365;
+    let y = yoe + era * YEARS_PER_ERA;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn day_of_year(year: i64, month: u32, day: u32) -> u32 {
+    let mut yday = DAYS_BEFORE_MONTH[(month - 1) as usize] + (day - 1);
+    if is_leap_year(year) && month > 2 {
+        yday += 1;
+    }
+    yday
 }
 
 pub const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
