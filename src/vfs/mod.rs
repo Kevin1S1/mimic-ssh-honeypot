@@ -5,6 +5,8 @@ pub use nodes::{Metadata, Node, NodeId, NodeKind, S_IFDIR, S_IFLNK, S_IFREG};
 
 use std::collections::BTreeMap;
 
+pub const DEFAULT_FILE_MODE: u32 = 0o644;
+
 const MAX_SYMLINK_DEPTH: usize = 40;
 
 const MAX_VFS_NODES: usize = 2_000;
@@ -307,7 +309,7 @@ impl Vfs {
             self.nodes[existing].meta.mtime = now;
             return existing;
         }
-        let id = self.add_file(parent, name, Vec::new(), 0o644, uid, gid);
+        let id = self.add_file(parent, name, Vec::new(), DEFAULT_FILE_MODE, uid, gid);
         self.nodes[id].meta.mtime = now;
         id
     }

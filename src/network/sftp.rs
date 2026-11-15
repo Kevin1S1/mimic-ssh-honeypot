@@ -1,5 +1,5 @@
 use crate::shell::Shell;
-use crate::vfs::{Metadata, NodeKind, Vfs, S_IFDIR, S_IFREG};
+use crate::vfs::{Metadata, NodeKind, Vfs, DEFAULT_FILE_MODE, S_IFDIR, S_IFREG};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -386,7 +386,11 @@ impl SftpSession {
                 }
 
                 if pflags & SSH_FXF_WRITE != 0 {
-                    let mode = attrs.as_ref().and_then(|a| a.permissions).unwrap_or(0o644) & 0o7777;
+                    let mode = attrs
+                        .as_ref()
+                        .and_then(|a| a.permissions)
+                        .unwrap_or(DEFAULT_FILE_MODE)
+                        & 0o7777;
                     let handle_bytes = self.alloc_handle();
                     self.handles.insert(
                         handle_bytes.clone(),

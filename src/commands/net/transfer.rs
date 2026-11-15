@@ -1,9 +1,8 @@
 use super::{capture_endpoint, fake_resolve, STDOUT_DESTINATION};
 use crate::commands::CommandResult;
 use crate::shell::Shell;
-use crate::vfs::Vfs;
+use crate::vfs::{Vfs, DEFAULT_FILE_MODE};
 
-const NEW_FILE_MODE: u32 = 0o644;
 const DEFAULT_REMOTE_NAME: &str = "index.html";
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x100_0000_01b3;
@@ -66,7 +65,7 @@ fn drop_file(shell: &mut Shell, dest: &str, contents: Vec<u8>) -> (String, u64) 
     let (uid, gid) = (shell.uid, shell.gid);
     let id = shell
         .vfs
-        .add_file(parent, name, contents, NEW_FILE_MODE, uid, gid);
+        .add_file(parent, name, contents, DEFAULT_FILE_MODE, uid, gid);
     let written = shell
         .vfs
         .node(id)

@@ -12,7 +12,7 @@ pub use pending::Pending;
 
 use crate::commands;
 use crate::persona::Persona;
-use crate::vfs::{snapshot, NodeId, Vfs};
+use crate::vfs::{snapshot, NodeId, Vfs, DEFAULT_FILE_MODE};
 use env::Env;
 
 #[derive(Default)]
@@ -97,7 +97,6 @@ const ROOT_UID: u32 = 0;
 const REGULAR_UID: u32 = 1000;
 const SHELL_PID: u32 = 1337;
 const HOME_DIR_MODE: u32 = 0o755;
-const REGULAR_FILE_MODE: u32 = 0o644;
 
 pub struct Shell {
     pub vfs: Vfs,
@@ -298,7 +297,7 @@ impl<'a> Account<'a> {
             home,
             ".bashrc",
             &b"# ~/.bashrc\n"[..],
-            REGULAR_FILE_MODE,
+            DEFAULT_FILE_MODE,
             uid,
             gid,
         );
@@ -306,7 +305,7 @@ impl<'a> Account<'a> {
             home,
             ".profile",
             &b"# ~/.profile\n"[..],
-            REGULAR_FILE_MODE,
+            DEFAULT_FILE_MODE,
             uid,
             gid,
         );
