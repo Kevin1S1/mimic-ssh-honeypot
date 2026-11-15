@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use super::file_read::{read_vfs_file, Access, ReadFailure};
 use super::{CommandResult, MAX_COMMAND_OUTPUT_BYTES};
 use crate::shell::Shell;
 
@@ -26,14 +27,10 @@ pub use sed::sed;
 pub use tr::tr;
 
 fn vfs_file<'a>(shell: &'a Shell, tool: &str, path: &str) -> Result<Cow<'a, [u8]>, String> {
-    let Some(id) = shell.vfs.resolve(shell.cwd, path) else {
-        return Err(format!("{tool}: {path}: No such file or directory\n"));
-    };
-    shell
-        .vfs
-        .node(id)
-        .file_bytes()
-        .ok_or_else(|| format!("{tool}: {path}: Is a directory\n"))
+    read_vfs_file(shell, path, Access::Unchecked).map_err(|failure| match failure {
+        ReadFailure::Missing => format!("{tool}: {path}: No such file or directory\n"),
+        _ => format!("{tool}: {path}: Is a directory\n"),
+    })
 }
 
 fn stdin_text(shell: &Shell) -> String {
