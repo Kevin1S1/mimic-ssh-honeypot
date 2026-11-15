@@ -84,11 +84,7 @@ fn cap(text: &mut String) {
     if text.len() <= MAX_COMMAND_OUTPUT_BYTES {
         return;
     }
-    let mut cut = MAX_COMMAND_OUTPUT_BYTES;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text.truncate(cut);
+    text.truncate(super::floor_char_boundary(text, MAX_COMMAND_OUTPUT_BYTES));
 }
 
 fn split_args(args: &[String]) -> (Vec<&str>, Vec<&str>) {

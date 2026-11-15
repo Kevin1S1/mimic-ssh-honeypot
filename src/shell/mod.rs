@@ -315,16 +315,6 @@ fn push_capped(buf: &mut String, text: &str) {
     commands::truncate_stream(buf, commands::MAX_COMMAND_OUTPUT_BYTES);
 }
 
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    if index >= text.len() {
-        return text.len();
-    }
-    (0..=index)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

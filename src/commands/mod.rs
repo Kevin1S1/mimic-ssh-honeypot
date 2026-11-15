@@ -61,15 +61,21 @@ impl CommandResult {
     }
 }
 
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    (0..=index)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0)
+}
+
 pub(crate) fn truncate_stream(text: &mut String, budget: usize) {
     if text.len() <= budget {
         return;
     }
-    let mut cut = budget;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text.truncate(cut);
+    text.truncate(floor_char_boundary(text, budget));
     text.push_str("\n... (output truncated)\n");
 }
 

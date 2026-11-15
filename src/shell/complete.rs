@@ -1,3 +1,4 @@
+use crate::commands;
 use crate::shell::Shell;
 use crate::vfs::Vfs;
 
@@ -286,10 +287,7 @@ fn longest_common_prefix(items: &[&str]) -> String {
         }
     }
 
-    while end > 0 && !first.is_char_boundary(end) {
-        end -= 1;
-    }
-    first[..end].to_string()
+    first[..commands::floor_char_boundary(first, end)].to_string()
 }
 
 #[cfg(test)]
