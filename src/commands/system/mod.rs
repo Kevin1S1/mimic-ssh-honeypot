@@ -29,7 +29,7 @@ pub fn whoami(shell: &Shell, _args: &[String]) -> CommandResult {
 }
 
 pub fn id(shell: &Shell, _args: &[String]) -> CommandResult {
-    let line = if shell.uid == 0 {
+    let line = if is_root(shell) {
         "uid=0(root) gid=0(root) groups=0(root)\n".to_string()
     } else {
         format!(
@@ -578,7 +578,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 pub fn groups(shell: &Shell, _args: &[String]) -> CommandResult {
-    let line = if shell.uid == 0 {
+    let line = if is_root(shell) {
         "root".to_string()
     } else {
         format!("{} sudo", shell.username)
@@ -670,7 +670,7 @@ const DMESG_BUFFER: &str = "\
 [    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
 
 pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
-    if shell.uid != 0 {
+    if !is_root(shell) {
         return CommandResult::err(
             "dmesg: read kernel buffer failed: Operation not permitted\n",
             1,
