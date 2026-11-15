@@ -42,91 +42,98 @@ pub fn id(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(line)
 }
 
-pub fn uname(shell: &Shell, args: &[String]) -> CommandResult {
-    let mut sysname = false;
-    let mut nodename = false;
-    let mut release = false;
-    let mut version = false;
-    let mut machine = false;
-    let mut operating = false;
-    let mut all = false;
+const UNAME_LONG_FLAGS: &[(&str, char)] = &[
+    ("--all", 'a'),
+    ("--kernel-name", 's'),
+    ("--nodename", 'n'),
+    ("--kernel-release", 'r'),
+    ("--kernel-version", 'v'),
+    ("--machine", 'm'),
+    ("--processor", 'p'),
+    ("--hardware-platform", 'i'),
+    ("--operating-system", 'o'),
+];
 
-    if args.is_empty() {
-        sysname = true;
+#[derive(Default)]
+struct UnameFields {
+    sysname: bool,
+    nodename: bool,
+    release: bool,
+    version: bool,
+    machine: bool,
+    operating: bool,
+}
+
+impl UnameFields {
+    const ALL: Self = Self {
+        sysname: true,
+        nodename: true,
+        release: true,
+        version: true,
+        machine: true,
+        operating: true,
+    };
+
+    fn set(&mut self, flag: char) -> bool {
+        match flag {
+            's' => self.sysname = true,
+            'n' => self.nodename = true,
+            'r' => self.release = true,
+            'v' => self.version = true,
+            'm' | 'p' | 'i' => self.machine = true,
+            'o' => self.operating = true,
+            'a' => *self = Self::ALL,
+            _ => return false,
+        }
+        true
     }
+
+    fn render(&self, hostname: &str) -> String {
+        let parts = [
+            (self.sysname, "Linux"),
+            (self.nodename, hostname),
+            (self.release, KERNEL_RELEASE),
+            (self.version, KERNEL_VERSION),
+            (self.machine, MACHINE),
+            (self.operating, "GNU/Linux"),
+        ];
+        let shown: Vec<&str> = parts
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, value)| *value)
+            .collect();
+        format!("{}\n", shown.join(" "))
+    }
+}
+
+pub fn uname(shell: &Shell, args: &[String]) -> CommandResult {
+    let mut fields = UnameFields {
+        sysname: args.is_empty(),
+        ..UnameFields::default()
+    };
     for arg in args {
-        match arg.as_str() {
-            "-a" | "--all" => all = true,
-            "-s" | "--kernel-name" => sysname = true,
-            "-n" | "--nodename" => nodename = true,
-            "-r" | "--kernel-release" => release = true,
-            "-v" | "--kernel-version" => version = true,
-            "-m" | "--machine" | "-p" | "--processor" | "-i" | "--hardware-platform" => {
-                machine = true
-            }
-            "-o" | "--operating-system" => operating = true,
-            other if other.starts_with('-') && !other.starts_with("--") => {
-                for ch in other[1..].chars() {
-                    match ch {
-                        's' => sysname = true,
-                        'n' => nodename = true,
-                        'r' => release = true,
-                        'v' => version = true,
-                        'm' | 'p' | 'i' => machine = true,
-                        'o' => operating = true,
-                        'a' => all = true,
-                        bad => {
-                            return CommandResult::err(
-                                format!(
-                                    "uname: invalid option -- '{bad}'\nTry 'uname --help' for more information.\n"
-                                ),
-                                1,
-                            );
-                        }
-                    }
-                }
-            }
-            bad => {
+        if let Some(&(_, flag)) = UNAME_LONG_FLAGS
+            .iter()
+            .find(|(long, _)| *long == arg.as_str())
+        {
+            fields.set(flag);
+        } else if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+            if let Some(bad) = cluster.chars().find(|&flag| !fields.set(flag)) {
                 return CommandResult::err(
                     format!(
-                        "uname: extra operand '{bad}'\nTry 'uname --help' for more information.\n"
+                        "uname: invalid option -- '{bad}'\nTry 'uname --help' for more information.\n"
                     ),
                     1,
                 );
             }
+        } else {
+            return CommandResult::err(
+                format!("uname: extra operand '{arg}'\nTry 'uname --help' for more information.\n"),
+                1,
+            );
         }
     }
-
-    if all {
-        return CommandResult::ok(format!(
-            "Linux {host} {rel} {ver} {mach} GNU/Linux\n",
-            host = shell.hostname,
-            rel = KERNEL_RELEASE,
-            ver = KERNEL_VERSION,
-            mach = MACHINE,
-        ));
-    }
-
-    let mut parts: Vec<String> = Vec::new();
-    if sysname {
-        parts.push("Linux".to_string());
-    }
-    if nodename {
-        parts.push(shell.hostname.clone());
-    }
-    if release {
-        parts.push(KERNEL_RELEASE.to_string());
-    }
-    if version {
-        parts.push(KERNEL_VERSION.to_string());
-    }
-    if machine {
-        parts.push(MACHINE.to_string());
-    }
-    if operating {
-        parts.push("GNU/Linux".to_string());
-    }
-    CommandResult::ok(format!("{}\n", parts.join(" ")))
+    CommandResult::ok(fields.render(&shell.hostname))
 }
 
 pub fn hostname(shell: &Shell, _args: &[String]) -> CommandResult {
