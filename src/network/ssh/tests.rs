@@ -5,9 +5,33 @@ use crate::config::AuthConfig;
 use crate::network::limiter::ConnectionRegistry;
 use crate::network::scp::CompletedFile;
 use crate::network::sftp;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use tokio::net::TcpListener;
 use tokio::time::Instant;
+
+type ClientHandle = russh::client::Handle<TestClient>;
+type ClientChannel = russh::Channel<russh::client::Msg>;
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("mimic-{tag}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn handler_with(config: Config, global_quarantine_bytes: Arc<AtomicU64>) -> MimicHandler {
     let max_upload_bytes = config.max_upload_bytes;
@@ -27,7 +51,7 @@ fn handler_with(config: Config, global_quarantine_bytes: Arc<AtomicU64>) -> Mimi
     handler
 }
 
-fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> MimicHandler {
+fn test_handler(quarantine_dir: PathBuf, max_upload_bytes: u64) -> MimicHandler {
     let config = Config {
         quarantine_dir,
         max_upload_bytes,
@@ -36,37 +60,39 @@ fn test_handler(quarantine_dir: std::path::PathBuf, max_upload_bytes: u64) -> Mi
     handler_with(config, Arc::new(AtomicU64::new(0)))
 }
 
-#[test]
-fn quarantine_disk_writes_are_capped_per_session() {
-    let dir = std::env::temp_dir().join(format!(
-        "mimic-quarantine-cap-test-{}-{}",
-        std::process::id(),
-        line!()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+fn scp_file(name: &str, data: Vec<u8>) -> CompletedFile {
+    CompletedFile {
+        name: name.to_string(),
+        rel_dir: String::new(),
+        mode: 0o644,
+        size: data.len() as u64,
+        data,
+        payload_sha256: String::new(),
+        truncated: false,
+    }
+}
+
+fn disk_usage(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("quarantine dir created")
+        .filter_map(|e| e.ok())
+        .map(|e| e.metadata().expect("metadata").len())
+        .sum()
+}
+
+fn assert_session_cap_holds(tag: &str, mut store: impl FnMut(&mut MimicHandler, u64, Vec<u8>)) {
+    let dir = TestDir::new(tag);
     let max_upload_bytes = 1024u64;
-    let mut handler = test_handler(dir.clone(), max_upload_bytes);
+    let mut handler = test_handler(dir.path().to_path_buf(), max_upload_bytes);
     let cap = max_upload_bytes * QUARANTINE_SESSION_MULTIPLIER;
 
     let file_size: usize = 1000;
     let num_files = (cap / file_size as u64) + 5;
     for i in 0..num_files {
-        handler.store_upload(CompletedFile {
-            name: format!("f{i}"),
-            rel_dir: String::new(),
-            mode: 0o644,
-            data: vec![i as u8; file_size],
-            size: file_size as u64,
-            payload_sha256: String::new(),
-            truncated: false,
-        });
+        store(&mut handler, i, vec![i as u8; file_size]);
     }
 
-    let total_on_disk: u64 = std::fs::read_dir(&dir)
-        .expect("quarantine dir created")
-        .filter_map(|e| e.ok())
-        .map(|e| e.metadata().expect("metadata").len())
-        .sum();
+    let total_on_disk = disk_usage(dir.path());
     assert!(
         total_on_disk <= cap,
         "quarantine disk usage {total_on_disk} exceeded session cap {cap}"
@@ -76,68 +102,39 @@ fn quarantine_disk_writes_are_capped_per_session() {
         "tracked quarantine_bytes {} exceeded cap {cap}",
         handler.quarantine_store.session_bytes()
     );
+}
 
-    let _ = std::fs::remove_dir_all(&dir);
+#[test]
+fn quarantine_disk_writes_are_capped_per_session() {
+    assert_session_cap_holds("quarantine-cap", |handler, i, data| {
+        handler.store_upload(scp_file(&format!("f{i}"), data));
+    });
 }
 
 #[test]
 fn sftp_quarantine_disk_writes_are_capped_per_session() {
-    let dir = std::env::temp_dir().join(format!(
-        "mimic-sftp-quarantine-cap-test-{}-{}",
-        std::process::id(),
-        line!()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    let max_upload_bytes = 1024u64;
-    let mut handler = test_handler(dir.clone(), max_upload_bytes);
-    let cap = max_upload_bytes * QUARANTINE_SESSION_MULTIPLIER;
-
-    let file_size: usize = 1000;
-    let num_files = (cap / file_size as u64) + 5;
-    for i in 0..num_files {
+    assert_session_cap_holds("sftp-quarantine-cap", |handler, i, data| {
         handler.store_sftp_upload(sftp::SftpCompletedUpload {
             name: format!("sftp_f{i}"),
             dest_path: format!("/tmp/sftp_f{i}"),
             mode: 0o644,
-            data: vec![i as u8; file_size],
-            size: file_size as u64,
+            size: data.len() as u64,
+            data,
             payload_sha256: String::new(),
             truncated: false,
         });
-    }
-
-    let total_on_disk: u64 = std::fs::read_dir(&dir)
-        .expect("quarantine dir created")
-        .filter_map(|e| e.ok())
-        .map(|e| e.metadata().expect("metadata").len())
-        .sum();
-    assert!(
-        total_on_disk <= cap,
-        "quarantine disk usage {total_on_disk} exceeded session cap {cap}"
-    );
-    assert!(
-        handler.quarantine_store.session_bytes() <= cap,
-        "tracked quarantine_bytes {} exceeded cap {cap}",
-        handler.quarantine_store.session_bytes()
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[test]
 fn quarantine_disk_writes_are_capped_globally() {
-    let dir = std::env::temp_dir().join(format!(
-        "mimic-quarantine-global-cap-test-{}-{}",
-        std::process::id(),
-        line!()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::new("quarantine-global-cap");
     let max_upload_bytes = 1024u64;
     let global_cap = 2000u64;
     let shared_global = Arc::new(AtomicU64::new(0));
 
     let config = || Config {
-        quarantine_dir: dir.clone(),
+        quarantine_dir: dir.path().to_path_buf(),
         max_upload_bytes,
         quarantine_max_total_bytes: Some(global_cap),
         ..Config::default()
@@ -145,48 +142,16 @@ fn quarantine_disk_writes_are_capped_globally() {
     let mut handler1 = handler_with(config(), Arc::clone(&shared_global));
     let mut handler2 = handler_with(config(), Arc::clone(&shared_global));
 
-    handler1.store_upload(CompletedFile {
-        name: "h1_file".to_string(),
-        rel_dir: String::new(),
-        mode: 0o644,
-        data: vec![1u8; 1000],
-        size: 1000,
-        payload_sha256: String::new(),
-        truncated: false,
-    });
+    handler1.store_upload(scp_file("h1_file", vec![1u8; 1000]));
+    handler2.store_upload(scp_file("h2_file1", vec![2u8; 1000]));
+    handler2.store_upload(scp_file("h2_file2", vec![3u8; 1000]));
 
-    handler2.store_upload(CompletedFile {
-        name: "h2_file1".to_string(),
-        rel_dir: String::new(),
-        mode: 0o644,
-        data: vec![2u8; 1000],
-        size: 1000,
-        payload_sha256: String::new(),
-        truncated: false,
-    });
-
-    handler2.store_upload(CompletedFile {
-        name: "h2_file2".to_string(),
-        rel_dir: String::new(),
-        mode: 0o644,
-        data: vec![3u8; 1000],
-        size: 1000,
-        payload_sha256: String::new(),
-        truncated: false,
-    });
-
-    let total_on_disk: u64 = std::fs::read_dir(&dir)
-        .expect("quarantine dir created")
-        .filter_map(|e| e.ok())
-        .map(|e| e.metadata().expect("metadata").len())
-        .sum();
+    let total_on_disk = disk_usage(dir.path());
     assert!(
         total_on_disk <= global_cap,
         "quarantine disk usage {total_on_disk} exceeded global cap {global_cap}"
     );
     assert_eq!(total_on_disk, 2000);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -249,72 +214,8 @@ impl russh::client::Handler for TestClient {
     }
 }
 
-#[tokio::test]
-async fn session_cap_disconnects_a_live_session() {
-    const CAP_SECS: u64 = 1;
-
-    let dir = std::env::temp_dir().join(format!("mimic-session-cap-test-{}", std::process::id()));
-
-    let probe = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("probe bind");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-
-    let config = Config {
-        listen_addr: "127.0.0.1".parse().expect("loopback"),
-        port,
-        max_session_secs: CAP_SECS,
-
-        idle_timeout_secs: 600,
-        host_key_dir: dir.join("host_keys"),
-        quarantine_dir: dir.join("quarantine"),
-        ..Config::default()
-    };
-    tokio::spawn(async move {
-        let _ = serve(Arc::new(config)).await;
-    });
-
-    let client_config = Arc::new(russh::client::Config::default());
-    let mut handle = loop {
-        match russh::client::connect(Arc::clone(&client_config), ("127.0.0.1", port), TestClient)
-            .await
-        {
-            Ok(handle) => break handle,
-
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
-    };
-    assert!(handle
-        .authenticate_password("root", "hunter2")
-        .await
-        .expect("auth request")
-        .success());
-
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.request_shell(true).await.expect("shell request");
-
-    let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while channel.wait().await.is_some() {}
-    })
-    .await
-    .expect("session outlived max_session_secs");
-
-    assert!(
-        started.elapsed() >= Duration::from_secs(CAP_SECS).saturating_sub(Duration::from_millis(200)),
-        "session ended after {:?}, before the {CAP_SECS}s cap — something other than the cap closed it",
-        started.elapsed()
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mimic-{tag}-test-{}", std::process::id()));
+async fn honeypot_with(tag: &str, max_session_secs: u64) -> (ClientHandle, TestDir) {
+    let dir = TestDir::new(tag);
     let probe = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("probe bind");
@@ -326,9 +227,9 @@ async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::P
         port,
 
         idle_timeout_secs: 600,
-        max_session_secs: 1800,
-        host_key_dir: dir.join("host_keys"),
-        quarantine_dir: dir.join("quarantine"),
+        max_session_secs,
+        host_key_dir: dir.path().join("host_keys"),
+        quarantine_dir: dir.path().join("quarantine"),
         ..Config::default()
     };
     tokio::spawn(async move {
@@ -353,34 +254,59 @@ async fn honeypot(tag: &str) -> (russh::client::Handle<TestClient>, std::path::P
     (handle, dir)
 }
 
-async fn shell_session(
-    tag: &str,
-) -> (
-    russh::client::Handle<TestClient>,
-    russh::Channel<russh::client::Msg>,
-    std::path::PathBuf,
-) {
-    let (handle, dir) = honeypot(tag).await;
-    let channel = handle
+async fn honeypot(tag: &str) -> (ClientHandle, TestDir) {
+    honeypot_with(tag, 1800).await
+}
+
+async fn open_channel(handle: &ClientHandle) -> ClientChannel {
+    handle
         .channel_open_session()
         .await
-        .expect("session channel");
+        .expect("session channel")
+}
+
+async fn request_pty(channel: &ClientChannel) {
     channel
         .request_pty(true, "xterm", 80, 24, 0, 0, &[])
         .await
         .expect("pty request");
+}
+
+async fn shell_session(tag: &str) -> (ClientHandle, ClientChannel, TestDir) {
+    let (handle, dir) = honeypot(tag).await;
+    let channel = open_channel(&handle).await;
+    request_pty(&channel).await;
     channel.request_shell(true).await.expect("shell request");
     (handle, channel, dir)
 }
 
-async fn drain_until_closed(
-    channel: &mut russh::Channel<russh::client::Msg>,
-) -> (Vec<u8>, Option<u32>) {
+async fn pipe_shell_session(tag: &str) -> (ClientHandle, ClientChannel, TestDir) {
+    let (handle, dir) = honeypot(tag).await;
+    let channel = open_channel(&handle).await;
+    channel.request_shell(true).await.expect("shell request");
+    (handle, channel, dir)
+}
+
+async fn exec_session(
+    tag: &str,
+    command: &[u8],
+    pty: bool,
+) -> (ClientHandle, ClientChannel, TestDir) {
+    let (handle, dir) = honeypot(tag).await;
+    let channel = open_channel(&handle).await;
+    if pty {
+        request_pty(&channel).await;
+    }
+    channel.exec(true, command).await.expect("exec");
+    (handle, channel, dir)
+}
+
+async fn drain_until_closed(channel: &mut ClientChannel) -> (Vec<u8>, Option<u32>) {
     let (seen, _, status) = drain_streams(channel).await;
     (seen, status)
 }
 
-async fn read_for(channel: &mut russh::Channel<russh::client::Msg>, window: Duration) -> Vec<u8> {
+async fn read_for(channel: &mut ClientChannel, window: Duration) -> Vec<u8> {
     let mut seen = Vec::new();
     let _ = tokio::time::timeout(window, async {
         while let Some(msg) = channel.wait().await {
@@ -393,9 +319,11 @@ async fn read_for(channel: &mut russh::Channel<russh::client::Msg>, window: Dura
     seen
 }
 
-async fn drain_streams(
-    channel: &mut russh::Channel<russh::client::Msg>,
-) -> (Vec<u8>, Vec<u8>, Option<u32>) {
+async fn read_text(channel: &mut ClientChannel, window: Duration) -> String {
+    String::from_utf8_lossy(&read_for(channel, window).await).into_owned()
+}
+
+async fn drain_streams(channel: &mut ClientChannel) -> (Vec<u8>, Vec<u8>, Option<u32>) {
     let mut seen = Vec::new();
     let mut errs = Vec::new();
     let mut status = None;
@@ -419,8 +347,30 @@ async fn drain_streams(
 }
 
 #[tokio::test]
+async fn session_cap_disconnects_a_live_session() {
+    const CAP_SECS: u64 = 1;
+
+    let (handle, _dir) = honeypot_with("session-cap", CAP_SECS).await;
+    let mut channel = open_channel(&handle).await;
+    channel.request_shell(true).await.expect("shell request");
+
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while channel.wait().await.is_some() {}
+    })
+    .await
+    .expect("session outlived max_session_secs");
+
+    assert!(
+        started.elapsed() >= Duration::from_secs(CAP_SECS).saturating_sub(Duration::from_millis(200)),
+        "session ended after {:?}, before the {CAP_SECS}s cap — something other than the cap closed it",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn ctrl_d_logs_out_and_ends_the_session() {
-    let (_handle, mut channel, dir) = shell_session("ctrl-d").await;
+    let (_handle, mut channel, _dir) = shell_session("ctrl-d").await;
 
     channel.data(&b"\x04"[..]).await.expect("send ctrl-d");
     let (seen, status) = drain_until_closed(&mut channel).await;
@@ -431,13 +381,11 @@ async fn ctrl_d_logs_out_and_ends_the_session() {
         "expected the session to end with a logout line, got {tail:?}"
     );
     assert_eq!(status, Some(0), "missing exit status");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn client_eof_ends_the_session() {
-    let (_handle, mut channel, dir) = shell_session("client-eof").await;
+    let (_handle, mut channel, _dir) = shell_session("client-eof").await;
 
     channel.eof().await.expect("send eof");
     let (seen, status) = drain_until_closed(&mut channel).await;
@@ -448,13 +396,11 @@ async fn client_eof_ends_the_session() {
         "expected the session to end with a logout line, got {tail:?}"
     );
     assert_eq!(status, Some(0), "missing exit status");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exit_reports_a_status() {
-    let (_handle, mut channel, dir) = shell_session("shell-exit").await;
+    let (_handle, mut channel, _dir) = shell_session("shell-exit").await;
 
     channel.data(&b"exit 42\r"[..]).await.expect("send exit");
     let (seen, status) = drain_until_closed(&mut channel).await;
@@ -465,94 +411,51 @@ async fn exit_reports_a_status() {
         "expected the session to end with a logout line, got {tail:?}"
     );
     assert_eq!(status, Some(42), "missing exit status");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exec_without_a_pty_sends_bare_lf() {
-    let (handle, dir) = honeypot("exec-lf").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.exec(true, &b"echo hello"[..]).await.expect("exec");
+    let (_handle, mut channel, _dir) = exec_session("exec-lf", b"echo hello", false).await;
 
     let (seen, status) = drain_until_closed(&mut channel).await;
 
     assert_eq!(seen, b"hello\n", "exec output should be LF-terminated");
     assert_eq!(status, Some(0), "missing exit status");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exec_with_a_pty_still_sends_crlf() {
-    let (handle, dir) = honeypot("exec-crlf").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel
-        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
-        .await
-        .expect("pty request");
-    channel.exec(true, &b"echo hello"[..]).await.expect("exec");
+    let (_handle, mut channel, _dir) = exec_session("exec-crlf", b"echo hello", true).await;
 
     let (seen, _) = drain_until_closed(&mut channel).await;
 
     assert_eq!(seen, b"hello\r\n", "a PTY exec should be CRLF-terminated");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exec_without_a_pty_sends_errors_as_extended_data() {
-    let (handle, dir) = honeypot("exec-stderr").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.exec(true, &b"nosuchcmd"[..]).await.expect("exec");
+    let (_handle, mut channel, _dir) = exec_session("exec-stderr", b"nosuchcmd", false).await;
 
     let (seen, errs, status) = drain_streams(&mut channel).await;
 
     assert_eq!(seen, b"", "an error must not reach stdout");
     assert_eq!(errs, b"-bash: nosuchcmd: command not found\n");
     assert_eq!(status, Some(127), "missing exit status");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_pty_channel_sends_no_extended_data() {
-    let (handle, dir) = honeypot("pty-stderr").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel
-        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
-        .await
-        .expect("pty request");
-    channel.exec(true, &b"nosuchcmd"[..]).await.expect("exec");
+    let (_handle, mut channel, _dir) = exec_session("pty-stderr", b"nosuchcmd", true).await;
 
     let (seen, errs, _) = drain_streams(&mut channel).await;
 
     assert_eq!(seen, b"-bash: nosuchcmd: command not found\r\n");
     assert!(errs.is_empty(), "a PTY channel has no second stream");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_shell_without_a_pty_runs_no_line_editor() {
-    let (handle, dir) = honeypot("no-pty-shell").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.request_shell(true).await.expect("shell request");
+    let (_handle, mut channel, _dir) = pipe_shell_session("no-pty-shell").await;
     channel
         .data(&b"echo one\nwhoami\nls /nope\nexit\n"[..])
         .await
@@ -577,20 +480,17 @@ async fn a_shell_without_a_pty_runs_no_line_editor() {
     );
 
     assert_eq!(status, Some(2), "missing exit status");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn top_holds_the_screen_until_q() {
-    let (_handle, mut channel, dir) = shell_session("top-hold").await;
+    let (_handle, mut channel, _dir) = shell_session("top-hold").await;
 
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel.data(&b"top\r"[..]).await.expect("send top");
 
-    let held = read_for(&mut channel, SCREEN_REFRESH + Duration::from_secs(2)).await;
-    let held = String::from_utf8_lossy(&held).into_owned();
+    let held = read_text(&mut channel, SCREEN_REFRESH + Duration::from_secs(2)).await;
 
     let frames = held.matches("Tasks:").count();
     assert!(
@@ -606,8 +506,7 @@ async fn top_holds_the_screen_until_q() {
     );
 
     channel.data(&b"q"[..]).await.expect("send q");
-    let after = read_for(&mut channel, Duration::from_millis(400)).await;
-    let after = String::from_utf8_lossy(&after).into_owned();
+    let after = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(
         after.contains("root@debian"),
         "no prompt after q: {after:?}"
@@ -619,13 +518,11 @@ async fn top_holds_the_screen_until_q() {
         "the redraw timer outlived the display: {:?}",
         String::from_utf8_lossy(&quiet)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn vi_holds_the_screen_until_colon_quit() {
-    let (_handle, mut channel, dir) = shell_session("vi-hold").await;
+    let (_handle, mut channel, _dir) = shell_session("vi-hold").await;
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel
@@ -635,8 +532,7 @@ async fn vi_holds_the_screen_until_colon_quit() {
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel.data(&b"vi f.txt\r"[..]).await.expect("send vi");
-    let held = read_for(&mut channel, Duration::from_millis(400)).await;
-    let held = String::from_utf8_lossy(&held).into_owned();
+    let held = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(held.contains("hello"), "file contents missing: {held:?}");
     assert!(held.contains("~\r\n"), "no filler rows: {held:?}");
     assert!(
@@ -645,8 +541,7 @@ async fn vi_holds_the_screen_until_colon_quit() {
     );
 
     channel.data(&b":q!\r"[..]).await.expect("send :q!");
-    let after = read_for(&mut channel, Duration::from_millis(400)).await;
-    let after = String::from_utf8_lossy(&after).into_owned();
+    let after = read_text(&mut channel, Duration::from_millis(400)).await;
     let clear_at = after.find(SCREEN_HOME);
     let prompt_at = after.find("root@debian");
     assert!(
@@ -662,13 +557,11 @@ async fn vi_holds_the_screen_until_colon_quit() {
         !after.contains("~\r\n"),
         "vi's buffer view leaked past the quit: {after:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn nano_holds_the_screen_until_ctrl_x() {
-    let (_handle, mut channel, dir) = shell_session("nano-hold").await;
+    let (_handle, mut channel, _dir) = shell_session("nano-hold").await;
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel
@@ -678,8 +571,7 @@ async fn nano_holds_the_screen_until_ctrl_x() {
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel.data(&b"nano f.txt\r"[..]).await.expect("send nano");
-    let held = read_for(&mut channel, Duration::from_millis(400)).await;
-    let held = String::from_utf8_lossy(&held).into_owned();
+    let held = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(held.contains("GNU nano"), "no title bar: {held:?}");
     assert!(held.contains("f.txt"), "no filename in the title: {held:?}");
     assert!(held.contains("^X Exit"), "no shortcut bar: {held:?}");
@@ -689,8 +581,7 @@ async fn nano_holds_the_screen_until_ctrl_x() {
     );
 
     channel.data(&b"\x18"[..]).await.expect("send ctrl-x");
-    let after = read_for(&mut channel, Duration::from_millis(400)).await;
-    let after = String::from_utf8_lossy(&after).into_owned();
+    let after = read_text(&mut channel, Duration::from_millis(400)).await;
     let clear_at = after.find(SCREEN_HOME);
     let prompt_at = after.find("root@debian");
     assert!(
@@ -702,29 +593,25 @@ async fn nano_holds_the_screen_until_ctrl_x() {
         clear_at < prompt_at,
         "screen not cleared before the prompt: {after:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn nc_listen_holds_the_screen_until_ctrl_c() {
-    let (_handle, mut channel, dir) = shell_session("nc-listen-hold").await;
+    let (_handle, mut channel, _dir) = shell_session("nc-listen-hold").await;
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel
         .data(&b"nc -l 4444\r"[..])
         .await
         .expect("send nc -l");
-    let held = read_for(&mut channel, Duration::from_millis(400)).await;
-    let held = String::from_utf8_lossy(&held).into_owned();
+    let held = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(
         !held.contains("root@debian"),
         "prompt drawn while listening: {held:?}"
     );
 
     channel.data(&b"\x03"[..]).await.expect("send ctrl-c");
-    let after = read_for(&mut channel, Duration::from_millis(400)).await;
-    let after = String::from_utf8_lossy(&after).into_owned();
+    let after = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(after.contains("^C\r\n"), "no ^C echo: {after:?}");
     assert!(
         !after.contains(SCREEN_HOME),
@@ -734,13 +621,11 @@ async fn nc_listen_holds_the_screen_until_ctrl_c() {
         after.contains("root@debian"),
         "no prompt after Ctrl-C: {after:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn screen_holds_do_not_leak_state_into_the_next_one() {
-    let (_handle, mut channel, dir) = shell_session("screen-hold-chain").await;
+    let (_handle, mut channel, _dir) = shell_session("screen-hold-chain").await;
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel
@@ -752,15 +637,13 @@ async fn screen_holds_do_not_leak_state_into_the_next_one() {
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel.data(&b"top\r"[..]).await.expect("send top");
-    let held = read_for(&mut channel, Duration::from_millis(400)).await;
-    let held = String::from_utf8_lossy(&held).into_owned();
+    let held = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(
         held.contains("Tasks:"),
         "top after nc -l should paint normally: {held:?}"
     );
     channel.data(&b"q"[..]).await.expect("send q");
-    let after_top = read_for(&mut channel, Duration::from_millis(400)).await;
-    let after_top = String::from_utf8_lossy(&after_top).into_owned();
+    let after_top = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(
         after_top.contains("root@debian"),
         "top after nc -l should still quit on q: {after_top:?}"
@@ -770,44 +653,37 @@ async fn screen_holds_do_not_leak_state_into_the_next_one() {
         .data(&b"vi missing.txt\r"[..])
         .await
         .expect("send vi");
-    let held = read_for(&mut channel, Duration::from_millis(400)).await;
-    let held = String::from_utf8_lossy(&held).into_owned();
+    let held = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(
         held.contains("[New File]"),
         "vi after top should paint normally: {held:?}"
     );
 
     channel.data(&b"q"[..]).await.expect("send q (ignored)");
-    let ignored = read_for(&mut channel, Duration::from_millis(300)).await;
-    let ignored = String::from_utf8_lossy(&ignored).into_owned();
+    let ignored = read_text(&mut channel, Duration::from_millis(300)).await;
     assert!(
         !ignored.contains("root@debian"),
         "vi quit on top's key, not its own: {ignored:?}"
     );
     channel.data(&b":q!\r"[..]).await.expect("send :q!");
-    let after_vi = read_for(&mut channel, Duration::from_millis(400)).await;
-    let after_vi = String::from_utf8_lossy(&after_vi).into_owned();
+    let after_vi = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(
         after_vi.contains("root@debian"),
         "vi after top should still quit on :q!: {after_vi:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn passwd_suppresses_echo_for_both_prompts() {
-    let (_handle, mut channel, dir) = shell_session("passwd-echo").await;
+    let (_handle, mut channel, _dir) = shell_session("passwd-echo").await;
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel.data(&b"passwd\r"[..]).await.expect("send passwd");
-    let first = read_for(&mut channel, Duration::from_millis(300)).await;
-    let first = String::from_utf8_lossy(&first).into_owned();
+    let first = read_text(&mut channel, Duration::from_millis(300)).await;
     assert!(first.contains("New password: "), "{first:?}");
 
     channel.data(&b"hunter2\r"[..]).await.expect("first answer");
-    let second = read_for(&mut channel, Duration::from_millis(300)).await;
-    let second = String::from_utf8_lossy(&second).into_owned();
+    let second = read_text(&mut channel, Duration::from_millis(300)).await;
     assert!(
         second.contains("Retype new password: "),
         "second prompt missing: {second:?}"
@@ -825,24 +701,16 @@ async fn passwd_suppresses_echo_for_both_prompts() {
         .data(&b"hunter2\r"[..])
         .await
         .expect("second answer");
-    let done = read_for(&mut channel, Duration::from_millis(300)).await;
-    let done = String::from_utf8_lossy(&done).into_owned();
+    let done = read_text(&mut channel, Duration::from_millis(300)).await;
     assert!(done.contains("updated successfully"), "{done:?}");
     assert!(!done.contains("hunter2"), "the secret was echoed: {done:?}");
 
     assert!(done.contains("root@debian"), "no prompt after: {done:?}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exec_top_prints_once_and_exits() {
-    let (handle, dir) = honeypot("exec-top").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.exec(true, &b"top"[..]).await.expect("exec");
+    let (_handle, mut channel, _dir) = exec_session("exec-top", b"top", false).await;
 
     let (seen, _, status) = drain_streams(&mut channel).await;
     let out = String::from_utf8_lossy(&seen);
@@ -854,21 +722,18 @@ async fn exec_top_prints_once_and_exits() {
     );
     assert!(!out.contains(SCREEN_HOME), "exec should not paint a screen");
     assert_eq!(status, Some(0));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_heredoc_collects_its_body_under_a_pty() {
-    let (_handle, mut channel, dir) = shell_session("heredoc-pty").await;
+    let (_handle, mut channel, _dir) = shell_session("heredoc-pty").await;
     read_for(&mut channel, Duration::from_millis(300)).await;
 
     channel
         .data(&b"cat << EOF > /tmp/x\r"[..])
         .await
         .expect("open");
-    let prompt = read_for(&mut channel, Duration::from_millis(400)).await;
-    let prompt = String::from_utf8_lossy(&prompt).into_owned();
+    let prompt = read_text(&mut channel, Duration::from_millis(400)).await;
     assert!(prompt.contains("> "), "no PS2 continuation: {prompt:?}");
     assert!(
         !prompt.contains("root@debian"),
@@ -882,24 +747,16 @@ async fn a_heredoc_collects_its_body_under_a_pty() {
     read_for(&mut channel, Duration::from_millis(400)).await;
 
     channel.data(&b"cat /tmp/x\r"[..]).await.expect("read back");
-    let seen = read_for(&mut channel, Duration::from_millis(500)).await;
-    let seen = String::from_utf8_lossy(&seen).into_owned();
+    let seen = read_text(&mut channel, Duration::from_millis(500)).await;
     assert!(
         seen.contains("line one\r\nline two\r\n"),
         "body did not reach the file: {seen:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_heredoc_collects_its_body_over_a_pipe() {
-    let (handle, dir) = honeypot("heredoc-pipe").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.request_shell(true).await.expect("shell request");
+    let (_handle, mut channel, _dir) = pipe_shell_session("heredoc-pipe").await;
     channel
         .data(&b"cat << EOF\npayload\nEOF\necho after\n"[..])
         .await
@@ -915,18 +772,11 @@ async fn a_heredoc_collects_its_body_over_a_pipe() {
         "a PS2 leaked onto a channel with no pty"
     );
     assert_eq!(status, Some(0));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exec_heredoc_ends_at_end_of_input() {
-    let (handle, dir) = honeypot("heredoc-exec").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.exec(true, &b"cat << EOF"[..]).await.expect("exec");
+    let (_handle, mut channel, _dir) = exec_session("heredoc-exec", b"cat << EOF", false).await;
 
     let (seen, errs, status) = drain_streams(&mut channel).await;
 
@@ -937,38 +787,22 @@ async fn exec_heredoc_ends_at_end_of_input() {
         String::from_utf8_lossy(&errs)
     );
     assert_eq!(status, Some(0));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn exec_exit_prints_no_logout() {
-    let (handle, dir) = honeypot("exec-exit-quiet").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel
-        .exec(true, &b"echo a; exit 3"[..])
-        .await
-        .expect("exec");
+    let (_handle, mut channel, _dir) =
+        exec_session("exec-exit-quiet", b"echo a; exit 3", false).await;
 
     let (seen, _, status) = drain_streams(&mut channel).await;
 
     assert_eq!(seen, b"a\n", "an exec channel announced a logout");
     assert_eq!(status, Some(3), "exit status lost");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_shell_without_a_pty_runs_an_unterminated_last_line() {
-    let (handle, dir) = honeypot("no-pty-partial").await;
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    channel.request_shell(true).await.expect("shell request");
+    let (_handle, mut channel, _dir) = pipe_shell_session("no-pty-partial").await;
     channel.data(&b"echo tail"[..]).await.expect("send script");
     channel.eof().await.expect("send eof");
 
@@ -977,34 +811,21 @@ async fn a_shell_without_a_pty_runs_an_unterminated_last_line() {
 
     assert!(out.ends_with("tail\n"), "last line did not run: {out:?}");
     assert_eq!(status, Some(0));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_later_exec_channel_does_not_inherit_the_pty() {
-    let (handle, dir) = honeypot("exec-after-shell").await;
+    let (handle, _dir) = honeypot("exec-after-shell").await;
 
-    let mut shell = handle
-        .channel_open_session()
-        .await
-        .expect("session channel");
-    shell
-        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
-        .await
-        .expect("pty request");
+    let mut shell = open_channel(&handle).await;
+    request_pty(&shell).await;
     shell.request_shell(true).await.expect("shell request");
     shell.data(&b"\x04"[..]).await.expect("send ctrl-d");
     drain_until_closed(&mut shell).await;
 
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .expect("second session channel");
+    let mut channel = open_channel(&handle).await;
     channel.exec(true, &b"echo hello"[..]).await.expect("exec");
     let (seen, _) = drain_until_closed(&mut channel).await;
 
     assert_eq!(seen, b"hello\n", "the PTY leaked into a later exec channel");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
