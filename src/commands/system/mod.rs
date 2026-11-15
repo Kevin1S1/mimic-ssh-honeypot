@@ -598,58 +598,36 @@ pub fn tty(_shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok("/dev/pts/0\n")
 }
 
+const LSB_FIELDS: &[(char, &str, &str)] = &[
+    ('i', "Distributor ID", "Debian"),
+    ('d', "Description", "Debian GNU/Linux 12 (bookworm)"),
+    ('r', "Release", "12"),
+    ('c', "Codename", "bookworm"),
+];
+
 pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
-    let (mut want_i, mut want_d, mut want_r, mut want_c) = (false, false, false, false);
-    let mut short = false;
-    let mut all = false;
-
-    for arg in args {
-        if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
-            for ch in arg[1..].chars() {
-                match ch {
-                    'a' => all = true,
-                    's' => short = true,
-                    'i' => want_i = true,
-                    'd' => want_d = true,
-                    'r' => want_r = true,
-                    'c' => want_c = true,
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let full = all || !(want_i || want_d || want_r || want_c);
-    if full {
-        want_i = true;
-        want_d = true;
-        want_r = true;
-        want_c = true;
-    }
+    let flags: Vec<char> = args
+        .iter()
+        .filter_map(|arg| arg.strip_prefix('-'))
+        .filter(|cluster| !cluster.is_empty() && !cluster.starts_with('-'))
+        .flat_map(str::chars)
+        .collect();
+    let short = flags.contains(&'s');
+    let full = flags.contains(&'a') || !LSB_FIELDS.iter().any(|(flag, _, _)| flags.contains(flag));
 
     let mut out = String::new();
     if full && !short {
         out.push_str("No LSB modules are available.\n");
     }
-    let mut push = |label: &str, value: &str| {
+    for (_, label, value) in LSB_FIELDS
+        .iter()
+        .filter(|(flag, _, _)| full || flags.contains(flag))
+    {
         if short {
-            out.push_str(value);
-            out.push('\n');
+            out.push_str(&format!("{value}\n"));
         } else {
             out.push_str(&format!("{label}:\t{value}\n"));
         }
-    };
-    if want_i {
-        push("Distributor ID", "Debian");
-    }
-    if want_d {
-        push("Description", "Debian GNU/Linux 12 (bookworm)");
-    }
-    if want_r {
-        push("Release", "12");
-    }
-    if want_c {
-        push("Codename", "bookworm");
     }
     CommandResult::ok(out)
 }
