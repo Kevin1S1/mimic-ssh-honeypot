@@ -194,6 +194,10 @@ impl Shell {
         }
     }
 
+    pub fn is_interactive_tty(&self) -> bool {
+        self.interactive && self.stdout_is_tty
+    }
+
     pub const MAX_HISTORY: usize = 1000;
 
     pub fn record_history(&mut self, line: &str) {

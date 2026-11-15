@@ -108,7 +108,7 @@ fn open_editor(shell: &Shell, kind: EditorKind, arg: Option<&str>) -> EditorScre
 }
 
 fn open_screen(shell: &mut Shell, kind: EditorKind, args: &[String]) -> CommandResult {
-    if !(shell.interactive && shell.stdout_is_tty) {
+    if !shell.is_interactive_tty() {
         return CommandResult::empty();
     }
     let arg = args
