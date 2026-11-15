@@ -1,5 +1,5 @@
 use super::terminal::{BACKSPACE, CTRL_C, CTRL_X, DELETE, ESC};
-use super::MimicHandler;
+use super::{encode_output, MimicHandler};
 use crate::shell::Screen;
 use russh::keys::ssh_encoding::bytes::Bytes;
 use russh::server::Session;
@@ -88,11 +88,7 @@ impl MimicHandler {
                     loop {
                         ticker.tick().await;
                         let frame = format!("{SCREEN_HOME}{}", top.render());
-                        let bytes = if pty {
-                            frame.replace('\n', "\r\n").into_bytes()
-                        } else {
-                            frame.into_bytes()
-                        };
+                        let bytes = encode_output(&frame, pty);
                         if handle.data(channel, Bytes::from(bytes)).await.is_err() {
                             return;
                         }

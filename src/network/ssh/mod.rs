@@ -209,11 +209,7 @@ impl MimicHandler {
     }
 
     fn out(&self, text: &str) -> Vec<u8> {
-        if self.pty {
-            text.replace('\n', "\r\n").into_bytes()
-        } else {
-            text.as_bytes().to_vec()
-        }
+        encode_output(text, self.pty)
     }
 
     fn write_output(
@@ -452,6 +448,14 @@ impl MimicHandler {
                 }
             }
         }
+    }
+}
+
+fn encode_output(text: &str, pty: bool) -> Vec<u8> {
+    if pty {
+        text.replace('\n', "\r\n").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
