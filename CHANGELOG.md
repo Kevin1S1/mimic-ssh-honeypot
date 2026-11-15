@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged and the key is still rejected in favor of password auth.
 
 ### Fixed
+- `netstat` and `ss` no longer hard-code the sshd PID, port and addresses. The
+  session sshd PID now matches `ps` (it was 604 in `netstat` and 1340 in `ss`),
+  the local address is the persona IP that `ip addr` shows, and the port and
+  peer come from `SSH_CONNECTION`.
 - The event catalogue said "sixteen event types" while listing seventeen, and the
   line-syntax table row broke its own rendering with unescaped `|` characters.
 
