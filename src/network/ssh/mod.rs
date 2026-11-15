@@ -43,6 +43,26 @@ const HISTORY_CAPACITY: usize = 1000;
 
 const PTY_DEVICE: &str = "/dev/pts/0";
 
+const KERNEL_RELEASE: &str = "6.1.0-21-amd64";
+const KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)";
+const MACHINE: &str = "x86_64";
+const DEBIAN_NOTICE: &str = "\
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+";
+
+const JITTER_BASE_MICROS: u64 = 900;
+const JITTER_MICROS_PER_OUTPUT_BYTE: u64 = 1;
+const JITTER_MAX_WORK_MICROS: u64 = 240_000;
+const JITTER_NOISE_PERCENT: std::ops::RangeInclusive<u64> = 40..=170;
+const JITTER_MIN_MICROS: u64 = 400;
+const JITTER_MAX_MICROS: u64 = 450_000;
+const PERCENT: u64 = 100;
+
 fn new_line_editor() -> LineEditor {
     LineEditor::new(MAX_COMMAND_LEN, HISTORY_CAPACITY)
 }
@@ -396,14 +416,7 @@ impl MimicHandler {
 
     fn motd(&self) -> String {
         format!(
-            "Linux {host} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64\n\
-             \n\
-             The programs included with the Debian GNU/Linux system are free software;\n\
-             the exact distribution terms for each program are described in the\n\
-             individual files in /usr/share/doc/*/copyright.\n\
-             \n\
-             Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\n\
-             permitted by applicable law.\n",
+            "Linux {host} {KERNEL_RELEASE} {KERNEL_VERSION} {MACHINE}\n\n{DEBIAN_NOTICE}",
             host = self.config.hostname,
         )
     }
@@ -736,13 +749,15 @@ fn reject_but_offer_password() -> Auth {
 }
 
 async fn jitter_for(output_bytes: usize) {
-    let base = 900u64;
-
-    let work = (output_bytes as u64).saturating_mul(1).min(240_000);
-
-    let noise = rand::random_range(40..=170) * rand::random_range(40..=170) / 100;
-    let micros = (base + work).saturating_mul(noise) / 100;
-    tokio::time::sleep(Duration::from_micros(micros.clamp(400, 450_000))).await;
+    let work = (output_bytes as u64)
+        .saturating_mul(JITTER_MICROS_PER_OUTPUT_BYTE)
+        .min(JITTER_MAX_WORK_MICROS);
+    let noise_percent = rand::random_range(JITTER_NOISE_PERCENT)
+        * rand::random_range(JITTER_NOISE_PERCENT)
+        / PERCENT;
+    let micros = (JITTER_BASE_MICROS + work).saturating_mul(noise_percent) / PERCENT;
+    let micros = micros.clamp(JITTER_MIN_MICROS, JITTER_MAX_MICROS);
+    tokio::time::sleep(Duration::from_micros(micros)).await;
 }
 
 #[cfg(test)]

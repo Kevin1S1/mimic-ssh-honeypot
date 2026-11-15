@@ -210,6 +210,23 @@ fn accept_after_grants_on_the_nth_attempt() {
 }
 
 #[test]
+fn motd_is_the_stock_debian_banner() {
+    let handler = test_handler(std::env::temp_dir(), 1024);
+    let expected = format!(
+        "Linux {} 6.1.0-21-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03) x86_64\n\
+         \n\
+         The programs included with the Debian GNU/Linux system are free software;\n\
+         the exact distribution terms for each program are described in the\n\
+         individual files in /usr/share/doc/*/copyright.\n\
+         \n\
+         Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent\n\
+         permitted by applicable law.\n",
+        handler.config.hostname
+    );
+    assert_eq!(handler.motd(), expected);
+}
+
+#[test]
 fn only_one_channel_is_active_at_a_time() {
     let mut handler = test_handler(std::env::temp_dir(), 1024);
     assert!(handler.try_open_channel(1));
