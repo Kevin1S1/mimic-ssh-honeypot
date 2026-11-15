@@ -40,6 +40,8 @@ const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
 const HISTORY_CAPACITY: usize = 1000;
 
+const PTY_DEVICE: &str = "/dev/pts/0";
+
 fn new_line_editor() -> LineEditor {
     LineEditor::new(MAX_COMMAND_LEN, HISTORY_CAPACITY)
 }
@@ -340,35 +342,36 @@ impl MimicHandler {
                 &self.config.hostname,
                 (*self.persona).clone(),
             );
-
-            let (peer_ip, peer_port) = (self.peer.ip(), self.peer.port());
-            shell.env.set(
-                "SSH_CLIENT",
-                &format!("{peer_ip} {peer_port} {}", self.local.port()),
-            );
-            shell.env.set(
-                "SSH_CONNECTION",
-                &format!(
-                    "{peer_ip} {peer_port} {} {}",
-                    self.local.ip(),
-                    self.local.port()
-                ),
-            );
-            if self.pty {
-                shell.env.set("SSH_TTY", "/dev/pts/0");
-            }
-
-            if let Some(pty) = self.pty_term.as_ref() {
-                shell.env.set("TERM", &pty.term);
-                pty.export_size(&mut shell);
-            }
-
-            for (key, value) in &self.accepted_env {
-                shell.env.set(key, value);
+            for (key, value) in self.connection_env() {
+                shell.env.set(&key, &value);
             }
             self.shell = Some(shell);
         }
         self.shell.as_mut().expect("shell just initialised")
+    }
+
+    fn connection_env(&self) -> Vec<(String, String)> {
+        let (peer_ip, peer_port) = (self.peer.ip(), self.peer.port());
+        let (local_ip, local_port) = (self.local.ip(), self.local.port());
+        let mut env = vec![
+            (
+                "SSH_CLIENT".to_string(),
+                format!("{peer_ip} {peer_port} {local_port}"),
+            ),
+            (
+                "SSH_CONNECTION".to_string(),
+                format!("{peer_ip} {peer_port} {local_ip} {local_port}"),
+            ),
+        ];
+        if self.pty {
+            env.push(("SSH_TTY".to_string(), PTY_DEVICE.to_string()));
+        }
+        if let Some(pty) = self.pty_term.as_ref() {
+            env.push(("TERM".to_string(), pty.term.clone()));
+            env.extend(pty.size_env().map(|(key, value)| (key.to_string(), value)));
+        }
+        env.extend(self.accepted_env.iter().cloned());
+        env
     }
 
     fn complete_current_word(&mut self) -> Vec<u8> {
