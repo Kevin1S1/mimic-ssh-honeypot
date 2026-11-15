@@ -5,6 +5,27 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_AUTH_ATTEMPTS: u32 = 6;
 
+const SSH_BANNER_PREFIX: &str = "SSH-2.0-";
+const MAX_SESSIONS_LIMIT: usize = 100_000;
+const MIN_IDLE_TIMEOUT_SECS: u64 = 10;
+const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
+const MAX_SESSION_SECS_LIMIT: u64 = 86_400;
+const MAX_UPLOAD_BYTES_LIMIT: u64 = 1024 * 1024 * 1024;
+const MAX_RETENTION_DAYS: usize = 3650;
+
+const DEFAULT_PORT: u16 = 2222;
+const DEFAULT_SERVER_ID: &str = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3";
+const DEFAULT_HOSTNAME: &str = "debian";
+const DEFAULT_SENSOR_NAME: &str = "mimic";
+const DEFAULT_MAX_SESSIONS: usize = 32;
+const DEFAULT_PER_IP_CONNECTIONS: usize = 4;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_MAX_SESSION_SECS: u64 = 1800;
+const DEFAULT_QUARANTINE_DIR: &str = "quarantine";
+const DEFAULT_MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_HOST_KEY_DIR: &str = "host_keys";
+const DEFAULT_ACCEPT_AFTER: u32 = 2;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -80,18 +101,18 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            port: 2222,
-            server_id: "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3".to_string(),
-            hostname: "debian".to_string(),
-            sensor_name: "mimic".to_string(),
-            max_sessions: 32,
-            per_ip_connections: 4,
-            idle_timeout_secs: 300,
-            max_session_secs: 1800,
-            quarantine_dir: PathBuf::from("quarantine"),
-            max_upload_bytes: 8 * 1024 * 1024,
+            port: DEFAULT_PORT,
+            server_id: DEFAULT_SERVER_ID.to_string(),
+            hostname: DEFAULT_HOSTNAME.to_string(),
+            sensor_name: DEFAULT_SENSOR_NAME.to_string(),
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            per_ip_connections: DEFAULT_PER_IP_CONNECTIONS,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            max_session_secs: DEFAULT_MAX_SESSION_SECS,
+            quarantine_dir: PathBuf::from(DEFAULT_QUARANTINE_DIR),
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             quarantine_max_total_bytes: None,
-            host_key_dir: PathBuf::from("host_keys"),
+            host_key_dir: PathBuf::from(DEFAULT_HOST_KEY_DIR),
             auth: AuthConfig::default(),
             logging: LoggingConfig::default(),
         }
@@ -102,7 +123,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             mode: AuthMode::AcceptAll,
-            accept_after: 2,
+            accept_after: DEFAULT_ACCEPT_AFTER,
             credentials: Vec::new(),
         }
     }
@@ -124,45 +145,62 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_server()?;
+        self.auth.validate()?;
+        self.logging.validate()
+    }
+
+    fn validate_server(&self) -> Result<()> {
         anyhow::ensure!(
-            self.server_id.starts_with("SSH-2.0-"),
-            "server_id must begin with \"SSH-2.0-\""
+            self.server_id.starts_with(SSH_BANNER_PREFIX),
+            "server_id must begin with \"{SSH_BANNER_PREFIX}\""
         );
         anyhow::ensure!(
-            self.max_sessions > 0 && self.max_sessions <= 100_000,
-            "max_sessions must be between 1 and 100000"
+            self.max_sessions > 0 && self.max_sessions <= MAX_SESSIONS_LIMIT,
+            "max_sessions must be between 1 and {MAX_SESSIONS_LIMIT}"
         );
         anyhow::ensure!(
             self.per_ip_connections > 0 && self.per_ip_connections <= self.max_sessions,
             "per_ip_connections must be between 1 and max_sessions"
         );
         anyhow::ensure!(
-            self.idle_timeout_secs >= 10 && self.idle_timeout_secs <= 3600,
-            "idle_timeout_secs must be between 10 and 3600 seconds"
+            (MIN_IDLE_TIMEOUT_SECS..=MAX_IDLE_TIMEOUT_SECS).contains(&self.idle_timeout_secs),
+            "idle_timeout_secs must be between {MIN_IDLE_TIMEOUT_SECS} and {MAX_IDLE_TIMEOUT_SECS} seconds"
         );
         anyhow::ensure!(
-            self.max_session_secs >= self.idle_timeout_secs && self.max_session_secs <= 86_400,
-            "max_session_secs must be between idle_timeout_secs and 86400 seconds"
+            (self.idle_timeout_secs..=MAX_SESSION_SECS_LIMIT).contains(&self.max_session_secs),
+            "max_session_secs must be between idle_timeout_secs and {MAX_SESSION_SECS_LIMIT} seconds"
         );
         anyhow::ensure!(
-            self.max_upload_bytes > 0 && self.max_upload_bytes <= 1024 * 1024 * 1024,
-            "max_upload_bytes must be between 1 and 1073741824 (1 GiB)"
+            self.max_upload_bytes > 0 && self.max_upload_bytes <= MAX_UPLOAD_BYTES_LIMIT,
+            "max_upload_bytes must be between 1 and {MAX_UPLOAD_BYTES_LIMIT} (1 GiB)"
         );
+        Ok(())
+    }
+}
 
+impl AuthConfig {
+    fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            (1..=MAX_AUTH_ATTEMPTS).contains(&self.auth.accept_after),
+            (1..=MAX_AUTH_ATTEMPTS).contains(&self.accept_after),
             "auth.accept_after must be between 1 and {MAX_AUTH_ATTEMPTS}"
         );
-        if self.auth.mode == AuthMode::Credentials {
+        if self.mode == AuthMode::Credentials {
             anyhow::ensure!(
-                !self.auth.credentials.is_empty(),
+                !self.credentials.is_empty(),
                 "auth.mode = \"credentials\" requires at least one credential pair"
             );
         }
-        if let Some(days) = self.logging.retention_days {
+        Ok(())
+    }
+}
+
+impl LoggingConfig {
+    fn validate(&self) -> Result<()> {
+        if let Some(days) = self.retention_days {
             anyhow::ensure!(
-                (1..=3650).contains(&days),
-                "logging.retention_days must be between 1 and 3650"
+                (1..=MAX_RETENTION_DAYS).contains(&days),
+                "logging.retention_days must be between 1 and {MAX_RETENTION_DAYS}"
             );
         }
         Ok(())
