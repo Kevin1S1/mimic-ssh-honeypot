@@ -497,16 +497,28 @@ pub fn last(shell: &Shell, _args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
+const SHM_RAM_DIVISOR: u64 = 2;
+
+const RUN_RAM_DIVISOR: u64 = 10;
+
+const UDEV_RESERVED_KB: u64 = 5270;
+
+const RUN_USED_KB: u64 = 960;
+
+const ROOT_USED_PERCENT: u64 = 16;
+
+const ROOT_RESERVED_PERCENT: u64 = 5;
+
 pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     let human = args.iter().any(|a| a == "-h" || a == "--human-readable");
 
-    let mem = shell.persona.mem_total_kb;
+    let ram = shell.persona.memory().total;
     let disk = shell.persona.disk_total_kb;
-    let udev = mem / 2 - 5270;
-    let run = mem / 10;
-    let shm = mem / 2;
-    let used = disk * 16 / 100;
-    let avail = disk - used - (disk / 20);
+    let shm = ram / SHM_RAM_DIVISOR;
+    let udev = shm - UDEV_RESERVED_KB;
+    let run = ram / RUN_RAM_DIVISOR;
+    let used = disk * ROOT_USED_PERCENT / 100;
+    let avail = disk - used - disk * ROOT_RESERVED_PERCENT / 100;
     let pct = (used * 100).div_ceil(disk.max(1));
     let uid = shell.uid;
 
@@ -532,14 +544,14 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
         format!(
             "Filesystem     1K-blocks    Used Available Use% Mounted on\n\
              udev          {udev:>10}       0  {udev:>8}   0% /dev\n\
-             tmpfs         {run:>10}     960  {run_avail:>8}   1% /run\n\
+             tmpfs         {run:>10} {RUN_USED_KB:>7}  {run_avail:>8}   1% /run\n\
              /dev/sda1     {disk:>10} {used:>7}  {avail:>8}  {pct}% /\n\
              tmpfs         {shm:>10}       0  {shm:>8}   0% /dev/shm\n\
              tmpfs               5120       0      5120   0% /run/lock\n\
              tmpfs         {run:>10}       0  {run:>8}   0% /run/user/{uid}\n",
             udev = udev,
             run = run,
-            run_avail = run - 960,
+            run_avail = run - RUN_USED_KB,
             disk = disk,
             used = used,
             avail = avail,
