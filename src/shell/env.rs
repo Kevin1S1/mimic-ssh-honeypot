@@ -58,3 +58,23 @@ impl Env {
         self.vars.iter()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_over_long_variable_name_is_not_stored() {
+        let mut env = Env::login("root", "/root", "debian");
+        let before = env.iter().count();
+
+        let longest = "K".repeat(MAX_ENV_KEY_LEN);
+        env.set(&longest, "1");
+        assert_eq!(env.get(&longest), Some("1"));
+
+        let too_long = "K".repeat(MAX_ENV_KEY_LEN + 1);
+        env.set(&too_long, "1");
+        assert_eq!(env.get(&too_long), None);
+        assert_eq!(env.iter().count(), before + 1);
+    }
+}

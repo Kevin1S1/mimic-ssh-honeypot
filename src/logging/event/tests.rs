@@ -237,6 +237,29 @@ fn attacker_input_cannot_forge_or_split_log_lines() {
 }
 
 #[test]
+fn sanitise_field_escapes_bidi_controls_and_unicode_line_separators() {
+    assert_eq!(
+        sanitise_field("user\u{202e}txt.exe"),
+        "user\\u{202e}txt.exe",
+        "a right-to-left override must not reorder a rendered log line"
+    );
+    assert_eq!(
+        sanitise_field("a\u{2066}b\u{2069}c\u{200f}"),
+        "a\\u{2066}b\\u{2069}c\\u{200f}"
+    );
+    assert_eq!(
+        sanitise_field("one\u{2028}two\u{2029}three"),
+        "one\\u{2028}two\\u{2029}three",
+        "line and paragraph separators must not split a record"
+    );
+    assert_eq!(
+        sanitise_field("caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{5d0}"),
+        "caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{5d0}",
+        "ordinary non-ASCII text, including right-to-left letters, is kept"
+    );
+}
+
+#[test]
 fn sanitise_field_escapes_terminal_control_sequences() {
     assert_eq!(sanitise_field("normal_text_123"), "normal_text_123");
     assert_eq!(sanitise_field("hello\tworld\n"), "hello\tworld\n");

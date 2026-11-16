@@ -155,6 +155,86 @@ fn quarantine_disk_writes_are_capped_globally() {
 }
 
 #[test]
+fn a_refused_or_deduplicated_upload_releases_its_global_reservation() {
+    let dir = TestDir::new("quarantine-reservation");
+    let shared_global = Arc::new(AtomicU64::new(0));
+    let config = Config {
+        quarantine_dir: dir.path().to_path_buf(),
+        max_upload_bytes: 1024,
+        quarantine_max_total_bytes: Some(2000),
+        ..Config::default()
+    };
+    let mut handler = handler_with(config, Arc::clone(&shared_global));
+
+    handler.store_upload(scp_file("first", vec![1u8; 1000]));
+    assert_eq!(shared_global.load(Ordering::Relaxed), 1000);
+
+    handler.store_upload(scp_file("same-bytes", vec![1u8; 1000]));
+    assert_eq!(
+        shared_global.load(Ordering::Relaxed),
+        1000,
+        "a deduplicated upload writes nothing and must not hold a reservation"
+    );
+
+    handler.store_upload(scp_file("too-big", vec![2u8; 1001]));
+    assert_eq!(
+        shared_global.load(Ordering::Relaxed),
+        1000,
+        "an upload refused by the global cap must not be counted"
+    );
+
+    handler.store_upload(scp_file("fits", vec![3u8; 1000]));
+    assert_eq!(shared_global.load(Ordering::Relaxed), 2000);
+    assert_eq!(disk_usage(dir.path()), 2000);
+}
+
+#[test]
+fn a_failed_quarantine_write_releases_its_global_reservation() {
+    let dir = TestDir::new("quarantine-io-failure");
+    // A regular file where the quarantine directory should be makes every
+    // write fail.
+    std::fs::write(dir.path(), b"not a directory").expect("blocker file");
+    let shared_global = Arc::new(AtomicU64::new(0));
+    let config = Config {
+        quarantine_dir: dir.path().to_path_buf(),
+        max_upload_bytes: 1024,
+        ..Config::default()
+    };
+    let mut handler = handler_with(config, Arc::clone(&shared_global));
+
+    handler.store_upload(scp_file("doomed", vec![1u8; 1000]));
+    assert_eq!(shared_global.load(Ordering::Relaxed), 0);
+    assert_eq!(handler.quarantine_store.session_bytes(), 0);
+    let _ = std::fs::remove_file(dir.path());
+}
+
+#[test]
+fn sftp_replies_are_held_until_the_peer_drains_and_the_backlog_is_capped() {
+    let mut backlog = OutputBacklog::default();
+
+    backlog.hold(vec![1, 2]);
+    assert_eq!(backlog.release(true), vec![1, 2], "a draining peer gets it");
+    assert!(backlog.release(true).is_empty());
+
+    backlog.hold(vec![3]);
+    backlog.hold(vec![4, 5]);
+    assert!(
+        backlog.release(false).is_empty(),
+        "nothing more is queued behind a peer that is not reading"
+    );
+    assert_eq!(backlog.release(true), vec![3, 4, 5], "order is preserved");
+
+    backlog.hold(vec![0u8; MAX_PENDING_OUTPUT_BYTES]);
+    assert!(!backlog.overflowed());
+    assert!(backlog.release(false).is_empty());
+    backlog.hold(vec![0u8; 1]);
+    assert!(
+        backlog.overflowed(),
+        "a peer that never drains must trip the ceiling"
+    );
+}
+
+#[test]
 fn accept_after_grants_on_the_nth_attempt() {
     let mut handler = test_handler(std::env::temp_dir(), 1024);
     handler.config = Arc::new(Config {

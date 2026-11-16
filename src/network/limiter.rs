@@ -102,8 +102,12 @@ impl ConnectionRegistry {
 
 /// Normalise a peer address to the key used for per-source rate limiting.
 /// IPv6 addresses collapse to their /64 prefix; IPv4 addresses are unchanged.
+///
+/// An IPv4 peer reaching a dual-stack listener arrives as `::ffff:a.b.c.d`.
+/// Those are unwrapped first: they all sit in one /64, so masking them would
+/// put every IPv4 client under a single shared cap.
 fn per_source_key(ip: IpAddr) -> IpAddr {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
             octets[8..].fill(0);
@@ -183,5 +187,51 @@ mod tests {
         }
 
         assert_eq!(reg.connections_per_ip.lock().unwrap().len(), 0);
+    }
+
+    fn v6(text: &str) -> IpAddr {
+        text.parse().expect("valid address")
+    }
+
+    #[test]
+    fn ipv6_addresses_in_one_slash_64_share_the_cap() {
+        let reg = ConnectionRegistry::new(100, 2);
+        let _a = reg.try_acquire(v6("2001:db8:1:2::1")).expect("first");
+        let _b = reg.try_acquire(v6("2001:db8:1:2:ffff::9")).expect("second");
+        assert!(matches!(
+            reg.try_acquire(v6("2001:db8:1:2:a:b:c:d")),
+            Err(RejectReason::PerIpLimit)
+        ));
+
+        let _c = reg
+            .try_acquire(v6("2001:db8:1:3::1"))
+            .expect("a neighbouring /64 has its own cap");
+    }
+
+    #[test]
+    fn ipv4_mapped_peers_are_keyed_on_their_ipv4_address() {
+        let reg = ConnectionRegistry::new(100, 1);
+        let _a = reg.try_acquire(v6("::ffff:10.0.0.1")).expect("first");
+        let _b = reg
+            .try_acquire(v6("::ffff:10.0.0.2"))
+            .expect("a different IPv4 client is not capped by the first");
+        assert!(matches!(
+            reg.try_acquire(v6("::ffff:10.0.0.1")),
+            Err(RejectReason::PerIpLimit)
+        ));
+        assert!(
+            matches!(reg.try_acquire(ip(1)), Err(RejectReason::PerIpLimit)),
+            "the mapped and plain forms of one address share a cap"
+        );
+    }
+
+    #[test]
+    fn a_slash_64_slot_is_released_on_drop() {
+        let reg = ConnectionRegistry::new(10, 1);
+        {
+            let _g = reg.try_acquire(v6("2001:db8::1")).expect("allowed");
+        }
+        assert_eq!(reg.connections_per_ip.lock().unwrap().len(), 0);
+        let _g = reg.try_acquire(v6("2001:db8::2")).expect("allowed again");
     }
 }

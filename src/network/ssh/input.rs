@@ -3,16 +3,56 @@ use super::{send_if_any, MimicHandler, MAX_COMMAND_LEN, MAX_PENDING_OUTPUT_BYTES
 use crate::shell::line::{is_continuation, Reaction};
 use russh::server::Session;
 use russh::ChannelId;
+
+/// SFTP replies generated but not yet handed to russh.
+///
+/// russh sends what the peer's window allows and queues the rest without
+/// bound. Replies are parked here while that queue is non-empty, so the bytes
+/// outstanding for a peer that is not reading are bounded by this buffer plus
+/// one release, and this buffer's size is known exactly.
+#[derive(Default)]
+pub(super) struct OutputBacklog {
+    held: Vec<u8>,
+}
+
+impl OutputBacklog {
+    pub(super) fn hold(&mut self, mut bytes: Vec<u8>) {
+        if self.held.is_empty() {
+            self.held = bytes;
+        } else {
+            self.held.append(&mut bytes);
+        }
+    }
+
+    /// Everything held, if the peer has drained what russh already had queued;
+    /// nothing otherwise.
+    pub(super) fn release(&mut self, peer_drained: bool) -> Vec<u8> {
+        if peer_drained {
+            std::mem::take(&mut self.held)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(super) fn overflowed(&self) -> bool {
+        self.held.len() > MAX_PENDING_OUTPUT_BYTES
+    }
+}
+
 impl MimicHandler {
-    /// True if the channel's outbound queue has backed up past the ceiling —
-    /// i.e. the peer has stopped draining its receive window. Flushes whatever
-    /// the socket will currently accept first, so a transient full window from
-    /// normal bursty output doesn't trip it.
-    pub(super) fn output_backpressured(&self, channel: ChannelId, session: &mut Session) -> bool {
-        session
-            .flush_pending(channel)
-            .map(|remaining| remaining > MAX_PENDING_OUTPUT_BYTES)
-            .unwrap_or(false)
+    /// Hands held SFTP replies to russh once its own queue for the channel is
+    /// empty. Called after each feed and on every window adjustment.
+    ///
+    /// russh also empties its queue when a key re-exchange completes, which has
+    /// no handler callback; replies held across one go out on the peer's next
+    /// packet or window adjustment instead.
+    pub(super) fn pump_sftp_output(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let peer_drained = !session.has_pending_data(channel);
+        send_if_any(session, channel, self.sftp_backlog.release(peer_drained))
     }
 
     pub(super) fn feed_sftp(
@@ -21,11 +61,6 @@ impl MimicHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        // Backpressure: a client that pipelines READs without reading the
-        // replies would otherwise grow russh's per-channel queue unbounded.
-        if self.output_backpressured(channel, session) {
-            return self.end_channel(channel, session, 0);
-        }
         let _ = self.shell();
         let (resp, uploads) = {
             let max_bytes = self.config.max_upload_bytes;
@@ -36,7 +71,18 @@ impl MimicHandler {
         for upload in uploads {
             self.store_sftp_upload(upload);
         }
-        send_if_any(session, channel, resp)
+        self.sftp_backlog.hold(resp);
+        self.pump_sftp_output(channel, session)?;
+        // Backpressure: a client that pipelines READs without reading the
+        // replies would otherwise grow the outbound queue without limit.
+        if self.sftp_backlog.overflowed() {
+            tracing::debug!(
+                event = "sftp_output_backlog_exceeded",
+                session_id = self.session_id,
+            );
+            return self.end_channel(channel, session, 0);
+        }
+        Ok(())
     }
 
     pub(super) fn feed_scp(
