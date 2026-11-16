@@ -78,7 +78,7 @@ impl MimicHandler {
         match screen {
             Screen::Top(top) => {
                 let first = format!("{SCREEN_HOME}{}", top.render());
-                session.data(channel, self.out(&first))?;
+                self.send(channel, self.out(&first), session)?;
                 let handle = session.handle();
                 let pty = self.pty;
                 let redraw = tokio::spawn(async move {
@@ -102,7 +102,7 @@ impl MimicHandler {
                     crate::commands::text::EditorKind::Nano => ScreenKind::Nano,
                 };
                 let first = format!("{SCREEN_HOME}{}", editor.render());
-                session.data(channel, self.out(&first))?;
+                self.send(channel, self.out(&first), session)?;
                 self.screen = Some(ScreenHold::new(kind, None));
             }
             Screen::Listen => {
@@ -144,7 +144,7 @@ impl MimicHandler {
             ScreenKind::Listen => "^C\n",
             ScreenKind::Top | ScreenKind::Vi | ScreenKind::Nano => SCREEN_HOME,
         };
-        session.data(channel, self.out(farewell))?;
+        self.send(channel, self.out(farewell), session)?;
         self.show_shell_prompt(channel, session)?;
 
         Ok(Some(&data[quit_at + 1..]))

@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/etc/ssh/ssh_host_ecdsa_key.pub`. Existing sensors create it on their next
   start; their Ed25519/RSA fingerprints and their persona (machine-id, MAC,
   addresses, hardware) are unchanged.
+- The reference config (`deploy/mimic.toml`) sets `retention_days = 30`. It
+  shipped without retention, so logs grew until the disk was full (#106).
+- Internal clean-code refactor with no intended behavior change: source comments
+  removed, large modules split into `commands/{fs,text,net,system}/`,
+  `network/ssh/`, `vfs/snapshot/` and `logging/event/`, duplicated code moved
+  into shared helpers (#96, #105).
 
 ### Fixed
 - Fingerprinting tells that set the emulation apart from a real
@@ -59,8 +65,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer come from `SSH_CONNECTION`.
 - The event catalogue said "sixteen event types" while listing seventeen, and the
   line-syntax table row broke its own rendering with unescaped `|` characters.
+- `top`'s `MiB Mem` header was a fixed 1993.4 MiB and disagreed with `free`,
+  `/proc/meminfo` and `lscpu` on any persona with a different RAM size. All
+  four now read the same persona figures (#103).
+- `sed` panicked on an `s` command with a multibyte delimiter such as
+  `s√a√b√`; such delimiters now work (#102).
+- `ping -c 0` underflowed its timing arithmetic and printed a NaN average. It
+  now fails as real ping does, with `ping: bad number of packets to transmit.`
+  and exit status 2 (#101).
+- The shipped systemd unit could not start with the shipped config:
+  `ProtectSystem=strict` left the config's `/data` paths read-only. The unit
+  now binds its writable `StateDirectory` onto `/data` (#106).
 
 ### Security
+- Shell, exec, screen and SCP output queued for a peer that is not reading it is
+  bounded (#107). A client that withheld its SSH window, or sent one packet of
+  lines with large output, could grow russh's unbounded per-channel queue until
+  the process hit its memory limit and every session died with it. Output
+  written since the queue was last seen empty is now counted, each write with a
+  fixed overhead so that one-byte echoes cannot hide their queue cost, and the
+  connection is dropped past 8 MiB. A new channel is refused while a closed one
+  still has output queued, which also stops SFTP replies from stacking up
+  across channels.
+- Findings from the security review of the emulation and network layers (#106):
+  - A long run of `-`/`+` signs inside `$(( ))` recursed once per sign and
+    overflowed the stack, aborting the whole process. The run is now consumed
+    iteratively.
+  - `sh` calling itself several times per line fanned out exponentially, since
+    the nesting cap bounds depth but not breadth. A per-line budget of 100,000
+    dispatches now bounds it.
+  - Memory paths that bypassed the output cap are bounded: `xargs` stderr,
+    `awk` field rendering, `sed` with stacked `-e` expressions and over-long
+    variable names in `env`. VFS node names and symlink targets now count
+    toward the 8 MiB content ceiling.
+  - A client that pipelined SFTP reads while withholding its window grew the
+    outbound queue without limit. SFTP replies are held in a buffer of known
+    size until russh's queue has drained, and the channel is closed past 8 MiB.
+  - The escape-guard test missed `tokio::{…}` and `use … as` imports; it now
+    scans whitespace-stripped source and covers both forms.
+  - The global quarantine cap is reserved atomically instead of
+    check-then-add, and the async quarantine write no longer blocks on
+    `sync_all()`.
+  - Unicode bidi and isolate controls and U+2028/U+2029 are escaped in logged
+    strings.
+  - The per-source connection cap keys IPv6 peers on their /64 prefix, so one
+    host cannot rotate addresses inside its own prefix to evade it.
+    IPv4-mapped peers keep per-address caps.
 - VFS tree depth is capped at 128 levels (enforced on create and on `mv`). A
   ~1,500-level `mkdir` chain walked by `tar`, `find` or `du` could overflow the
   stack and abort the whole process; `mkdir -p` and `mv` now report the refusal.
