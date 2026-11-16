@@ -48,7 +48,7 @@ max_upload_bytes = 8388608
 # disk exhaustion. Default: max_upload_bytes * 64 (512 MiB by default).
 # quarantine_max_total_bytes = 536870912
 
-# Directory where SSH host keys are persisted. Keys (Ed25519 + RSA) are
+# Directory where SSH host keys are persisted. Keys (Ed25519, RSA, ECDSA) are
 # generated on first start and reused afterwards so the server fingerprint stays
 # stable across restarts — a fingerprint that changes every boot is a tell.
 host_key_dir = "/data/host_keys"

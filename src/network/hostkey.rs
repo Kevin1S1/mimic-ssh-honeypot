@@ -3,10 +3,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rand::SeedableRng;
 use russh::keys::ssh_key::LineEnding;
-use russh::keys::{Algorithm, PrivateKey};
+use russh::keys::{Algorithm, EcdsaCurve, PrivateKey};
 
 const ED25519_KEY_FILE: &str = "ssh_host_ed25519_key";
 const RSA_KEY_FILE: &str = "ssh_host_rsa_key";
+const ECDSA_KEY_FILE: &str = "ssh_host_ecdsa_key";
 
 pub fn load_or_create(dir: &Path) -> Result<Vec<PrivateKey>> {
     std::fs::create_dir_all(dir)
@@ -17,6 +18,14 @@ pub fn load_or_create(dir: &Path) -> Result<Vec<PrivateKey>> {
     match ensure_key(&dir.join(RSA_KEY_FILE), Algorithm::Rsa { hash: None }) {
         Ok(key) => keys.push(key),
         Err(err) => tracing::warn!(event = "host_key_skip", algo = "rsa", error = %err),
+    }
+
+    let ecdsa = Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP256,
+    };
+    match ensure_key(&dir.join(ECDSA_KEY_FILE), ecdsa) {
+        Ok(key) => keys.push(key),
+        Err(err) => tracing::warn!(event = "host_key_skip", algo = "ecdsa", error = %err),
     }
 
     Ok(keys)

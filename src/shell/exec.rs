@@ -13,6 +13,7 @@ impl Shell {
         if self.nesting == 0 {
             self.subst_budget = commands::MAX_COMMAND_OUTPUT_BYTES;
             self.dispatch_budget = commands::MAX_DISPATCHES_PER_LINE;
+            self.owed_delay = std::time::Duration::ZERO;
 
             self.subst_stderr.clear();
             if self.park_heredoc(line) {

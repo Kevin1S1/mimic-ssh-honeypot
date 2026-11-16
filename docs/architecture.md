@@ -51,7 +51,7 @@ logged as `connection_rejected` events.
 
 ## Host key persistence
 
-An Ed25519 and an RSA host key are generated on first run and written to
+An Ed25519, an RSA and an ECDSA host key are generated on first run and written to
 `host_key_dir`. Subsequent starts load the same keys, so the server fingerprint
 never changes — a rotating fingerprint is a classic honeypot tell.
 
@@ -71,7 +71,7 @@ mimic-ssh-honeypot/
 │   │   ├── limiter.rs       Connection registry (global + per-IP caps, RAII guards)
 │   │   ├── scp.rs           SCP sink — upload capture protocol
 │   │   ├── sftp.rs          SFTP subsystem (v3) — upload capture & VFS operations
-│   │   └── hostkey.rs       Persistent Ed25519 + RSA host keys
+│   │   └── hostkey.rs       Persistent Ed25519, RSA + ECDSA host keys
 │   ├── shell/
 │   │   ├── mod.rs           Shell state machine, expansion, dispatch, history
 │   │   ├── line.rs          Readline-style line editor (cursor, history, Ctrl-R)

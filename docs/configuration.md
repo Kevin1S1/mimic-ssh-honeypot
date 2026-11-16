@@ -33,7 +33,7 @@ max_session_secs   = 1800       # absolute per-session lifetime cap
 # Capture
 quarantine_dir     = "/data/quarantine" # SCP/SFTP uploads land here (SHA-256 named)
 max_upload_bytes   = 8388608            # truncate stored files at 8 MiB
-host_key_dir       = "/data/host_keys"  # persisted Ed25519 + RSA keys
+host_key_dir       = "/data/host_keys"  # persisted Ed25519, RSA + ECDSA keys
 
 [logging]
 # Events always go to stdout. When `dir` is set they are additionally written to

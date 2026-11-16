@@ -22,8 +22,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `russh` bumped to 0.65.0; the public-key handler now takes the new
   `VerifiedPublicKey` type. Behavior is unchanged: the key fingerprint is still
   logged and the key is still rejected in favor of password auth.
+- An ECDSA (nistp256) host key is now generated next to the Ed25519 and RSA
+  keys, as on a stock Debian install, and appears as
+  `/etc/ssh/ssh_host_ecdsa_key.pub`. Existing sensors create it on their next
+  start; their Ed25519/RSA fingerprints and their persona (machine-id, MAC,
+  addresses, hardware) are unchanged.
 
 ### Fixed
+- Fingerprinting tells that set the emulation apart from a real
+  `OpenSSH_9.2p1 Debian-2+deb12u3` host (#108):
+  - `sleep` returned instantly. It now holds the reply back for the requested
+    time, on an async timer, capped at 30 s per submitted line and at the
+    session deadline. Input (including `^C`) is not read during the wait.
+  - `$$` was 1337 in every session on every sensor. The shell PID now derives
+    from the persona and the session, so it differs between sensors and rises
+    from one session to the next; `ps`, `netstat` and `ss` follow it.
+  - Uptime started at the same 2 days 3:21 on every sensor. The starting uptime
+    (1 to 90 days) now derives from the persona.
+  - The advertised algorithms now match that sshd's `KEXINIT` in content and
+    order: `diffie-hellman-group-exchange-sha256`,
+    `diffie-hellman-group18-sha512` and `aes128-gcm@openssh.com` added,
+    `ext-info-s` and plain `zlib` dropped, host key algorithms reordered to
+    `rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-ed25519`. Still missing,
+    because russh does not implement them:
+    `sntrup761x25519-sha512@openssh.com` and the `umac-*` MACs.
+  - `df -h` printed procps-style `Gi`/`Mi` suffixes; it now prints coreutils'
+    `G`/`M`, rounded up.
+  - `ls -l` could show groups (`shadow`, `utmp`) and a bare gid (`5`) that
+    `/etc/group` did not list. `/etc/group` now carries the full Debian base
+    set, including every primary group `/etc/passwd` refers to.
+  - `dmesg` reported a fixed CPU and memory size, and `mount` fixed tmpfs
+    sizes; all follow the persona now, as `free`, `top` and `df` already did.
 - `netstat` and `ss` no longer hard-code the sshd PID, port and addresses. The
   session sshd PID now matches `ps` (it was 604 in `netstat` and 1340 in `ss`),
   the local address is the persona IP that `ip addr` shows, and the port and

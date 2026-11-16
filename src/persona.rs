@@ -19,6 +19,10 @@ pub struct Persona {
     pub subnet: String,
 
     pub host_keys: Vec<(String, String)>,
+
+    pub uptime_at_start_secs: i64,
+
+    pub pid_base: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +113,17 @@ const SRECLAIMABLE_PER_MILLE: u64 = 20;
 const FREE_PERCENT: u64 = 73;
 const AVAILABLE_PERCENT: u64 = 86;
 
+const SECS_PER_DAY: u64 = 86_400;
+const MIN_UPTIME_DAYS: u64 = 1;
+const UPTIME_DAY_CHOICES: u64 = 89;
+
+// Session shells get PIDs above every boot-time process, and stay far below
+// the kernel's `pid_max` so a long-lived sensor never has to wrap.
+const FIRST_PID_BASE: u64 = 1_400;
+const PID_BASE_CHOICES: u64 = 28_000;
+const PID_STRIDE: u64 = 11;
+const PID_MAX: u64 = 4_194_304;
+
 const MEM_SIZES_KB: &[u64] = &[1009428, 2041208, 4025464, 8148304, 16373612];
 
 const DISK_SIZES_KB: &[u64] = &[8065444, 16197524, 20263528, 32441516, 40593708, 64891496];
@@ -152,6 +167,13 @@ impl Persona {
         let (subnet, host) = random_subnet_and_host(&mut rng);
         let ipv4 = format!("{subnet}.{host}");
 
+        // Drawn last so the fields above keep the values earlier releases
+        // derived from the same seed.
+        let uptime_at_start_secs = ((rng.below(UPTIME_DAY_CHOICES) + MIN_UPTIME_DAYS)
+            * SECS_PER_DAY
+            + rng.below(SECS_PER_DAY)) as i64;
+        let pid_base = (rng.below(PID_BASE_CHOICES) + FIRST_PID_BASE) as u32;
+
         Self {
             machine_id,
             boot_id,
@@ -163,6 +185,8 @@ impl Persona {
             ipv4,
             subnet,
             host_keys: Vec::new(),
+            uptime_at_start_secs,
+            pid_base,
         }
     }
 
@@ -173,6 +197,15 @@ impl Persona {
 
     pub fn sample() -> Self {
         Self::from_seed(SAMPLE_SEED)
+    }
+
+    /// PID of the login shell for the `session`-th connection: stable within
+    /// a session, rising from one session to the next, different per sensor.
+    pub fn shell_pid(&self, session: u64) -> u32 {
+        let base = u64::from(self.pid_base);
+        let jitter = SplitMix64(base ^ session.rotate_left(32)).below(PID_STRIDE);
+        let offset = session.wrapping_mul(PID_STRIDE).wrapping_add(jitter);
+        (base + offset % (PID_MAX - base)) as u32
     }
 
     pub fn bogomips(&self) -> String {
@@ -311,6 +344,46 @@ mod tests {
         let macs: std::collections::BTreeSet<String> =
             (0..64).map(|s| Persona::from_seed(s).mac).collect();
         assert_eq!(macs.len(), 64, "MACs must be distinct");
+    }
+
+    #[test]
+    fn existing_identity_fields_are_unchanged_by_the_newer_draws() {
+        let p = Persona::from_seed(42);
+        assert_eq!(p.machine_id, "bdd732262feb6e9528efe333b266f103");
+        assert_eq!(p.mac, "ba:57:05:b8:77:0b");
+        assert_eq!(p.ipv4, "192.168.190.152");
+    }
+
+    #[test]
+    fn uptime_and_pid_differ_between_sensors_but_not_between_runs() {
+        let a = Persona::from_seed(42);
+        let b = Persona::from_seed(42);
+        assert_eq!(a.uptime_at_start_secs, b.uptime_at_start_secs);
+        assert_eq!(a.shell_pid(7), b.shell_pid(7));
+
+        let uptimes: std::collections::BTreeSet<i64> = (0..64)
+            .map(|s| Persona::from_seed(s).uptime_at_start_secs)
+            .collect();
+        assert!(uptimes.len() > 60, "uptimes should vary per sensor");
+        let pids: std::collections::BTreeSet<u32> = (0..64)
+            .map(|s| Persona::from_seed(s).shell_pid(1))
+            .collect();
+        assert!(pids.len() > 60, "shell PIDs should vary per sensor");
+
+        for seed in 0..64 {
+            let p = Persona::from_seed(seed);
+            assert!(p.uptime_at_start_secs >= 86_400, "seed {seed}");
+            assert!(p.uptime_at_start_secs < 91 * 86_400, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn shell_pids_rise_with_each_session_and_stay_in_range() {
+        let p = Persona::from_seed(42);
+        let pids: Vec<u32> = (1..200).map(|s| p.shell_pid(s)).collect();
+        assert!(pids.windows(2).all(|w| w[0] < w[1]), "{pids:?}");
+        assert!(pids[0] > 1_400);
+        assert!(u64::from(p.shell_pid(u64::MAX)) < PID_MAX);
     }
 
     #[test]

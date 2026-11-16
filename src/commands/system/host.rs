@@ -189,15 +189,15 @@ pub fn lsb_release(_shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-const DMESG_BUFFER: &str = "\
+const DMESG_HEAD: &str = "\
 [    0.000000] Linux version 6.1.0-21-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)\n\
 [    0.000000] Command line: BOOT_IMAGE=/boot/vmlinuz-6.1.0-21-amd64 root=UUID=8f3a2b1c-4d5e-6f70-8192-a3b4c5d6e7f8 ro console=tty0 console=ttyS0,115200\n\
 [    0.000000] BIOS-provided physical RAM map:\n\
 [    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable\n\
 [    0.000000] KVM: setup async PF for cpu 0\n\
-[    0.008000] Hypervisor detected: KVM\n\
-[    0.020000] CPU0: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz (family: 0x6, model: 0x55, stepping: 0x7)\n\
-[    0.130000] Memory: 2041208K/2097152K available\n\
+[    0.008000] Hypervisor detected: KVM\n";
+
+const DMESG_TAIL: &str = "\
 [    0.410000] pci 0000:00:00.0: [8086:1237] type 00 class 0x060000\n\
 [    0.512000] virtio_blk virtio1: [vda] 83886080 512-byte logical blocks (42.9 GB/40.0 GiB)\n\
 [    0.640000] ata1.00: ATA-8: QEMU HARDDISK, 2.5+, max UDMA/100\n\
@@ -208,6 +208,30 @@ const DMESG_BUFFER: &str = "\
 [    2.310000] e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex\n\
 [    2.640000] IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready\n";
 
+const KB_PER_GIB: u64 = 1024 * 1024;
+
+// What the kernel holds back before `MemTotal` is counted (its own image and
+// early allocations); the boot line reports the installed RAM alongside it.
+const DMESG_EARLY_RESERVED_KB: u64 = 17_416;
+
+fn dmesg_buffer(persona: &crate::persona::Persona) -> String {
+    let cpu = &persona.cpu;
+    let total = persona.memory().total;
+    let installed = total.div_ceil(KB_PER_GIB) * KB_PER_GIB;
+    let available = total.saturating_sub(DMESG_EARLY_RESERVED_KB);
+    format!(
+        "{DMESG_HEAD}\
+         [    0.020000] smpboot: CPU0: {name} (family: {family:#x}, model: {model:#x}, stepping: {stepping:#x})\n\
+         [    0.130000] Memory: {available}K/{installed}K available (14342K kernel code, 2332K rwdata, 9056K rodata, 2792K init, 17416K bss, {reserved}K reserved, 0K cma-reserved)\n\
+         {DMESG_TAIL}",
+        name = cpu.name,
+        family = cpu.family,
+        model = cpu.model,
+        stepping = cpu.stepping,
+        reserved = installed - available,
+    )
+}
+
 pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
     if !is_root(shell) {
         return CommandResult::err(
@@ -215,7 +239,7 @@ pub fn dmesg(shell: &Shell, _args: &[String]) -> CommandResult {
             1,
         );
     }
-    CommandResult::ok(DMESG_BUFFER)
+    CommandResult::ok(dmesg_buffer(&shell.persona))
 }
 
 pub fn date(_shell: &Shell, args: &[String]) -> CommandResult {

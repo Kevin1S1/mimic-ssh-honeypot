@@ -120,6 +120,8 @@ struct MimicHandler {
 
     opened_at: std::time::Instant,
 
+    session_deadline: tokio::time::Instant,
+
     command_count: u64,
 
     persona: Arc<crate::persona::Persona>,
@@ -163,6 +165,8 @@ impl MimicHandler {
             accepted_env: Vec::new(),
             banner_logged: false,
             opened_at: std::time::Instant::now(),
+            session_deadline: tokio::time::Instant::now()
+                + Duration::from_secs(shared.config.max_session_secs),
             command_count: 0,
             _guard: guard,
         }
@@ -254,8 +258,21 @@ impl MimicHandler {
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         self.drain_captures();
+        self.wait_out_owed_delay().await;
         jitter_for(output.text.len() + output.stdout.len() + output.stderr.len()).await;
         self.write_output(channel, output, session)
+    }
+
+    // What `sleep` asked for. An async timer, so no runtime worker is held;
+    // only this session stalls. It is cut short at the session deadline so a
+    // batch of queued `sleep` lines cannot outlast the watchdog's disconnect.
+    async fn wait_out_owed_delay(&mut self) {
+        let owed = self.shell().take_owed_delay();
+        if owed.is_zero() {
+            return;
+        }
+        let until = (tokio::time::Instant::now() + owed).min(self.session_deadline);
+        tokio::time::sleep_until(until).await;
     }
 
     fn show_prompt(
@@ -373,6 +390,7 @@ impl MimicHandler {
                 &self.config.hostname,
                 (*self.persona).clone(),
             );
+            shell.pid = self.persona.shell_pid(self.session_id);
             for (key, value) in self.connection_env() {
                 shell.env.set(&key, &value);
             }

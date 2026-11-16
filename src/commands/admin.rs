@@ -23,8 +23,6 @@ const UNIT_NOT_FOUND_STATUS: i32 = 4;
 const GETENT_KEY_NOT_FOUND_STATUS: i32 = 2;
 const NOHUP_CANNOT_RUN_STATUS: i32 = 125;
 
-const SLEEP_UNIT_SUFFIXES: [char; 4] = ['s', 'm', 'h', 'd'];
-
 fn read_text(shell: &Shell, path: &str) -> String {
     shell
         .vfs
@@ -97,21 +95,37 @@ fn missing_operand(command: &str) -> CommandResult {
     CommandResult::err(format!("{command}: missing operand\n"), USAGE_STATUS)
 }
 
-pub fn sleep(_shell: &Shell, args: &[String]) -> CommandResult {
+fn sleep_interval_secs(arg: &str) -> Option<f64> {
+    let (number, unit_secs) = match arg.char_indices().last() {
+        Some((at, 's')) => (&arg[..at], 1.0),
+        Some((at, 'm')) => (&arg[..at], 60.0),
+        Some((at, 'h')) => (&arg[..at], 3_600.0),
+        Some((at, 'd')) => (&arg[..at], 86_400.0),
+        _ => (arg, 1.0),
+    };
+    let value = number.parse::<f64>().ok()?;
+    (value >= 0.0).then_some(value * unit_secs)
+}
+
+// The shell itself never blocks: the interval is recorded as time owed and
+// the SSH layer waits it out, asynchronously, before sending the output.
+pub fn sleep(shell: &mut Shell, args: &[String]) -> CommandResult {
     if args.is_empty() {
         return CommandResult::err(
             "sleep: missing operand\nTry 'sleep --help' for more information.\n",
             1,
         );
     }
-    let is_interval = |a: &&String| {
-        a.trim_end_matches(SLEEP_UNIT_SUFFIXES)
-            .parse::<f64>()
-            .is_ok()
-    };
-    if let Some(invalid) = args.iter().find(|a| !is_interval(a)) {
-        return CommandResult::err(format!("sleep: invalid time interval '{invalid}'\n"), 1);
+    let mut total_secs = 0.0;
+    for arg in args {
+        match sleep_interval_secs(arg) {
+            Some(secs) => total_secs += secs,
+            None => {
+                return CommandResult::err(format!("sleep: invalid time interval '{arg}'\n"), 1)
+            }
+        }
     }
+    shell.owe_delay(total_secs);
     CommandResult::empty()
 }
 
@@ -676,6 +690,44 @@ mod tests {
         assert_eq!(run(&mut shell, "sleep 0.5"), "");
         assert_eq!(run(&mut shell, "sleep 2m"), "");
         assert!(run(&mut shell, "sleep abc").contains("invalid time interval"));
+        assert!(run(&mut shell, "sleep -1").contains("invalid time interval"));
+        assert!(run(&mut shell, "sleep 5ms").contains("invalid time interval"));
+    }
+
+    #[test]
+    fn sleep_owes_its_interval_instead_of_blocking() {
+        use std::time::Duration;
+        let mut shell = Shell::new("root", "debian");
+        let started = std::time::Instant::now();
+
+        run(&mut shell, "sleep 2");
+        assert_eq!(shell.take_owed_delay(), Duration::from_secs(2));
+        assert_eq!(shell.take_owed_delay(), Duration::ZERO);
+
+        run(&mut shell, "sleep 0.5 1; sleep 1s");
+        assert_eq!(shell.take_owed_delay(), Duration::from_millis(2_500));
+
+        run(&mut shell, "sleep abc");
+        assert_eq!(shell.take_owed_delay(), Duration::ZERO);
+
+        for line in [
+            "sleep 1d",
+            "sleep infinity",
+            "sleep 1e300",
+            "sleep 20; sleep 20",
+        ] {
+            run(&mut shell, line);
+            assert_eq!(shell.take_owed_delay(), Shell::MAX_OWED_DELAY, "{line}");
+        }
+
+        run(&mut shell, "sleep 3");
+        run(&mut shell, "true");
+        assert_eq!(
+            shell.take_owed_delay(),
+            Duration::ZERO,
+            "a delay nobody collected must not leak into the next line"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

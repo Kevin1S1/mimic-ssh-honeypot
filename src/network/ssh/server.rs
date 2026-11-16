@@ -23,6 +23,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         crate::persona::Persona::from_seed(persona_seed(&host_keys, &config.sensor_name))
             .with_host_keys(host_key_files(&host_keys)),
     );
+    crate::clock::set_uptime_at_start(persona.uptime_at_start_secs);
     let server_config = Arc::new(server_config(&config, host_keys));
 
     let registry = ConnectionRegistry::new(config.max_sessions, config.per_ip_connections);
@@ -213,7 +214,12 @@ pub(super) fn persona_seed(keys: &[russh::keys::PrivateKey], sensor_name: &str) 
     let mut hasher = Sha256::new();
     hasher.update(b"mimic-persona-v1");
     hasher.update(sensor_name.as_bytes());
-    for key in keys {
+    // The ECDSA key arrived after sensors were already deployed; leaving it
+    // out keeps every existing sensor's persona what it was.
+    let seeding = keys
+        .iter()
+        .filter(|key| !matches!(key.algorithm(), russh::keys::Algorithm::Ecdsa { .. }));
+    for key in seeding {
         if let Ok(blob) = key.public_key().to_openssh() {
             hasher.update(blob.as_bytes());
         }
@@ -248,6 +254,25 @@ pub(super) async fn shutdown_signal() {
     }
 }
 
+// sshd lists host key algorithms in the order it loads its keys (RSA, ECDSA,
+// Ed25519), and has not offered SHA-1 `ssh-rsa` by default since 8.8.
+const HOST_KEY_ALGORITHMS: &[russh::keys::Algorithm] = &[
+    russh::keys::Algorithm::Rsa {
+        hash: Some(russh::keys::HashAlg::Sha512),
+    },
+    russh::keys::Algorithm::Rsa {
+        hash: Some(russh::keys::HashAlg::Sha256),
+    },
+    russh::keys::Algorithm::Ecdsa {
+        curve: russh::keys::EcdsaCurve::NistP256,
+    },
+    russh::keys::Algorithm::Ed25519,
+];
+
+// The KEXINIT of `OpenSSH_9.2p1 Debian-2+deb12u3` with default sshd_config,
+// in its order, less what russh cannot negotiate: the
+// `sntrup761x25519-sha512@openssh.com` kex and the four `umac-*` MACs.
+// `ext-info-s` is left out on purpose: sshd only started sending it in 9.6.
 pub(super) fn debian_openssh_preferred() -> russh::Preferred {
     use std::borrow::Cow;
     russh::Preferred {
@@ -257,16 +282,19 @@ pub(super) fn debian_openssh_preferred() -> russh::Preferred {
             russh::kex::ECDH_SHA2_NISTP256,
             russh::kex::ECDH_SHA2_NISTP384,
             russh::kex::ECDH_SHA2_NISTP521,
+            russh::kex::DH_GEX_SHA256,
             russh::kex::DH_G16_SHA512,
+            russh::kex::DH_G18_SHA512,
             russh::kex::DH_G14_SHA256,
-            russh::kex::EXTENSION_SUPPORT_AS_SERVER,
             russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
         ]),
+        key: Cow::Borrowed(HOST_KEY_ALGORITHMS),
         cipher: Cow::Borrowed(&[
             russh::cipher::CHACHA20_POLY1305,
             russh::cipher::AES_128_CTR,
             russh::cipher::AES_192_CTR,
             russh::cipher::AES_256_CTR,
+            russh::cipher::AES_128_GCM,
             russh::cipher::AES_256_GCM,
         ]),
         mac: Cow::Borrowed(&[
@@ -277,6 +305,7 @@ pub(super) fn debian_openssh_preferred() -> russh::Preferred {
             russh::mac::HMAC_SHA512,
             russh::mac::HMAC_SHA1,
         ]),
+        compression: Cow::Borrowed(&[russh::compression::NONE, russh::compression::ZLIB_LEGACY]),
         ..russh::Preferred::DEFAULT
     }
 }

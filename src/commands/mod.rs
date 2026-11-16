@@ -197,7 +197,7 @@ fn dispatch_inner(shell: &mut Shell, argv: &[String]) -> CommandResult {
         "unset" => CommandHandler::Mut(system::unset),
         "clear" => CommandHandler::Read(system::clear),
 
-        "sleep" => CommandHandler::Read(admin::sleep),
+        "sleep" => CommandHandler::Mut(admin::sleep),
         "passwd" => CommandHandler::Mut(admin::passwd),
         "chpasswd" => CommandHandler::Mut(admin::chpasswd),
         "useradd" | "adduser" => CommandHandler::Mut(admin::useradd),
