@@ -36,10 +36,18 @@ MemoryHigh=768M
 MemoryMax=1G
 
 # Run as a transient, unprivileged user with a persistent state directory at
-# /var/lib/mimic (host keys + quarantine resolve here via WorkingDirectory).
+# /var/lib/mimic (systemd creates it and chowns it to the transient user).
 DynamicUser=yes
 StateDirectory=mimic
 WorkingDirectory=/var/lib/mimic
+
+# The reference mimic.toml (shared with the Docker deployment) writes under
+# /data. Bind the writable StateDirectory onto /data inside the unit's mount
+# namespace so those absolute paths resolve to persistent, writable storage.
+# Without this, ProtectSystem=strict makes /data read-only and the service
+# fails at startup trying to create /data/host_keys. The bind target is created
+# automatically; nothing outside the unit's namespace is affected.
+BindPaths=/var/lib/mimic:/data
 
 # Allow binding low ports (e.g. 22) without full root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE

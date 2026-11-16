@@ -3,14 +3,20 @@ use std::path::{Path, PathBuf};
 
 const EMULATION_DIRS: &[&str] = &["src/shell", "src/vfs", "src/commands"];
 
+// Needles are matched against each source line with all whitespace removed (see
+// `collect_violations`), so `std :: fs` and `std::fs` both trip, and the brace
+// and alias import forms below cannot slip past.
 const FORBIDDEN: &[&str] = &[
     "std::process",
     "process::Command",
     "std::fs",
     "std::{",
     "std::env",
+    "stdas",   // `use std as s;` then `s::fs::…`
     "tokio::fs",
     "tokio::net",
+    "tokio::{", // `use tokio::{net::TcpStream};`
+    "tokioas",  // `use tokio as t;`
     "TcpStream",
     "TcpListener",
     "UdpSocket",
@@ -51,8 +57,12 @@ fn collect_violations(dir: &Path, out: &mut Vec<String>) {
         let source =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
         for (lineno, line) in source.lines().enumerate() {
+            // Remove whitespace so spacing tricks (`std :: fs`, line-wrapped use
+            // statements collapse per-line but at least intra-line spacing) can't
+            // defeat a substring needle.
+            let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
             for needle in FORBIDDEN {
-                if line.contains(needle) {
+                if compact.contains(needle) {
                     out.push(format!("{}:{}: {}", path.display(), lineno + 1, needle));
                 }
             }

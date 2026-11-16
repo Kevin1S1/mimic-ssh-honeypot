@@ -125,6 +125,8 @@ pub struct Shell {
 
     pub nesting: u32,
 
+    pub dispatch_budget: u32,
+
     subst_budget: usize,
 
     subst_stderr: String,
@@ -177,6 +179,7 @@ impl Shell {
             pid: SHELL_PID,
             login: crate::clock::now(),
             nesting: 0,
+            dispatch_budget: commands::MAX_DISPATCHES_PER_LINE,
             subst_budget: commands::MAX_COMMAND_OUTPUT_BYTES,
             subst_stderr: String::new(),
             stdin: None,

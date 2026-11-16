@@ -53,17 +53,40 @@ impl QuarantineStore {
 
     pub(super) fn write(&mut self, sha256: &str, data: &[u8]) -> Result<String, QuarantineRefusal> {
         let len = data.len() as u64;
+        // `session_bytes` is per-session (single owner), so check-then-add is
+        // fine here.
         if self.session_bytes.saturating_add(len) > self.session_cap {
             return Err(QuarantineRefusal::SessionCap);
         }
-        let current_global = self.global_bytes.load(Ordering::Relaxed);
-        if current_global.saturating_add(len) > self.global_cap {
+        // `global_bytes` is shared across all sessions. Reserve atomically so two
+        // sessions can't both pass a check-then-add race and overshoot the cap.
+        let cap = self.global_cap;
+        if self
+            .global_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                let next = cur.saturating_add(len);
+                (next <= cap).then_some(next)
+            })
+            .is_err()
+        {
             return Err(QuarantineRefusal::GlobalCap);
         }
-        let (path, written) =
-            write_quarantine(&self.dir, sha256, data).map_err(QuarantineRefusal::Io)?;
+
+        let (path, written) = match write_quarantine(&self.dir, sha256, data) {
+            Ok(result) => result,
+            Err(e) => {
+                // Writing failed: release the full reservation.
+                self.global_bytes.fetch_sub(len, Ordering::Relaxed);
+                return Err(QuarantineRefusal::Io(e));
+            }
+        };
+        // Release any over-reservation: a dedup hit writes 0 bytes, a truncated
+        // or short write fewer than `len`.
+        if written < len {
+            self.global_bytes
+                .fetch_sub(len - written, Ordering::Relaxed);
+        }
         self.session_bytes += written;
-        self.global_bytes.fetch_add(written, Ordering::Relaxed);
         Ok(path)
     }
 }
@@ -240,7 +263,11 @@ fn stage_and_commit(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(0),
         Err(e) => return Err(e),
     };
-    let written = file.write_all(data).and_then(|()| file.sync_all());
+    // No fsync: quarantine writes run inline on an async runtime worker, and
+    // sync_all() blocks it for the whole flush. The atomic rename below still
+    // makes a fully written file appear at its final path; the only thing given
+    // up is durability across a host power loss, which a honeypot can tolerate.
+    let written = file.write_all(data);
     drop(file);
     if let Err(e) = written.and_then(|()| std::fs::rename(&staging, path)) {
         let _ = std::fs::remove_file(&staging);

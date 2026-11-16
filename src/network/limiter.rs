@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -37,6 +37,11 @@ impl ConnectionRegistry {
     }
 
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionGuard, RejectReason> {
+        // Key the per-source cap on the /64 for IPv6: a single attacker is
+        // routinely assigned a whole /64 (or larger), so keying on the exact
+        // address would let them evade `per_ip_connections` by rotating within
+        // their block. IPv4 is keyed on the full address.
+        let ip = per_source_key(ip);
         if !self.try_reserve_global_slot() {
             return Err(RejectReason::GlobalLimit);
         }
@@ -92,6 +97,19 @@ impl ConnectionRegistry {
         }
         drop(connections_per_ip);
         self.release_global_slot();
+    }
+}
+
+/// Normalise a peer address to the key used for per-source rate limiting.
+/// IPv6 addresses collapse to their /64 prefix; IPv4 addresses are unchanged.
+fn per_source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+        v4 => v4,
     }
 }
 

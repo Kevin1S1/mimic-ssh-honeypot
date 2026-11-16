@@ -35,6 +35,14 @@ use std::time::Duration;
 
 const MAX_COMMAND_LEN: usize = 4096;
 
+// Ceiling on server->client bytes russh may hold queued for a channel whose
+// peer has stopped advancing its receive window. russh queues such data in an
+// unbounded per-channel VecDeque; a client that pipelines many SFTP READs and
+// never reads the replies would otherwise grow it without limit. Several
+// windows' worth (default window is 2 MiB) of slack before we treat the peer as
+// abusive and drop the channel.
+const MAX_PENDING_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 const LOGOUT: &str = "logout\n";
 
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;

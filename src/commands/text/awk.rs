@@ -117,8 +117,11 @@ fn run(rules: &[AwkRule], text: &str, separator: Option<&str>) -> String {
             number: index as u64 + 1,
         };
         for rule in rules.iter().filter(|rule| record.matches(&rule.pattern)) {
-            out.push_str(&record.render(&rule.print_items));
+            record.render_into(&mut out, &rule.print_items);
             out.push('\n');
+            if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
+                break;
+            }
         }
 
         if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
@@ -245,9 +248,20 @@ impl Record<'_> {
         }
     }
 
-    fn render(&self, items: &[String]) -> String {
-        let rendered: Vec<String> = items.iter().map(|item| self.value(item)).collect();
-        rendered.join(" ")
+    fn render_into(&self, out: &mut String, items: &[String]) {
+        // Append field by field, stopping as soon as the shared output buffer
+        // reaches the cap. A record with a long line and many print items would
+        // otherwise materialise (items x line) bytes at once before any size
+        // check ran.
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&self.value(item));
+            if out.len() >= MAX_COMMAND_OUTPUT_BYTES {
+                return;
+            }
+        }
     }
 
     fn value(&self, item: &str) -> String {

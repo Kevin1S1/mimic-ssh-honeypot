@@ -66,7 +66,11 @@ dir = "/data/logs"
 # older than that many days is deleted — at startup, hourly while running, and
 # on rotation — so the window survives restarts and downtime. Only this
 # appender's own files are touched. Must be between 1 and 3650.
-# retention_days = 30
+#
+# Set by default so a flood of events (e.g. many tiny SCP uploads) cannot fill
+# the disk with rotated log files forever. Raise, lower, or comment out to keep
+# every file indefinitely.
+retention_days = 30
 
 [auth]
 # Acceptance strategy. One of:

@@ -15,6 +15,13 @@ impl Vfs {
         if self.is_full(parent) {
             return parent;
         }
+        // Names are stored twice (on the node and in the parent's child map) and
+        // are never reclaimed, so count them toward the byte ceiling. Otherwise
+        // an attacker could create thousands of long-named entries (or long
+        // symlink targets, see `add_symlink`) that the 8 MiB cap never sees.
+        if self.content_bytes + name.len() > MAX_VFS_BYTES {
+            return parent;
+        }
         let id = self.nodes.len();
         self.nodes.push(Node {
             name: name.to_string(),
@@ -25,6 +32,7 @@ impl Vfs {
         if let NodeKind::Directory { children } = &mut self.nodes[parent].kind {
             children.insert(name.to_string(), id);
         }
+        self.content_bytes += name.len();
         id
     }
 
@@ -125,10 +133,20 @@ impl Vfs {
         if let Some(existing) = self.child(parent, name) {
             return existing;
         }
+        // The link target is unbounded attacker input (an SFTP SYMLINK packet
+        // carries up to a 256 KiB target); count it toward the byte ceiling so
+        // repeated links can't grow memory past the 8 MiB cap.
+        if self.content_bytes + target.len() > MAX_VFS_BYTES {
+            return parent;
+        }
         let kind = NodeKind::Symlink {
             target: target.to_string(),
         };
-        self.insert(parent, name, kind, Metadata::new(S_IFLNK, 0o777, 0, 0))
+        let id = self.insert(parent, name, kind, Metadata::new(S_IFLNK, 0o777, 0, 0));
+        if id != parent {
+            self.content_bytes += target.len();
+        }
+        id
     }
 
     pub fn mkdir_p(&mut self, path: &str, perms: u32, uid: u32, gid: u32) -> Option<NodeId> {

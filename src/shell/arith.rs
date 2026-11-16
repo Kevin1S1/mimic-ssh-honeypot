@@ -154,13 +154,22 @@ impl Parser<'_> {
     }
 
     fn unary(&mut self) -> Option<i64> {
-        if self.eat("-") {
-            return Some(self.unary()?.wrapping_neg());
+        // Consume a run of leading signs iteratively rather than recursively:
+        // `- - - … x` must not grow the call stack, or a long chain inside
+        // `$(( ))` would overflow it and abort the whole process (a stack
+        // overflow is not an unwinding panic and is not contained per-session).
+        let mut negate = false;
+        loop {
+            if self.eat("-") {
+                negate = !negate;
+            } else if self.eat("+") {
+                // Unary plus is a no-op.
+            } else {
+                break;
+            }
         }
-        if self.eat("+") {
-            return self.unary();
-        }
-        self.primary()
+        let value = self.primary()?;
+        Some(if negate { value.wrapping_neg() } else { value })
     }
 
     fn primary(&mut self) -> Option<i64> {
@@ -250,5 +259,18 @@ mod tests {
         let env = env();
         let expr = format!("{}1{}", "(".repeat(64), ")".repeat(64));
         assert_eq!(eval(&env, &expr), None);
+    }
+
+    #[test]
+    fn a_long_sign_chain_does_not_overflow_the_stack() {
+        let env = env();
+        // A flat run of unary signs must be handled without recursion. An even
+        // count leaves the value unchanged; an odd count negates it.
+        let even = format!("{}7", "-".repeat(500_000));
+        assert_eq!(eval(&env, &even), Some(7));
+        let odd = format!("{}7", "-".repeat(500_001));
+        assert_eq!(eval(&env, &odd), Some(-7));
+        let mixed = format!("{}7", "+-".repeat(250_000));
+        assert_eq!(eval(&env, &mixed), Some(7));
     }
 }
