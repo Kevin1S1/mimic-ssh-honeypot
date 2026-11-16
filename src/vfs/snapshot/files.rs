@@ -154,8 +154,7 @@ games:x:60:\n\
 users:x:100:\n\
 nogroup:x:65534:\n\
 ssh:x:114:\n\
-user:x:1000:
-";
+user:x:1000:\n";
 
 pub(super) const SHADOW: &str = "root:!:19000:0:99999:7:::\n\
 daemon:*:19000:0:99999:7:::\n\
