@@ -28,13 +28,12 @@ impl MimicHandler {
                     self.config.max_upload_bytes,
                 ));
 
-                session.data(channel, vec![SCP_READY])?;
-                Ok(())
+                self.send(channel, vec![SCP_READY], session)
             }
             ScpMode::Source { path } => {
                 self.log_command(cmd, CommandSource::Exec, Some(SCP_FAILURE_STATUS));
                 let msg = format!("\x01scp: {path}: No such file or directory\n");
-                session.data(channel, msg.into_bytes())?;
+                self.send(channel, msg.into_bytes(), session)?;
                 self.end_channel(channel, session, SCP_FAILURE_STATUS as u32)
             }
         }

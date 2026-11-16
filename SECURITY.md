@@ -135,6 +135,8 @@ the one gap that did exist (the SFTP request path) hard to notice. They are:
 | Shell history | 1000 entries | `shell/line.rs` | Per-session growth |
 | Environment | 256 vars × 4096 bytes | `shell/env.rs` | `export` flood |
 | Command output (stdout + stderr, shared) | 1 MiB | `commands/mod.rs` dispatch | Output amplification |
+| Shell, exec, screen and SCP output not yet read by the peer | 8 MiB, then disconnect | `network/ssh/mod.rs` | A peer that withholds its SSH window |
+| SFTP replies held for a peer that is not reading | 8 MiB, then channel close | `network/ssh/input.rs` | Pipelined reads with a withheld window |
 | Filter input (`sed`, `tr`, `base64`, …) | 1 MiB | `commands/text.rs` | Transforms that inflate their input |
 | `tr` set expansion | 1024 chars | `commands/text.rs` | 2 bytes of argument → 1.1M-char set |
 | Script lines run by `sh` | 4096 | `commands/system.rs` | CPU burn with no output to truncate |

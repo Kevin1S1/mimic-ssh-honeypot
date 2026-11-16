@@ -1,5 +1,8 @@
 use super::terminal::{BACKSPACE, CTRL_C, DELETE};
-use super::{send_if_any, MimicHandler, MAX_COMMAND_LEN, MAX_PENDING_OUTPUT_BYTES};
+use super::{
+    send_if_any, MimicHandler, MAX_COMMAND_LEN, MAX_PENDING_OUTPUT_BYTES,
+    QUEUED_WRITE_OVERHEAD_BYTES,
+};
 use crate::shell::line::{is_continuation, Reaction};
 use russh::server::Session;
 use russh::ChannelId;
@@ -36,6 +39,33 @@ impl OutputBacklog {
 
     pub(super) fn overflowed(&self) -> bool {
         self.held.len() > MAX_PENDING_OUTPUT_BYTES
+    }
+}
+
+/// Upper bound on the shell, exec, screen and SCP output that russh may still
+/// be holding for the peer.
+///
+/// russh reports only whether its queue is empty, so this counts every byte
+/// written since the queue was last seen empty at the start of a callback. It
+/// overstates the queue (the peer may have read part of it) and never
+/// understates it.
+#[derive(Default)]
+pub(super) struct OutputMeter {
+    unread: usize,
+}
+
+impl OutputMeter {
+    pub(super) fn peer_caught_up(&mut self) {
+        self.unread = 0;
+    }
+
+    /// Records one write; false once the peer is too far behind.
+    pub(super) fn charge(&mut self, len: usize) -> bool {
+        self.unread = self
+            .unread
+            .saturating_add(len)
+            .saturating_add(QUEUED_WRITE_OVERHEAD_BYTES);
+        self.unread <= MAX_PENDING_OUTPUT_BYTES
     }
 }
 
@@ -95,7 +125,7 @@ impl MimicHandler {
         for file in files {
             self.store_upload(file);
         }
-        send_if_any(session, channel, acks)
+        self.send(channel, acks, session)
     }
 
     pub(super) async fn feed_terminal_byte(
@@ -109,17 +139,17 @@ impl MimicHandler {
         }
         match self.editor.input(byte) {
             Reaction::Ignore => {}
-            Reaction::Write(bytes) => session.data(channel, bytes)?,
+            Reaction::Write(bytes) => self.send(channel, bytes, session)?,
             Reaction::Complete => {
                 let bytes = self.complete_current_word();
-                send_if_any(session, channel, bytes)?;
+                self.send(channel, bytes, session)?;
             }
             Reaction::Eof => {
                 self.logout(channel, session)?;
                 return Ok(true);
             }
             Reaction::Submit { echo, line } => {
-                session.data(channel, echo)?;
+                self.send(channel, echo, session)?;
                 return self.submit_terminal_line(channel, &line, session).await;
             }
         }
@@ -174,7 +204,7 @@ impl MimicHandler {
             CTRL_C => {
                 self.password_buf = None;
                 self.shell().pending = None;
-                session.data(channel, b"\r\n".to_vec())?;
+                self.send(channel, b"\r\n".to_vec(), session)?;
                 self.show_shell_prompt(channel, session)?;
             }
             BACKSPACE | DELETE => {
@@ -201,7 +231,7 @@ impl MimicHandler {
     ) -> Result<bool, russh::Error> {
         let password = self.password_buf.take().unwrap_or_default();
         let password = String::from_utf8_lossy(&password).into_owned();
-        session.data(channel, b"\r\n".to_vec())?;
+        self.send(channel, b"\r\n".to_vec(), session)?;
 
         let output = self.shell().resume(&password);
         if self.deliver(channel, &output, session).await? {

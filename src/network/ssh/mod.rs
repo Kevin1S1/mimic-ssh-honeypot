@@ -7,7 +7,7 @@ mod terminal;
 
 pub use server::serve;
 
-use input::OutputBacklog;
+use input::{OutputBacklog, OutputMeter};
 use quarantine::QuarantineStore;
 use screen::ScreenHold;
 use server::SharedState;
@@ -44,6 +44,11 @@ const MAX_COMMAND_LEN: usize = 4096;
 // window is 2 MiB) of slack before the peer is treated as abusive and the
 // channel is dropped.
 const MAX_PENDING_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+// What one queued write costs beyond its payload: russh keeps each write as
+// its own queue entry with its own allocation, so a flood of one-byte echoes
+// would otherwise be charged far less than the memory it holds.
+const QUEUED_WRITE_OVERHEAD_BYTES: usize = 64;
 
 const LOGOUT: &str = "logout\n";
 
@@ -104,6 +109,10 @@ struct MimicHandler {
 
     sftp_backlog: OutputBacklog,
 
+    output_meter: OutputMeter,
+
+    draining_channels: Vec<ChannelId>,
+
     quarantine_store: QuarantineStore,
 
     password_buf: Option<Vec<u8>>,
@@ -154,6 +163,8 @@ impl MimicHandler {
             scp: None,
             sftp: None,
             sftp_backlog: OutputBacklog::default(),
+            output_meter: OutputMeter::default(),
+            draining_channels: Vec::new(),
             quarantine_store: QuarantineStore::new(
                 &shared.config,
                 Arc::clone(&shared.global_quarantine_bytes),
@@ -170,6 +181,15 @@ impl MimicHandler {
             command_count: 0,
             _guard: guard,
         }
+    }
+
+    // A channel this side has closed stays alive inside russh until the output
+    // queued on it has gone out. A new channel is refused until then, so a
+    // peer that reads nothing cannot stack one queue per channel.
+    fn earlier_output_drained(&mut self, session: &Session) -> bool {
+        self.draining_channels
+            .retain(|&closed| session.has_pending_data(closed));
+        self.draining_channels.is_empty()
     }
 
     fn try_open_channel(&mut self, channel: u32) -> bool {
@@ -203,6 +223,7 @@ impl MimicHandler {
             self.scp = None;
             self.sftp = None;
             self.sftp_backlog = OutputBacklog::default();
+            self.output_meter = OutputMeter::default();
             self.password_buf = None;
             self.line_buf.clear();
 
@@ -222,8 +243,60 @@ impl MimicHandler {
         session.exit_status_request(channel, status)?;
         session.eof(channel)?;
         session.close(channel)?;
+        if session.has_pending_data(channel) {
+            self.draining_channels.push(channel);
+        }
         self.close_channel(channel.number());
         Ok(())
+    }
+
+    // Shell, exec, screen and SCP output all goes through here. russh sends
+    // what the peer's window allows and queues the rest without bound, and
+    // everything written during one callback sits in memory until that
+    // callback returns. The meter counts what has been written since a
+    // callback last began with russh's queue empty; a peer that lets that pass
+    // the ceiling is not reading, and the connection is dropped.
+    fn send(
+        &mut self,
+        channel: ChannelId,
+        bytes: Vec<u8>,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.charge_output(bytes.len())?;
+        session.data(channel, bytes)
+    }
+
+    fn send_stderr(
+        &mut self,
+        channel: ChannelId,
+        bytes: Vec<u8>,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.charge_output(bytes.len())?;
+        session.extended_data(channel, SSH_EXTENDED_DATA_STDERR, bytes)
+    }
+
+    fn charge_output(&mut self, len: usize) -> Result<(), russh::Error> {
+        if self.output_meter.charge(len) {
+            return Ok(());
+        }
+        tracing::debug!(
+            event = "output_backlog_exceeded",
+            session_id = self.session_id,
+        );
+        Err(russh::Error::Disconnect)
+    }
+
+    fn note_peer_progress(&mut self, channel: ChannelId, session: &Session) {
+        if !session.has_pending_data(channel) {
+            self.output_meter.peer_caught_up();
+        }
     }
 
     fn out(&self, text: &str) -> Vec<u8> {
@@ -231,24 +304,16 @@ impl MimicHandler {
     }
 
     fn write_output(
-        &self,
+        &mut self,
         channel: ChannelId,
         output: &Output,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         if self.pty {
-            if !output.text.is_empty() {
-                session.data(channel, self.out(&output.text))?;
-            }
-            return Ok(());
+            return self.send(channel, self.out(&output.text), session);
         }
-        if !output.stdout.is_empty() {
-            session.data(channel, self.out(&output.stdout))?;
-        }
-        if !output.stderr.is_empty() {
-            session.extended_data(channel, SSH_EXTENDED_DATA_STDERR, self.out(&output.stderr))?;
-        }
-        Ok(())
+        self.send(channel, self.out(&output.stdout), session)?;
+        self.send_stderr(channel, self.out(&output.stderr), session)
     }
 
     async fn respond(
@@ -282,8 +347,8 @@ impl MimicHandler {
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         self.editor.set_prompt(prompt);
-        session.data(channel, self.editor.render().to_vec())?;
-        Ok(())
+        let rendered = self.editor.render().to_vec();
+        self.send(channel, rendered, session)
     }
 
     fn show_shell_prompt(
@@ -305,7 +370,7 @@ impl MimicHandler {
     }
 
     fn logout(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
-        session.data(channel, self.out(LOGOUT))?;
+        self.send(channel, self.out(LOGOUT), session)?;
         self.end_shell_channel(channel, session)
     }
 
@@ -559,7 +624,7 @@ impl Handler for MimicHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.log_client_banner(session);
-        if self.try_open_channel(channel.id().number()) {
+        if self.earlier_output_drained(session) && self.try_open_channel(channel.id().number()) {
             reply.accept().await;
         } else {
             reply
@@ -673,7 +738,7 @@ impl Handler for MimicHandler {
         self.shell().interactive = pty;
 
         let banner = self.out(&self.motd());
-        session.data(channel, banner)?;
+        self.send(channel, banner, session)?;
         if !self.pty {
             return Ok(());
         }
@@ -684,7 +749,7 @@ impl Handler for MimicHandler {
             crate::clock::format(prev, "%a %b %e %H:%M:%S %Y"),
             crate::clock::PREV_LOGIN_FROM,
         ));
-        session.data(channel, last_login)?;
+        self.send(channel, last_login, session)?;
         self.show_shell_prompt(channel, session)
     }
 
@@ -713,6 +778,7 @@ impl Handler for MimicHandler {
         if self.sftp.is_some() {
             return self.feed_sftp(channel, data, session);
         }
+        self.note_peer_progress(channel, session);
         if self.scp.is_some() {
             return self.feed_scp(channel, data, session);
         }
@@ -739,9 +805,13 @@ impl Handler for MimicHandler {
     ) -> Result<(), Self::Error> {
         // russh has already flushed what the new window allows; if that emptied
         // its queue, the replies held back for this peer can follow.
-        if self.sftp.is_some() && self.active_channel == Some(channel.number()) {
-            self.pump_sftp_output(channel, session)?;
+        if self.active_channel != Some(channel.number()) {
+            return Ok(());
         }
+        if self.sftp.is_some() {
+            return self.pump_sftp_output(channel, session);
+        }
+        self.note_peer_progress(channel, session);
         Ok(())
     }
 
@@ -750,6 +820,7 @@ impl Handler for MimicHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.note_peer_progress(channel, session);
         if self.scp.take().is_some() {
             self.end_channel(channel, session, 0)?;
         } else if self.sftp.is_some() {

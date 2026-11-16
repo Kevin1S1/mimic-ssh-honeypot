@@ -235,6 +235,35 @@ fn sftp_replies_are_held_until_the_peer_drains_and_the_backlog_is_capped() {
 }
 
 #[test]
+fn the_output_meter_trips_past_the_ceiling_and_resets_when_the_peer_catches_up() {
+    let mut meter = OutputMeter::default();
+    let megabyte = 1024 * 1024;
+    let writes_that_fit = MAX_PENDING_OUTPUT_BYTES / (megabyte + QUEUED_WRITE_OVERHEAD_BYTES);
+
+    for _ in 0..writes_that_fit {
+        assert!(meter.charge(megabyte), "output under the ceiling passes");
+    }
+    assert!(!meter.charge(megabyte), "an unread peer is cut off");
+
+    meter.peer_caught_up();
+    assert!(meter.charge(megabyte), "a peer that reads starts over");
+}
+
+#[test]
+fn the_output_meter_charges_each_write_more_than_its_payload() {
+    let mut meter = OutputMeter::default();
+    let one_byte_writes = MAX_PENDING_OUTPUT_BYTES / (1 + QUEUED_WRITE_OVERHEAD_BYTES);
+
+    for _ in 0..one_byte_writes {
+        assert!(meter.charge(1));
+    }
+    assert!(
+        !meter.charge(1),
+        "tiny writes are bounded by their queue cost, not their payload"
+    );
+}
+
+#[test]
 fn accept_after_grants_on_the_nth_attempt() {
     let mut handler = test_handler(std::env::temp_dir(), 1024);
     handler.config = Arc::new(Config {
@@ -568,6 +597,82 @@ async fn a_shell_without_a_pty_runs_no_line_editor() {
     );
 
     assert_eq!(status, Some(2), "missing exit status");
+}
+
+const NEAR_OUTPUT_CAP: &[u8] = b"seq 1 150000\n";
+
+async fn output_of_one_capped_command(tag: &str) -> usize {
+    let (_handle, mut channel, _dir) = exec_session(tag, NEAR_OUTPUT_CAP, false).await;
+    let (seen, status) = drain_until_closed(&mut channel).await;
+    assert_eq!(status, Some(0));
+    seen.len()
+}
+
+fn lines_past_the_ceiling(bytes_per_line: usize) -> usize {
+    MAX_PENDING_OUTPUT_BYTES / bytes_per_line + 3
+}
+
+#[tokio::test]
+async fn exec_output_near_the_cap_arrives_whole() {
+    let len = output_of_one_capped_command("cap-exec").await;
+    assert!(
+        len > 900 * 1024,
+        "the probe should sit near the 1 MiB cap, got {len}"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_keeps_reading_gets_more_output_than_the_ceiling() {
+    let one = output_of_one_capped_command("cap-reading").await;
+    let lines = lines_past_the_ceiling(one);
+    let (_handle, mut channel, _dir) = pipe_shell_session("reading-peer").await;
+    read_for(&mut channel, Duration::from_millis(300)).await;
+
+    let mut seen = 0;
+    for sent in 1..=lines {
+        channel.data(NEAR_OUTPUT_CAP).await.expect("send line");
+        while seen < sent * one {
+            let msg = channel.wait().await.expect("channel stays open");
+            if let russh::ChannelMsg::Data { ref data } = msg {
+                seen += data.len();
+            }
+        }
+    }
+    channel.eof().await.expect("send eof");
+    let (_, status) = drain_until_closed(&mut channel).await;
+
+    assert!(seen > MAX_PENDING_OUTPUT_BYTES, "only {seen} bytes seen");
+    assert_eq!(status, Some(0), "a peer that keeps reading is not cut off");
+}
+
+#[tokio::test]
+async fn output_piled_up_faster_than_the_peer_can_read_drops_the_connection() {
+    let one = output_of_one_capped_command("cap-unread").await;
+    let lines = lines_past_the_ceiling(one);
+    let (_handle, mut channel, _dir) = pipe_shell_session("unread-output").await;
+
+    let script = NEAR_OUTPUT_CAP.repeat(lines);
+    channel.data(&script[..]).await.expect("send script");
+
+    let mut seen = 0;
+    let mut status = None;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => seen += data.len(),
+                russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("server dropped the connection");
+
+    assert_eq!(status, None, "the session was cut off, not finished");
+    assert!(
+        seen < lines * one,
+        "the whole script's output must not have been queued: {seen}"
+    );
 }
 
 #[tokio::test]
