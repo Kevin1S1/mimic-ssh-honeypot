@@ -60,6 +60,27 @@ fn human_kib(kb: u64) -> String {
     }
 }
 
+// coreutils `df -h`: single-letter binary suffixes, rounded up, one decimal
+// below ten. (`free -h` is procps and does print `Gi`/`Mi`.)
+fn df_human(kb: u64) -> String {
+    const UNITS: [&str; 4] = ["K", "M", "G", "T"];
+    if kb == 0 {
+        return "0".to_string();
+    }
+    let mut value = kb as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let tenths = (value * 10.0).ceil() / 10.0;
+    if tenths < 10.0 {
+        format!("{tenths:.1}{}", UNITS[unit])
+    } else {
+        format!("{:.0}{}", value.ceil(), UNITS[unit])
+    }
+}
+
 const SHM_RAM_DIVISOR: u64 = 2;
 
 const RUN_RAM_DIVISOR: u64 = 10;
@@ -67,6 +88,8 @@ const RUN_RAM_DIVISOR: u64 = 10;
 const UDEV_RESERVED_KB: u64 = 5270;
 
 const RUN_USED_KB: u64 = 960;
+
+const KB_PER_PAGE: u64 = 4;
 
 const ROOT_USED_PERCENT: u64 = 16;
 
@@ -89,17 +112,19 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
         format!(
             "Filesystem      Size  Used Avail Use% Mounted on\n\
              udev            {udev:>4}     0  {udev:>4}   0% /dev\n\
-             tmpfs           {run:>4}  960K  {run:>4}   1% /run\n\
+             tmpfs           {run:>4}  {run_used:>4}  {run_avail:>4}   1% /run\n\
              /dev/sda1       {disk:>4}  {used:>4}  {avail:>4}  {pct}% /\n\
              tmpfs           {shm:>4}     0  {shm:>4}   0% /dev/shm\n\
              tmpfs           5.0M     0  5.0M   0% /run/lock\n\
              tmpfs           {run:>4}     0  {run:>4}   0% /run/user/{uid}\n",
-            udev = human_kib(udev),
-            run = human_kib(run),
-            shm = human_kib(shm),
-            disk = human_kib(disk),
-            used = human_kib(used),
-            avail = human_kib(avail),
+            udev = df_human(udev),
+            run = df_human(run),
+            run_used = df_human(RUN_USED_KB),
+            run_avail = df_human(run - RUN_USED_KB),
+            shm = df_human(shm),
+            disk = df_human(disk),
+            used = df_human(used),
+            avail = df_human(avail),
             pct = pct,
             uid = uid,
         )
@@ -126,14 +151,20 @@ pub fn df(shell: &Shell, args: &[String]) -> CommandResult {
     CommandResult::ok(out)
 }
 
-pub fn mount(_shell: &Shell, _args: &[String]) -> CommandResult {
-    let out = "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
+pub fn mount(shell: &Shell, _args: &[String]) -> CommandResult {
+    let ram = shell.persona.memory().total;
+    let udev = ram / SHM_RAM_DIVISOR - UDEV_RESERVED_KB;
+    let udev_inodes = udev / KB_PER_PAGE;
+    let run = ram / RUN_RAM_DIVISOR;
+    let out = format!(
+        "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n\
         proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n\
-        udev on /dev type devtmpfs (rw,nosuid,relatime,size=1015532k,nr_inodes=253883,mode=755)\n\
+        udev on /dev type devtmpfs (rw,nosuid,relatime,size={udev}k,nr_inodes={udev_inodes},mode=755)\n\
         devpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000)\n\
-        tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,size=204120k,mode=755)\n\
+        tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,size={run}k,mode=755)\n\
         /dev/sda1 on / type ext4 (rw,relatime,errors=remount-ro)\n\
         tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev,inode64)\n\
-        tmpfs on /run/lock type tmpfs (rw,nosuid,nodev,noexec,relatime,size=5120k,inode64)\n";
+        tmpfs on /run/lock type tmpfs (rw,nosuid,nodev,noexec,relatime,size=5120k,inode64)\n"
+    );
     CommandResult::ok(out)
 }

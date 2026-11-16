@@ -95,7 +95,6 @@ const ROOT_USER: &str = "root";
 const ROOT_HOME: &str = "/root";
 const ROOT_UID: u32 = 0;
 const REGULAR_UID: u32 = 1000;
-const SHELL_PID: u32 = 1337;
 const HOME_DIR_MODE: u32 = 0o755;
 
 pub struct Shell {
@@ -151,6 +150,8 @@ pub struct Shell {
 
     heredoc_stdin: Option<String>,
 
+    owed_delay: std::time::Duration,
+
     pub heredoc_log: Option<String>,
 }
 
@@ -164,6 +165,7 @@ impl Shell {
         let account = Account::named(username);
         let home = account.ensure_home(&mut vfs);
         let env = Env::login(account.name, &account.home, hostname);
+        let pid = persona.shell_pid(0);
 
         Self {
             vfs,
@@ -176,7 +178,7 @@ impl Shell {
             uid: account.uid,
             gid: account.gid,
             last_status: 0,
-            pid: SHELL_PID,
+            pid,
             login: crate::clock::now(),
             nesting: 0,
             dispatch_budget: commands::MAX_DISPATCHES_PER_LINE,
@@ -188,6 +190,7 @@ impl Shell {
             screen: None,
             subst_depth: 0,
             heredoc_stdin: None,
+            owed_delay: std::time::Duration::ZERO,
             heredoc_log: None,
             persona,
             history: Vec::new(),
@@ -201,6 +204,24 @@ impl Shell {
     }
 
     pub const MAX_HISTORY: usize = 1000;
+
+    // Longest pause one submitted line can ask for. While the SSH layer waits
+    // it out the session reads no input (not even ^C), so it stays short.
+    pub const MAX_OWED_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Records time an emulated command would have blocked for.
+    pub fn owe_delay(&mut self, secs: f64) {
+        let extra = std::time::Duration::try_from_secs_f64(secs).unwrap_or(Self::MAX_OWED_DELAY);
+        self.owed_delay = self
+            .owed_delay
+            .saturating_add(extra)
+            .min(Self::MAX_OWED_DELAY);
+    }
+
+    /// Hands over the pause owed by the commands run since the last call.
+    pub fn take_owed_delay(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.owed_delay)
+    }
 
     pub fn record_history(&mut self, line: &str) {
         let line = line.trim();
@@ -356,7 +377,8 @@ mod tests {
         assert_eq!(shell.parse_line("echo $USER"), vec!["echo", "root"]);
         assert_eq!(shell.parse_line("echo ${HOME}"), vec!["echo", "/root"]);
         assert_eq!(shell.parse_line("echo $?"), vec!["echo", "7"]);
-        assert_eq!(shell.parse_line("echo $$"), vec!["echo", "1337"]);
+        let pid = shell.pid.to_string();
+        assert_eq!(shell.parse_line("echo $$"), vec!["echo", pid.as_str()]);
         assert_eq!(shell.parse_line("echo $#"), vec!["echo", "0"]);
         assert_eq!(shell.parse_line("echo $0"), vec!["echo", "-bash"]);
         assert_eq!(shell.parse_line("echo $1 $2"), vec!["echo"]);

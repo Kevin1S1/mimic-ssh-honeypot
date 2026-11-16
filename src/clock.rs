@@ -12,13 +12,16 @@ const DAYS_PER_ERA: i64 = 146_097;
 const YEARS_PER_ERA: i64 = 400;
 const DAYS_BEFORE_MONTH: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
-const BOOT_OFFSET_SECS: i64 = 184_860;
+const DEFAULT_UPTIME_AT_START_SECS: i64 = 184_860;
 
 const INSTALL_OFFSET_SECS: i64 = 95 * SECS_PER_DAY;
 
 const PREV_LOGIN_OFFSET_SECS: i64 = 3_720;
 
 const PREV_LOGIN_DURATION_SECS: i64 = 1_657;
+
+// The previous login has to fit between boot and now.
+const MIN_UPTIME_AT_START_SECS: i64 = PREV_LOGIN_OFFSET_SECS + PREV_LOGIN_DURATION_SECS + 1;
 
 pub const PREV_LOGIN_FROM: &str = "10.0.0.5";
 
@@ -29,9 +32,16 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+static BOOT: OnceLock<i64> = OnceLock::new();
+
+/// Fixes how long the emulated host had been up when this process started.
+/// Takes effect only before the first `boot_time()` call; returns whether it did.
+pub fn set_uptime_at_start(secs: i64) -> bool {
+    BOOT.set(now() - secs.max(MIN_UPTIME_AT_START_SECS)).is_ok()
+}
+
 pub fn boot_time() -> i64 {
-    static BOOT: OnceLock<i64> = OnceLock::new();
-    *BOOT.get_or_init(|| now() - BOOT_OFFSET_SECS)
+    *BOOT.get_or_init(|| now() - DEFAULT_UPTIME_AT_START_SECS)
 }
 
 pub fn uptime_secs() -> i64 {
@@ -234,6 +244,13 @@ mod tests {
 
         assert_eq!(boot_time(), boot_time());
         assert_eq!(install_time(), install_time());
+    }
+
+    #[test]
+    fn a_configured_uptime_only_applies_before_the_clock_is_read() {
+        let boot = boot_time();
+        assert!(!set_uptime_at_start(40 * SECS_PER_DAY));
+        assert_eq!(boot_time(), boot);
     }
 
     #[test]

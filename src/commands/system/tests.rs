@@ -446,6 +446,86 @@ fn df_human_flag_changes_units() {
 }
 
 #[test]
+fn df_human_prints_coreutils_suffixes_not_procps_ones() {
+    for seed in 0..16u64 {
+        let persona = crate::persona::Persona::from_seed(seed);
+        let mut shell = Shell::with_persona("root", "debian", persona);
+        let out = run(&mut shell, "df -h");
+
+        for row in out.lines().skip(1) {
+            for size in row.split_whitespace().skip(1).take(3) {
+                let (number, suffix) = match size.char_indices().last() {
+                    Some((at, c)) if c.is_ascii_alphabetic() => (&size[..at], &size[at..]),
+                    _ => (size, ""),
+                };
+                assert!(
+                    matches!(suffix, "K" | "M" | "G" | "T") || size == "0",
+                    "seed={seed}: {size:?} in {row:?}"
+                );
+                assert!(number.parse::<f64>().is_ok(), "seed={seed}: {size:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn df_human_rounds_up_like_coreutils() {
+    let persona = crate::persona::Persona::from_seed(0);
+    let disk_kb = persona.disk_total_kb;
+    let mut shell = Shell::with_persona("root", "debian", persona);
+    let out = run(&mut shell, "df -h");
+
+    let gib = disk_kb as f64 / 1024.0 / 1024.0;
+    let expected = if gib < 10.0 {
+        format!("{:.1}G", (gib * 10.0).ceil() / 10.0)
+    } else {
+        format!("{:.0}G", gib.ceil())
+    };
+    let root = out.lines().find(|l| l.ends_with(" /")).expect("a / row");
+    assert_eq!(
+        root.split_whitespace().nth(1),
+        Some(expected.as_str()),
+        "{out}"
+    );
+    assert!(out.contains("  960K  "), "{out}");
+    assert!(out.contains("5.0M     0  5.0M"), "{out}");
+}
+
+#[test]
+fn dmesg_and_mount_follow_the_persona() {
+    for seed in 0..16u64 {
+        let persona = crate::persona::Persona::from_seed(seed);
+        let (total, cpu) = (persona.mem_total_kb, persona.cpu.name);
+        let mut shell = Shell::with_persona("root", "debian", persona);
+
+        let dmesg = run(&mut shell, "dmesg");
+        let memory = dmesg
+            .lines()
+            .find_map(|l| l.split_once("] Memory: "))
+            .map(|(_, figures)| figures)
+            .expect("a Memory: line");
+        let figures: Vec<u64> = memory
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        let (available, installed) = (figures[0], figures[1]);
+        assert!(available < total, "seed={seed}: {memory}");
+        assert!(total <= installed, "seed={seed}: {memory}");
+        assert!(installed - total < 1024 * 1024, "seed={seed}: {memory}");
+        assert!(
+            dmesg.contains(&format!("CPU0: {cpu} (family: ")),
+            "seed={seed}"
+        );
+
+        let mount = run(&mut shell, "mount");
+        assert!(
+            mount.contains(&format!("size={}k,mode=755", total / 10)),
+            "seed={seed}: /run should be RAM/10 as in df: {mount}"
+        );
+    }
+}
+
+#[test]
 fn mount_lists_fabricated_table() {
     let mut shell = Shell::new("root", "debian");
     assert!(run(&mut shell, "mount").contains("/dev/sda1 on / type ext4"));

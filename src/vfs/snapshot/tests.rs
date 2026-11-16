@@ -155,3 +155,50 @@ fn shadow_holds_no_real_credentials() {
         );
     }
 }
+
+#[test]
+fn every_owner_and_group_ls_can_print_is_in_the_account_databases() {
+    use crate::commands::fs::{gid_name, uid_name};
+
+    let fs = build("srv1", &Persona::sample());
+    let passwd = read(&fs, "/etc/passwd");
+    let group = read(&fs, "/etc/group");
+
+    let mut pending = vec![fs.root()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let meta = &fs.node(id).meta;
+        let path = fs.path_of(id);
+
+        let owner = format!("{}:x:{}:", uid_name(meta.uid), meta.uid);
+        assert!(
+            passwd.lines().any(|l| l.starts_with(&owner)),
+            "{path}: no /etc/passwd entry starts with {owner:?}"
+        );
+        let owning_group = format!("{}:x:{}:", gid_name(meta.gid), meta.gid);
+        assert!(
+            group.lines().any(|l| l.starts_with(&owning_group)),
+            "{path}: no /etc/group entry starts with {owning_group:?}"
+        );
+
+        pending.extend(fs.entries(id).into_iter().flatten().map(|(_, child)| child));
+    }
+    assert!(seen.len() > 100, "the walk should cover the whole snapshot");
+}
+
+#[test]
+fn every_primary_group_in_passwd_exists() {
+    let fs = build("srv1", &Persona::sample());
+    let group = read(&fs, "/etc/group");
+    let gids: std::collections::BTreeSet<&str> =
+        group.lines().filter_map(|l| l.split(':').nth(2)).collect();
+
+    assert_eq!(gids.len(), group.lines().count(), "duplicate gid");
+    for account in read(&fs, "/etc/passwd").lines() {
+        let gid = account.split(':').nth(3).expect("a gid field");
+        assert!(gids.contains(gid), "{account}: gid {gid} has no group");
+    }
+}

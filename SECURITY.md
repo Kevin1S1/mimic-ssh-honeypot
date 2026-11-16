@@ -58,7 +58,7 @@ A deployment-level daily reset mechanism restarts the honeypot and wipes accumul
 - **Limits quarantine disk growth** — captured SCP uploads are purged daily, bounding the on-disk footprint without operator intervention.
 - **Clears in-memory state** — VFS modifications, shell histories, and per-session artifacts from previous attackers are discarded, preventing one attacker's leftovers from confusing or alerting the next.
 - **Randomised timing** — the restart occurs at a random time within a configurable window (default: 0–3 hours), so the reset is not predictable from `uptime` output or connection-drop patterns. Fixed-schedule restarts are a honeypot fingerprinting vector. Note that the emulated uptime is anchored to process start, so it advances while MIMIC runs and returns to its starting value on restart — the randomised window is what keeps the moment of that reset unpredictable.
-- **Host keys are preserved** — Ed25519 and RSA keys survive the reset so the SSH fingerprint stays stable (a rotating fingerprint is a classic honeypot tell).
+- **Host keys are preserved** — Ed25519, RSA and ECDSA keys survive the reset so the SSH fingerprint stays stable (a rotating fingerprint is a classic honeypot tell).
 
 In Docker deployments, this is handled by a lightweight sidecar container. For systemd, a timer + one-shot service unit pair is provided. See [Daily reset](docs/deployment.md#daily-reset) for configuration.
 

@@ -105,6 +105,8 @@ pub(crate) fn gid_name(gid: u32) -> String {
     match gid {
         0 => "root".into(),
         4 => "adm".into(),
+        5 => "tty".into(),
+        6 => "disk".into(),
         8 => "mail".into(),
         27 => "sudo".into(),
         33 => "www-data".into(),

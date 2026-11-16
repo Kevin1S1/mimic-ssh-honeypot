@@ -295,6 +295,14 @@ impl russh::client::Handler for TestClient {
 }
 
 async fn honeypot_with(tag: &str, max_session_secs: u64) -> (ClientHandle, TestDir) {
+    honeypot_for(tag, max_session_secs, russh::client::Config::default()).await
+}
+
+async fn honeypot_for(
+    tag: &str,
+    max_session_secs: u64,
+    client_config: russh::client::Config,
+) -> (ClientHandle, TestDir) {
     let dir = TestDir::new(tag);
     let probe = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -316,7 +324,7 @@ async fn honeypot_with(tag: &str, max_session_secs: u64) -> (ClientHandle, TestD
         let _ = serve(Arc::new(config)).await;
     });
 
-    let client_config = Arc::new(russh::client::Config::default());
+    let client_config = Arc::new(client_config);
     let mut handle = loop {
         match russh::client::connect(Arc::clone(&client_config), ("127.0.0.1", port), TestClient)
             .await
@@ -908,4 +916,181 @@ async fn a_later_exec_channel_does_not_inherit_the_pty() {
     let (seen, _) = drain_until_closed(&mut channel).await;
 
     assert_eq!(seen, b"hello\n", "the PTY leaked into a later exec channel");
+}
+
+#[tokio::test]
+async fn sleep_holds_the_reply_back_for_its_interval() {
+    const NAP: Duration = Duration::from_millis(700);
+
+    let (handle, _dir) = honeypot("sleep-delay").await;
+    let mut channel = open_channel(&handle).await;
+
+    let started = Instant::now();
+    channel
+        .exec(true, &b"sleep 0.7; echo awake"[..])
+        .await
+        .expect("exec");
+    let (seen, status) = drain_until_closed(&mut channel).await;
+
+    assert_eq!(seen, b"awake\n");
+    assert_eq!(status, Some(0));
+    assert!(
+        started.elapsed() >= NAP,
+        "`sleep 0.7` returned after only {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_sleep_cannot_outlast_the_session_cap() {
+    const CAP_SECS: u64 = 2;
+
+    let (handle, _dir) = honeypot_with("sleep-cap", CAP_SECS).await;
+    let mut channel = open_channel(&handle).await;
+    channel.request_shell(false).await.expect("shell request");
+
+    channel
+        .data(&b"sleep 20\nsleep 20\nsleep 20\n"[..])
+        .await
+        .expect("queued sleeps");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while channel.wait().await.is_some() {}
+    })
+    .await
+    .expect("queued sleeps kept the session alive past max_session_secs");
+}
+
+#[test]
+fn the_shell_pid_follows_the_persona_and_the_session() {
+    let dir = TestDir::new("shell-pid");
+    let mut handler = test_handler(dir.path().to_path_buf(), 1024);
+
+    let first = handler.shell().pid;
+    assert_eq!(first, handler.persona.shell_pid(1));
+    assert_eq!(
+        handler.shell().execute("echo $$").stdout.trim(),
+        first.to_string()
+    );
+
+    handler.session_id = 2;
+    handler.shell = None;
+    assert!(
+        handler.shell().pid > first,
+        "a later session should get a higher PID"
+    );
+}
+
+fn owned(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+fn spelled<N: AsRef<str>>(names: &[N]) -> Vec<String> {
+    names.iter().map(|name| name.as_ref().to_string()).collect()
+}
+
+// Expected lists: `ssh -vv` against a stock Debian 12 sshd, less what russh
+// lacks (sntrup761x25519-sha512@openssh.com and the umac-* MACs).
+#[test]
+fn the_algorithm_proposal_is_that_of_openssh_9_2_on_debian() {
+    let prefs = server::debian_openssh_preferred();
+
+    assert_eq!(
+        spelled(&prefs.kex),
+        owned(&[
+            "curve25519-sha256",
+            "curve25519-sha256@libssh.org",
+            "ecdh-sha2-nistp256",
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
+            "diffie-hellman-group16-sha512",
+            "diffie-hellman-group18-sha512",
+            "diffie-hellman-group14-sha256",
+            "kex-strict-s-v00@openssh.com",
+        ])
+    );
+    assert_eq!(
+        prefs.key.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        owned(&[
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+            "ecdsa-sha2-nistp256",
+            "ssh-ed25519",
+        ])
+    );
+    assert_eq!(
+        spelled(&prefs.cipher),
+        owned(&[
+            "chacha20-poly1305@openssh.com",
+            "aes128-ctr",
+            "aes192-ctr",
+            "aes256-ctr",
+            "aes128-gcm@openssh.com",
+            "aes256-gcm@openssh.com",
+        ])
+    );
+    assert_eq!(
+        spelled(&prefs.mac),
+        owned(&[
+            "hmac-sha2-256-etm@openssh.com",
+            "hmac-sha2-512-etm@openssh.com",
+            "hmac-sha1-etm@openssh.com",
+            "hmac-sha2-256",
+            "hmac-sha2-512",
+            "hmac-sha1",
+        ])
+    );
+    assert_eq!(
+        spelled(&prefs.compression),
+        owned(&["none", "zlib@openssh.com"])
+    );
+}
+
+#[tokio::test]
+async fn the_newly_advertised_algorithms_actually_negotiate() {
+    use russh::keys::{Algorithm, EcdsaCurve};
+    use std::borrow::Cow;
+
+    let client_config = russh::client::Config {
+        preferred: russh::Preferred {
+            kex: Cow::Borrowed(&[russh::kex::DH_GEX_SHA256]),
+            key: Cow::Owned(vec![Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            }]),
+            cipher: Cow::Borrowed(&[russh::cipher::AES_128_GCM]),
+            ..russh::Preferred::DEFAULT
+        },
+        ..russh::client::Config::default()
+    };
+    let (handle, _dir) = honeypot_for("new-algos", 1800, client_config).await;
+    let mut channel = open_channel(&handle).await;
+    channel.exec(true, &b"echo hello"[..]).await.expect("exec");
+
+    let (seen, status) = drain_until_closed(&mut channel).await;
+    assert_eq!(seen, b"hello\n");
+    assert_eq!(status, Some(0));
+}
+
+#[test]
+fn the_ecdsa_host_key_is_served_but_does_not_move_the_persona() {
+    use russh::keys::Algorithm;
+
+    let dir = TestDir::new("ecdsa-hostkey");
+    let keys = crate::network::hostkey::load_or_create(dir.path()).expect("host keys");
+    let is_ecdsa =
+        |key: &russh::keys::PrivateKey| matches!(key.algorithm(), Algorithm::Ecdsa { .. });
+    assert!(keys.iter().any(is_ecdsa));
+
+    let files = server::host_key_files(&keys);
+    assert!(files.iter().any(|(name, line)| {
+        name == "ssh_host_ecdsa_key.pub" && line.starts_with("ecdsa-sha2-nistp256 ")
+    }));
+
+    let before_ecdsa: Vec<_> = keys.iter().filter(|key| !is_ecdsa(key)).cloned().collect();
+    assert_eq!(before_ecdsa.len(), keys.len() - 1);
+    assert_eq!(
+        server::persona_seed(&keys, "sensor"),
+        server::persona_seed(&before_ecdsa, "sensor"),
+        "adding the ECDSA key must not change an existing sensor's persona"
+    );
 }

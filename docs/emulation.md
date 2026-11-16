@@ -117,4 +117,10 @@ Last login: Wed Aug 20 11:03:33 2026 from 10.0.0.5
 
 The `Last login` timestamp is derived from the fake box's boot time at startup,
 as are the snapshot's file mtimes and everything `uptime`, `w`, `last` and `ps`
-report — so `date` can never contradict them.
+report — so `date` can never contradict them. How long the box had been up when
+the process started, and the PID of each login shell, derive from the sensor's
+persona: stable for one sensor, different from the next.
+
+`sleep` really waits (up to 30 s per submitted line, and never past the session
+deadline). The wait is an async timer, so it costs no thread; the session just
+reads no input until it is over.
