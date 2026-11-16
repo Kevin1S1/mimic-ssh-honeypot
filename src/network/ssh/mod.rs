@@ -7,6 +7,7 @@ mod terminal;
 
 pub use server::serve;
 
+use input::OutputBacklog;
 use quarantine::QuarantineStore;
 use screen::ScreenHold;
 use server::SharedState;
@@ -34,6 +35,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_COMMAND_LEN: usize = 4096;
+
+// Ceiling on SFTP reply bytes held back for a peer that has stopped advancing
+// its receive window. russh queues such data in an unbounded per-channel
+// VecDeque and exposes only whether that queue is empty, not its size, so
+// replies are held in `OutputBacklog` (whose size is known exactly) and handed
+// to russh only once its queue has drained. Several windows' worth (OpenSSH's
+// window is 2 MiB) of slack before the peer is treated as abusive and the
+// channel is dropped.
+const MAX_PENDING_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 const LOGOUT: &str = "logout\n";
 
@@ -92,6 +102,8 @@ struct MimicHandler {
 
     sftp: Option<SftpSession>,
 
+    sftp_backlog: OutputBacklog,
+
     quarantine_store: QuarantineStore,
 
     password_buf: Option<Vec<u8>>,
@@ -139,6 +151,7 @@ impl MimicHandler {
             active_channel: None,
             scp: None,
             sftp: None,
+            sftp_backlog: OutputBacklog::default(),
             quarantine_store: QuarantineStore::new(
                 &shared.config,
                 Arc::clone(&shared.global_quarantine_bytes),
@@ -185,6 +198,7 @@ impl MimicHandler {
             self.shell = None;
             self.scp = None;
             self.sftp = None;
+            self.sftp_backlog = OutputBacklog::default();
             self.password_buf = None;
             self.line_buf.clear();
 
@@ -699,6 +713,20 @@ impl Handler for MimicHandler {
         Ok(())
     }
 
+    async fn window_adjusted(
+        &mut self,
+        channel: ChannelId,
+        _new_size: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // russh has already flushed what the new window allows; if that emptied
+        // its queue, the replies held back for this peer can follow.
+        if self.sftp.is_some() && self.active_channel == Some(channel.number()) {
+            self.pump_sftp_output(channel, session)?;
+        }
+        Ok(())
+    }
+
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
@@ -709,6 +737,9 @@ impl Handler for MimicHandler {
         } else if self.sftp.is_some() {
             let _ = self.shell();
             self.drain_sftp_uploads();
+            // The client is done sending; whatever replies are still held are
+            // bounded by the backlog ceiling, so hand them over before closing.
+            send_if_any(session, channel, self.sftp_backlog.release(true))?;
             self.end_channel(channel, session, 0)?;
         } else if self.shell_started && self.active_channel == Some(channel.number()) {
             if self.pty {

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 const MAX_ENV_VARS: usize = 256;
+const MAX_ENV_KEY_LEN: usize = 256;
 const MAX_ENV_VALUE_LEN: usize = 4096;
 const DEFAULT_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games";
@@ -36,6 +37,12 @@ impl Env {
     }
 
     pub fn set(&mut self, key: &str, value: &str) {
+        // Bound the key as well as the value: an assignment from a script line
+        // (which isn't length-capped the way interactive input is) could
+        // otherwise store a multi-megabyte variable name.
+        if key.len() > MAX_ENV_KEY_LEN {
+            return;
+        }
         if !self.vars.contains_key(key) && self.vars.len() >= MAX_ENV_VARS {
             return;
         }
@@ -49,5 +56,25 @@ impl Env {
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.vars.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_over_long_variable_name_is_not_stored() {
+        let mut env = Env::login("root", "/root", "debian");
+        let before = env.iter().count();
+
+        let longest = "K".repeat(MAX_ENV_KEY_LEN);
+        env.set(&longest, "1");
+        assert_eq!(env.get(&longest), Some("1"));
+
+        let too_long = "K".repeat(MAX_ENV_KEY_LEN + 1);
+        env.set(&too_long, "1");
+        assert_eq!(env.get(&too_long), None);
+        assert_eq!(env.iter().count(), before + 1);
     }
 }

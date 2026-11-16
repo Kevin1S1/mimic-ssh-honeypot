@@ -146,6 +146,45 @@ fn byte_cap_bounds_total_content() {
 }
 
 #[test]
+fn symlink_targets_count_toward_the_byte_cap() {
+    let mut fs = Vfs::new();
+    let root = fs.root();
+    let target = "t".repeat(MAX_VFS_BYTES / 4);
+
+    for i in 0..3 {
+        assert_ne!(fs.add_symlink(root, &format!("l{i}"), &target), root);
+    }
+    assert_eq!(
+        fs.add_symlink(root, "l3", &target),
+        root,
+        "a fourth quarter-cap target, plus the names, exceeds the cap"
+    );
+    assert!(fs.child(root, "l3").is_none());
+
+    let filler = vec![0u8; MAX_VFS_BYTES / 4];
+    assert_eq!(
+        fs.add_file(root, "f", filler, 0o644, 0, 0),
+        root,
+        "file contents share the budget the targets used up"
+    );
+}
+
+#[test]
+fn node_names_count_toward_the_byte_cap() {
+    let mut fs = Vfs::new();
+    let root = fs.root();
+    let stem = "n".repeat(MAX_VFS_BYTES / 4);
+
+    for i in 0..3 {
+        assert_ne!(fs.mkdir(root, &format!("{stem}{i}"), 0o755, 0, 0), root);
+    }
+    let fourth = format!("{stem}3");
+    assert_eq!(fs.mkdir(root, &fourth, 0o755, 0, 0), root);
+    assert!(fs.child(root, &fourth).is_none());
+    assert_eq!(fs.touch(root, &fourth, 0, 0), root);
+}
+
+#[test]
 fn unlink_detaches_child() {
     let mut fs = fixture();
     let tmp = fs.resolve(fs.root(), "/tmp").unwrap();

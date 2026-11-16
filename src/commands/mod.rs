@@ -102,12 +102,25 @@ impl CommandHandler {
 
 pub const MAX_NESTED_COMMANDS: u32 = 16;
 
+// Total commands one submitted line may dispatch, across all nesting and
+// fan-out. `MAX_NESTED_COMMANDS` only bounds recursion *depth*; a script that
+// invokes `sh` on itself several times per line multiplies breadth (n^depth)
+// and, with its output suppressed, never trips the output-size cap. This
+// ceiling bounds the total work so such a line cannot pin a runtime worker.
+// Set well above any legitimate pipeline (e.g. `xargs -n1` over a stream, which
+// hits the 1 MiB output cap long before this).
+pub const MAX_DISPATCHES_PER_LINE: u32 = 100_000;
+
 pub const LOGOUT: &str = "logout\n";
 
 pub fn dispatch(shell: &mut Shell, argv: &[String]) -> CommandResult {
     if shell.nesting >= MAX_NESTED_COMMANDS {
         return CommandResult::err("-bash: fork: retry: Resource temporarily unavailable\n", 1);
     }
+    if shell.dispatch_budget == 0 {
+        return CommandResult::err("-bash: fork: retry: Resource temporarily unavailable\n", 1);
+    }
+    shell.dispatch_budget -= 1;
     shell.nesting += 1;
     let result = dispatch_inner(shell, argv);
     shell.nesting -= 1;

@@ -92,7 +92,10 @@ pub fn xargs(shell: &mut Shell, args: &[String]) -> CommandResult {
         if result.status != 0 {
             status = result.status;
         }
-        if out.len() > MAX_COMMAND_OUTPUT_BYTES {
+        // Bound both streams: a command that writes only to stderr (e.g. a flood
+        // of "No such file" lines) would otherwise grow unchecked while `out`
+        // stays empty.
+        if out.len() > MAX_COMMAND_OUTPUT_BYTES || errs.len() > MAX_COMMAND_OUTPUT_BYTES {
             break;
         }
     }

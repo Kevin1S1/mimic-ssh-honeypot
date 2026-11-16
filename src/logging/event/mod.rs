@@ -36,7 +36,21 @@ fn peer_parts(peer: SocketAddr) -> (String, u16) {
 }
 
 fn needs_escape(c: char) -> bool {
-    (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || c == '\x7f'
+    (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || c == '\x7f' || is_bidi_or_separator(c)
+}
+
+// Unicode bidirectional-override / isolate controls and the line/paragraph
+// separators. None are `is_control()` in Rust, so they would otherwise pass
+// through: the bidi controls let a log line reorder as rendered in a terminal
+// (spoofing), and U+2028/U+2029 split a record for consumers that treat them as
+// line boundaries.
+fn is_bidi_or_separator(c: char) -> bool {
+    matches!(c,
+        '\u{200e}' | '\u{200f}'        // LRM, RLM
+        | '\u{202a}'..='\u{202e}'      // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}'      // LRI, RLI, FSI, PDI
+        | '\u{2028}' | '\u{2029}'      // line separator, paragraph separator
+    )
 }
 
 pub fn sanitise_field(s: &str) -> Cow<'_, str> {

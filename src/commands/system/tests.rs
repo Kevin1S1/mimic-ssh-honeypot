@@ -82,6 +82,31 @@ fn a_self_running_script_hits_the_nesting_cap() {
 }
 
 #[test]
+fn a_script_that_fans_out_into_itself_is_stopped_by_the_dispatch_budget() {
+    let mut shell = Shell::new("root", "debian");
+    // Four self-calls per line with stderr discarded: 4^16 dispatches if only
+    // the nesting depth were bounded, and no output to trip the size cap.
+    shell.execute("echo 'sh /tmp/f 2>/dev/null; sh /tmp/f 2>/dev/null; sh /tmp/f 2>/dev/null; sh /tmp/f 2>/dev/null' > /tmp/f");
+    let started = std::time::Instant::now();
+    shell.execute("sh /tmp/f 2>/dev/null");
+    assert_eq!(
+        shell.dispatch_budget, 0,
+        "the line should exhaust its budget"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "fan-out was not bounded: took {:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(
+        run(&mut shell, "whoami"),
+        "root\n",
+        "the next line starts with a fresh budget"
+    );
+}
+
+#[test]
 fn a_script_runs_at_most_the_line_cap() {
     let mut shell = Shell::new("root", "debian");
     let body = "echo x\n".repeat(super::interpreter::MAX_SCRIPT_LINES + 500);
