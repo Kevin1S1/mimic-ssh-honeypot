@@ -12,7 +12,7 @@ const FORBIDDEN: &[&str] = &[
     "std::fs",
     "std::{",
     "std::env",
-    "stdas",   // `use std as s;` then `s::fs::…`
+    "stdas", // `use std as s;` then `s::fs::…`
     "tokio::fs",
     "tokio::net",
     "tokio::{", // `use tokio::{net::TcpStream};`

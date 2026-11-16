@@ -115,7 +115,8 @@ fn edit_line(scripts: &[&str], line: &str) -> Result<Option<EditedLine>, String>
         // compounds the growth. Keep the working line bounded so the transient
         // can't reach hundreds of MiB regardless of how many scripts are given.
         if edited.text.len() > MAX_COMMAND_OUTPUT_BYTES {
-            let boundary = crate::commands::floor_char_boundary(&edited.text, MAX_COMMAND_OUTPUT_BYTES);
+            let boundary =
+                crate::commands::floor_char_boundary(&edited.text, MAX_COMMAND_OUTPUT_BYTES);
             edited.text.truncate(boundary);
             break;
         }
