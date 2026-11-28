@@ -67,15 +67,18 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # Scans Cargo.lock against the RustSec advisory database. One advisory is
-      # explicitly accepted and documented in SECURITY.md (and deny.toml):
+      # Scans Cargo.lock against the RustSec advisory database. Two advisories
+      # are explicitly accepted and documented in SECURITY.md:
       #   RUSTSEC-2023-0071  rsa Marvin sidechannel — no fix exists; host-key
       #                      recovery only, no escape from the honeypot.
+      #   RUSTSEC-2026-0543  chrono unmaintained — only a wasm32 dependency of
+      #                      russh-util, never compiled into MIMIC.
       # Any NEW advisory still fails the build.
       - name: cargo-audit (fails on new advisories)
         run: |
           cargo audit --deny warnings \
-            --ignore RUSTSEC-2023-0071
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0543
 
   deny:
     name: Supply-chain (cargo-deny)

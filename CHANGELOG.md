@@ -123,6 +123,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `russh` 0.65.0 fixes a pre-authentication stack overflow from nested OpenSSH
   certificates (GHSA-3hm4-p7h4-rvwp) and a channel stall when a peer declares a
   zero maximum packet size (GHSA-fw5c-8223-6h42).
+- RUSTSEC-2026-0543 (`chrono` unmaintained) is accepted and documented in
+  `SECURITY.md`: `chrono` is only a `wasm32` dependency of `russh-util` and is
+  never compiled into MIMIC.
 
 ## [0.6.0] - 2026-08-30
 

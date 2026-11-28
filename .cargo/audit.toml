@@ -1,8 +1,8 @@
 # Local `cargo audit` configuration — keeps developer runs consistent with CI.
 #
-# One advisory is explicitly accepted and documented in SECURITY.md (and
-# deny.toml): it is unfixable upstream and does not break MIMIC's core
-# invariant. A *new* advisory in any dependency still fails `cargo audit`.
+# Two advisories are explicitly accepted and documented in SECURITY.md: both
+# are unfixable upstream and neither breaks MIMIC's core invariant. A *new*
+# advisory in any dependency still fails `cargo audit`.
 
 [advisories]
 ignore = [
@@ -10,4 +10,8 @@ ignore = [
     # decoy), no escape; no fixed version exists upstream. Pulled in transitively
     # by `russh`.
     "RUSTSEC-2023-0071",
+    # chrono unmaintained, no fixed version. Only a `cfg(target_arch = "wasm32")`
+    # dependency of `russh-util`, so it is never compiled into MIMIC. cargo-deny
+    # resolves the host targets and does not see it, hence no deny.toml entry.
+    "RUSTSEC-2026-0543",
 ]
