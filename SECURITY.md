@@ -166,11 +166,12 @@ Any change that would weaken one of these invariants must be rejected — securi
 
 ### Known / accepted dependency advisories
 
-Security is a process: CI runs `cargo audit` and `cargo deny` on every push and weekly. One advisory is **explicitly accepted** because it cannot break the invariants above. It is documented here, in `deny.toml`, and in `.cargo/audit.toml`; any *new* advisory still fails CI.
+Security is a process: CI runs `cargo audit` and `cargo deny` on every push and weekly. Two advisories are **explicitly accepted** because they cannot break the invariants above. They are documented here and in `.cargo/audit.toml` (the `rsa` one also in `deny.toml`); any *new* advisory still fails CI.
 
 | Advisory | Crate | Severity | Why accepted | Mitigation / fix |
 |---|---|---|---|---|
 | [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) | `rsa` | Medium (5.9) | Marvin timing sidechannel. Worst case is recovery of the SSH **host key**, which only allows *impersonating* the honeypot — harmless for a sacrificial decoy and **no escape** to the host. | **No fixed version exists** upstream. Accepted; revisit if a patched `rsa` ships. |
+| [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543) | `chrono` | Unmaintained (informational) | Listed in `Cargo.lock` only as a `wasm32`-only dependency of `russh-util`; it is **never compiled** into MIMIC on any supported target. | No fixed version exists. Accepted; revisit if `russh` drops it or MIMIC ever builds for `wasm32`. |
 
 ---
 
